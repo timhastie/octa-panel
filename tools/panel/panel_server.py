@@ -400,10 +400,11 @@ def main():
                          "sequencer runs on its own clock -- no MIDI clock ever arrives here)")
     a = ap.parse_args()
 
-    image = a.image
-    if image is None:
-        built = ROOT / "out/mainos_bus.bin"
-        image = str(built) if built.exists() else str(ROOT / "out/raw/section_3_MAIN_OS.bin")
+    # Default to the STOCK image: out/mainos_bus.bin is whatever the last
+    # build or gate left there (verify_burn leaves a probe build that never
+    # reaches the UI -- a blank screen, 11 Sep 2026). Pass --image to test
+    # a built remix deliberately.
+    image = a.image or str(ROOT / "out/raw/section_3_MAIN_OS.bin")
 
     project = None
     if a.project:
