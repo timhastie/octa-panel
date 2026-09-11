@@ -61,10 +61,13 @@ def _png_gray(w, h, rows):
 class Panel:
     """Owns the emulator thread; everything Unicorn happens on it."""
 
-    def __init__(self, image, card, pump_ms=25.0):
+    def __init__(self, image, card, pump_ms=25.0, project=None, internal_clock=True):
         self.image = image
         self.card = card
         self.pump_ms = pump_ms
+        self.project = project            # (set_name, project_name) to load at boot
+        self.internal_clock = internal_clock
+        self.loaded = None                # load_project_live's tuple once done
         self.actions = queue.Queue()
         self.lock = threading.Lock()
         self.frame = b""          # latest PNG
@@ -105,6 +108,8 @@ class Panel:
             self.r, self.rt = r, rt
             self.booted = True
             self._snapshot(r.uc)
+            if self.project:
+                self._load_project(rt)
         except Exception as e:  # boot is all-or-nothing
             self.fault = f"boot: {type(e).__name__}: {e}"
             return
@@ -127,6 +132,43 @@ class Panel:
             except Exception as e:
                 self.fault = f"{type(e).__name__}: {e}"
                 time.sleep(0.5)
+
+    def _load_project(self, rt):
+        """The CLI's --sequencer preamble (emu_rtos.main), verbatim in
+        spirit: wait for the M6a gate, mount + LOAD PROJECT through the real
+        sys/engine tasks, then the two compensations RTOS_FORK.md section 7
+        documents (the load ends on bank A here where the unit comes up on
+        the saved bank; the sequencer's own bank/pattern byte is re-issued),
+        and the internal clock so a project saved with CLOCK RECEIVE does not
+        wait for MIDI clock that never arrives in emulation."""
+        set_name, name = self.project
+        if not rt.gate_m6a()[0]:
+            rt.run(ms=1000, until=lambda x: x.gate_m6a()[0])
+        mounted, posted, saved_bank, final_bank, elapsed = rt.load_project_live(set_name, name)
+        if saved_bank is not None and final_bank != saved_bank:
+            final_bank = rt.select_bank_live(saved_bank)
+        pattern = rt.uc.mem_read(er.CUR_PATTERN, 1)[0]
+        rt.seq_select_live(final_bank, pattern)
+        if self.internal_clock:
+            rt.internal_clock()
+        rt.frame = True
+        rt.next_frame = rt.sample + er.FRAME_PERIOD
+        rt.exact_clock()
+        self.loaded = {"mounted": mounted, "posted": posted, "saved_bank": saved_bank,
+                       "final_bank": final_bank, "elapsed_ms": elapsed}
+        self._snapshot(rt.uc if hasattr(rt, "uc") else self.r.uc)
+
+    def transport(self, what):
+        """PLAY / REC / STOP through the firmware's own key handlers
+        (press_key_live, RTOS_FORK.md section 9) -- the proven way to start
+        the transport until the matrix cells for these keys are mapped."""
+        handler = {"play": er.KEY_PLAY, "rec": er.KEY_REC, "stop": er.KEY_STOP}.get(what)
+        if handler is None:
+            return False, "play|rec|stop"
+        return self.do(lambda rt: rt.press_key_live(handler), timeout=120)
+
+    def poke_trig(self, step):
+        return self.do(lambda rt: f"{rt.poke_trig(int(step)):#04x}", timeout=60)
 
     _led_pos = 0
 
@@ -251,6 +293,14 @@ class Handler(BaseHTTPRequestHandler):
             ok, res = p.key(int(args.get("row", "-1"), 0), int(args.get("bit", "-1")),
                             args.get("down", "1") == "1")
             self._json({"ok": ok, "result": str(res)})
+        elif path == "/transport":
+            ok, res = p.transport(args.get("k", ""))
+            self._json({"ok": ok, "result": str(res)})
+        elif path == "/poke_trig":
+            ok, res = p.poke_trig(args.get("step", "1"))
+            self._json({"ok": ok, "result": str(res)})
+        elif path == "/project":
+            self._json({"project": p.project, "loaded": p.loaded})
         elif path == "/leds":
             with p.lock:
                 self._json({"bits": bytes(p.led_bits).hex(),
@@ -271,6 +321,9 @@ def main():
     ap.add_argument("--set", default="OCTABAM")
     ap.add_argument("--name", default=None)
     ap.add_argument("--port", type=int, default=8563)
+    ap.add_argument("--midi-clock", action="store_true",
+                    help="keep the project's CLOCK RECEIVE setting (default: clear it so the "
+                         "sequencer runs on its own clock -- no MIDI clock ever arrives here)")
     a = ap.parse_args()
 
     image = a.image
@@ -278,14 +331,25 @@ def main():
         built = ROOT / "out/mainos_bus.bin"
         image = str(built) if built.exists() else str(ROOT / "out/raw/section_3_MAIN_OS.bin")
 
+    project = None
     if a.project:
-        card, _ = er.stage_project(a.project, a.set, a.name)
+        # Stage the project's own samples too: project.work references them
+        # as ../AUDIO/<file>, so a sibling AUDIO/ next to the project dir is
+        # the set's pool. Without them every sample slot stays invalid
+        # (RTOS_FORK section 10.12) -- the UI still works, the audio does not.
+        pdir = pathlib.Path(a.project).resolve()
+        pool = pdir.parent / "AUDIO"
+        audio = [f"{w}:AUDIO/{w.name}" for w in sorted(pool.glob("*.wav"))] if pool.is_dir() else []
+        card, staged = er.stage_project(a.project, a.set, a.name, audio=audio,
+                                        image_mb=max(64, 16 + sum(w.stat().st_size for w in pool.glob("*.wav")) // 2**20 if pool.is_dir() else 64))
+        project = (a.set, staged)
+        print(f"staged {pdir.name} as {a.set}/{staged} with {len(audio)} samples")
     else:
         tree = ROOT / "out/_panel_tree"
         (tree / a.set / "AUDIO").mkdir(parents=True, exist_ok=True)
         card = ec.build_image(str(tree), size_mb=64)
 
-    Handler.panel = Panel(image, card)
+    Handler.panel = Panel(image, card, project=project, internal_clock=not a.midi_clock)
     Handler.html = (pathlib.Path(__file__).parent / "panel.html").read_bytes()
     srv = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)
     print(f"panel: http://localhost:{a.port}/   image={image}")

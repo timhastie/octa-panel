@@ -248,7 +248,17 @@ document.addEventListener("mousedown", e => {
     return;
   }
   const k = keyOf(el);
-  if (!k) { $("#statusline").textContent = `"${el.dataset.id}" is unmapped — use MAP KEYS`; return; }
+  if (!k) {
+    // transport has a proven fallback: the firmware's own key handlers
+    const t = {play: "play", rec: "rec", stop: "stop"}[el.dataset.id];
+    if (t) {
+      el.classList.add("down");
+      fetch(`/transport?k=${t}`).then(x => x.json()).then(r =>
+        $("#statusline").textContent = `${t.toUpperCase()} via key handler: ${r.result}`);
+      return;
+    }
+    $("#statusline").textContent = `"${el.dataset.id}" is unmapped — use MAP KEYS`; return;
+  }
   el.classList.add("down");
   sendKey(k[0], k[1], true);
 });
