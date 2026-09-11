@@ -161,11 +161,17 @@ class Panel:
             if self.project:
                 self.phase = "loading project (about a minute)"
                 self._load_project(rt)
+                # Settle before replaying clicks queued during the load: a
+                # key event injected as the very first thing after the load
+                # wedged emulated time (run(ms=50) never returned, 11 Sep 2026).
+                rt.run(ms=300)
+                self._snapshot(r.uc)
             self.phase = "ready"
         except Exception as e:  # boot is all-or-nothing
             self.fault = f"boot: {type(e).__name__}: {e}"
             self.phase = "failed"
             return
+        threading.Thread(target=self._watchdog, daemon=True).start()
         while True:
             try:
                 while True:
@@ -173,9 +179,15 @@ class Panel:
                         act = self.actions.get_nowait()
                     except queue.Empty:
                         break
-                    act()
+                    self.busy_since = time.perf_counter()
+                    try:
+                        act()
+                    finally:
+                        self.busy_since = None
                 t = time.perf_counter()
+                self.busy_since = t
                 rt.run(ms=self.pump_ms)
+                self.busy_since = None
                 self.ran_ms = rt.sample / er.SAMPLE_HZ * 1000.0
                 self._snapshot(r.uc)
                 self._parse_leds(rt)
@@ -204,9 +216,11 @@ class Panel:
         rt.seq_select_live(final_bank, pattern)
         if self.internal_clock:
             rt.internal_clock()
-        rt.frame = True
-        rt.next_frame = rt.sample + er.FRAME_PERIOD
-        rt.exact_clock()
+        # NOT here: rt.frame / rt.exact_clock(). Both are the sequencer
+        # research's fidelity settings and they cost ~100x wall time (50 ms
+        # of firmware = 5.5 s, measured 11 Sep 2026) -- every click took 11 s
+        # and the panel looked hung. Frame mode goes on with PLAY, off with
+        # STOP (transport()); the exact clock is never needed for the UI.
         self.loaded = {"mounted": mounted, "posted": posted, "saved_bank": saved_bank,
                        "final_bank": final_bank, "elapsed_ms": elapsed}
         self._snapshot(rt.uc if hasattr(rt, "uc") else self.r.uc)
@@ -218,14 +232,24 @@ class Panel:
         if what == "play":
             # press_play_live = PLAY's own handler + FW_START_TRACK per track;
             # tracks only start if the pattern flags them active, so make sure.
+            # The DSP frame interrupt is what steps the sequencer, so frame
+            # mode comes on here (and costs wall time while it is on).
             def play(rt):
                 flags = self.activate_tracks(rt)
-                return f"d0={rt.press_play_live()} active={flags}"
+                if not rt.frame:
+                    rt.frame = True
+                    rt.next_frame = rt.sample + er.FRAME_PERIOD
+                return f"d0={rt.press_play_live()} active={flags} (frame mode on: slower while playing)"
             return self.do(play, timeout=120)
         handler = {"rec": er.KEY_REC, "stop": er.KEY_STOP}.get(what)
         if handler is None:
             return False, "play|rec|stop"
-        return self.do(lambda rt: rt.press_key_live(handler), timeout=120)
+        def press(rt):
+            d0 = rt.press_key_live(handler)
+            if what == "stop":
+                rt.frame = False
+            return f"d0={d0}" + (" (frame mode off)" if what == "stop" else "")
+        return self.do(press, timeout=120)
 
     def activate_tracks(self, rt, tracks=range(8)):
         """Mark tracks ACTIVE in the current pattern record (+84 + 2330*t):
@@ -274,6 +298,26 @@ class Panel:
                 i += 2
         with self.lock:
             self._led_pos = i
+
+    busy_since = None
+    ACTION_LIMIT = 20.0      # wall seconds an action may hold the emulator
+
+    def _watchdog(self):
+        """Abort an action that holds the emulator too long: Unicorn's
+        emu_stop() is safe from another thread, and Rtos.run's burst loop
+        then returns. The action reports the abort; the pump carries on."""
+        while True:
+            time.sleep(1.0)
+            t0 = self.busy_since
+            if t0 is not None and time.perf_counter() - t0 > self.ACTION_LIMIT:
+                self.aborted = (self.aborted or 0) + 1
+                try:
+                    self.r.uc.emu_stop()
+                except Exception:
+                    pass
+                self.busy_since = time.perf_counter()   # re-arm; stop once per limit
+
+    aborted = 0
 
     def do(self, fn, timeout=30.0):
         """Run fn(rt) on the emu thread, return (ok, result-or-error)."""
@@ -377,6 +421,16 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": ok, "result": str(res)})
         elif path == "/project":
             self._json({"project": p.project, "loaded": p.loaded})
+        elif path == "/stack":
+            # where is the emulator thread right now? (a hung action shows here)
+            import traceback
+            frames = sys._current_frames()
+            dump = {}
+            for th in threading.enumerate():
+                f = frames.get(th.ident)
+                if f is not None and th is not threading.current_thread():
+                    dump[th.name] = "".join(traceback.format_stack(f)[-12:])
+            self._send(200, "\n\n".join(f"== {k}\n{v}" for k, v in dump.items()).encode(), "text/plain")
         elif path == "/leds":
             with p.lock:
                 self._json({"bits": bytes(p.led_bits).hex(),
