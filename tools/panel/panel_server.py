@@ -162,13 +162,36 @@ class Panel:
         """PLAY / REC / STOP through the firmware's own key handlers
         (press_key_live, RTOS_FORK.md section 9) -- the proven way to start
         the transport until the matrix cells for these keys are mapped."""
-        handler = {"play": er.KEY_PLAY, "rec": er.KEY_REC, "stop": er.KEY_STOP}.get(what)
+        if what == "play":
+            # press_play_live = PLAY's own handler + FW_START_TRACK per track;
+            # tracks only start if the pattern flags them active, so make sure.
+            def play(rt):
+                flags = self.activate_tracks(rt)
+                return f"d0={rt.press_play_live()} active={flags}"
+            return self.do(play, timeout=120)
+        handler = {"rec": er.KEY_REC, "stop": er.KEY_STOP}.get(what)
         if handler is None:
             return False, "play|rec|stop"
         return self.do(lambda rt: rt.press_key_live(handler), timeout=120)
 
-    def poke_trig(self, step):
-        return self.do(lambda rt: f"{rt.poke_trig(int(step)):#04x}", timeout=60)
+    def activate_tracks(self, rt, tracks=range(8)):
+        """Mark tracks ACTIVE in the current pattern record (+84 + 2330*t):
+        FW_START_TRACK only promotes an active track to running, and a
+        pattern with no saved trigs (the public fixture projects) has every
+        flag clear -- PLAY then starts nothing and no trig ever lands
+        (measured 10 Sep 2026: flags [0]*8, states [0]*8, zero nibble
+        writes; with track 1's flag set: state 1 and the poked trig fires).
+        A project saved on a unit with trigs carries the flags itself."""
+        pb = rt.pattern_base()
+        for t in tracks:
+            rt.uc.mem_write(pb + 84 + 2330 * t, b"\x01")
+        return [rt.uc.mem_read(pb + 84 + 2330 * t, 1)[0] for t in range(8)]
+
+    def poke_trig(self, step, track=0):
+        def act(rt):
+            flags = self.activate_tracks(rt, [track])
+            return f"mask {rt.poke_trig(int(step)):#04x}, active flags {flags}"
+        return self.do(act, timeout=60)
 
     _led_pos = 0
 

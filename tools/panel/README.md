@@ -60,6 +60,24 @@ beside it), is a good PR — it is pure discovery, no firmware bytes.
 | `GET /leds` | parsed LED bitmap + per-id values |
 | `GET /run?ms=1000` | advance emulated time (the sequencer runs here) |
 
+## No unit to hand? Real projects from public test fixtures
+
+Two open-source Octatrack tools ship projects saved on real units (OS
+1.40B, VERSION=19) as test data — GPL-licensed, fine to use locally:
+
+| source | what | where it lands |
+|---|---|---|
+| [ot-tools](https://gitlab.com/ot-tools/ot-tools) `ot-tools-operations/test-data/copy-redo-live` | a full project (16 banks, `.work` + `.strd`, arrangements, markers) **with its AUDIO pool** (4 samples in slots) | `out/_projects/otlive/OTLIVE/{PROJECT,AUDIO}` |
+| ot-tools `ot-tools-io/test-data/blank-project` | a blank project, all files | `out/_projects/blank/BLANK` |
+| [octatrack-manager](https://github.com/davidferlay/octatrack-manager) `src-tauri/tests/fixtures/real_device` | one bank + project/markers/arr01 | `out/_projects/real_device` |
+
+```sh
+.venv/bin/python3 tools/panel/panel_server.py --project out/_projects/otlive/OTLIVE/PROJECT --set OTLIVE --name PROJECT
+```
+
+The full project loads under route A (M6b gate passes: mount, LOAD
+PROJECT, bank A parsed) and the panel stages its AUDIO pool automatically.
+
 ## Limits
 
 Everything route A cannot see is still invisible here — audio (use the DSP
