@@ -5,200 +5,335 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Virtual Panel</title>
 <style>
-  :root {
-    --panel:#2b2b2d; --panel2:#232325; --key:#9a9a97; --key-hi:#c6c6c2;
-    --red:#c03a2b; --cream:#e8e4da; --txt:#d8d5cc; --dim:#8a877e;
-    --lcd:#c9cdc4;
-  }
-  body { margin:0; background:#161617; color:var(--txt);
-         font:12px/1.35 -apple-system, "Helvetica Neue", sans-serif;
-         display:flex; flex-direction:column; align-items:center; }
-  #unit { background:linear-gradient(#303032,var(--panel) 12%,var(--panel2));
-          border:1px solid #000; border-radius:10px; margin:18px 8px;
-          padding:16px 20px 20px; box-shadow:0 12px 40px #000a;
-          user-select:none; width:min(1180px,97vw); box-sizing:border-box; }
-  .row { display:flex; align-items:center; justify-content:center; gap:14px; }
-  .col { display:flex; flex-direction:column; gap:8px; align-items:center; }
+  /* The unit is drawn on a fixed 1420x760 stage (centres below are stage
+     pixels, measured from a photo of a MKI, 11 Sep 2026) and the stage is
+     scaled uniformly to the window, so nothing can leave the base. */
+  :root { --red:#d02b26; --txt:#e8e6df; --dim:#8a877e; --lcd:#c9cdc4; }
+  html, body { height:100%; }
+  body { margin:0; background:#08080a; color:#d8d5cc; overflow:hidden;
+         font:12px/1.35 -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif;
+         display:flex; flex-direction:column; }
 
-  .k { background:linear-gradient(#b9b9b5,var(--key));
-       border:1px solid #55554f; border-bottom-color:#2e2e2a;
-       border-radius:6px; color:#1c1c1a; text-align:center;
-       cursor:pointer; padding:7px 6px; min-width:52px;
-       font-weight:600; font-size:10px; letter-spacing:.02em;
-       box-shadow:0 2px 0 #1c1c1a80; position:relative; }
-  .k:active, .k.down { transform:translateY(1px); box-shadow:0 1px 0 #1c1c1a80;
-                       background:linear-gradient(#d6d6d2,var(--key-hi)); }
-  .k.red   { background:linear-gradient(#d0523f,var(--red)); color:#fff; }
-  .k.red:active { background:linear-gradient(#e06a56,#cf4736); }
-  .k.cream { background:linear-gradient(#f2efe7,var(--cream)); }
-  .k.round { border-radius:50%; width:38px; height:38px; min-width:38px;
-             padding:0; display:flex; align-items:center; justify-content:center; }
-  .k.big   { width:52px; height:52px; min-width:52px; border-radius:50%; }
-  .k .sub  { display:block; font-weight:400; font-size:8px; color:#7a2020; }
-  .k.unmapped { outline:1px dashed #6b6b64; outline-offset:-3px; }
-  .k.selecting { outline:2px solid #e8b23a; outline-offset:-2px; }
-  .lbl { font-size:9px; color:var(--dim); text-align:center; }
+  /* ---- toolbar (outside the unit) ---- */
+  #top { flex:none; background:#121214; border-bottom:1px solid #232326; }
+  #bar { display:flex; flex-wrap:wrap; align-items:center; gap:6px 8px; padding:5px 10px; min-height:22px; font-size:11px; }
+  #bar .brand { color:#6f6d68; letter-spacing:.25em; font-size:10px; font-weight:600; }
+  #bar .img { color:#bdbab2; font-family:ui-monospace, Menlo, monospace; font-size:10px; }
+  #phase { padding:1px 8px; border-radius:9px; font-size:10px; background:#2a2a2c; color:#bdbab2; }
+  #phase.ready { background:#1d3a22; color:#8fe39a; }
+  #phase.busy { background:#3a3016; color:#f0c85a; }
+  #phase.failed { background:#3f1a18; color:#ff8a80; }
+  #fault { color:#ff8a80; font-size:10px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:30vw; }
+  #bar button { background:#2c2c2e; color:#d8d5cc; border:1px solid #47474a; border-radius:4px;
+                padding:2px 9px; font-size:10px; cursor:pointer; letter-spacing:.04em; }
+  #bar button:hover { background:#38383a; }
+  #bar button.on { background:#7a5a18; border-color:#e8b23a; }
+  #hint { flex:1 1 260px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+          color:var(--dim); font-size:11px; line-height:22px; margin-left:4px; }   /* wraps to its own line when squeezed */
 
-  #screenwrap { background:#0c0c0d; border:3px solid #0a0a0a; border-radius:6px;
-                padding:10px; box-shadow:inset 0 0 18px #000; }
-  #screen { width:512px; height:256px; image-rendering:pixelated; display:block;
-            background:var(--lcd); }
-  #statusline { font-size:10px; color:var(--dim); margin-top:6px; text-align:center;
-                min-height:14px; max-width:540px; }
-
-  .knob { width:44px; height:44px; border-radius:50%;
-          background:radial-gradient(circle at 35% 30%, #b5b5b1, #7d7d79 70%, #565652);
-          border:1px solid #333; position:relative; opacity:.55; }
-  .knob::after { content:""; position:absolute; left:50%; top:4px; width:2px;
-                 height:12px; background:#2a2a28; transform:translateX(-50%); }
-
-  .trig { min-width:46px; padding:10px 4px; }
-  .led { width:7px; height:7px; border-radius:50%; background:#3a3a38;
-         margin:0 auto 3px; }
-  .led.on { background:#e5533a; box-shadow:0 0 6px #e5533a; }
-  .led.grn { background:#7ac25a; box-shadow:0 0 6px #7ac25a; }
-
-  #fader { width:170px; height:34px; background:#1b1b1c; border-radius:4px;
-           border:1px solid #000; position:relative; opacity:.55; }
-  #fader::after { content:""; position:absolute; left:46%; top:3px; width:16px;
-                  height:26px; background:linear-gradient(#cfcfcb,#8f8f8b);
-                  border-radius:3px; border:1px solid #333; }
-
-  #mapbar { margin:6px 0 12px; display:flex; gap:10px; align-items:center;
-            justify-content:center; font-size:11px; }
-  #mapbar button { background:#3a3a3c; color:var(--txt); border:1px solid #555;
-                   border-radius:4px; padding:4px 10px; cursor:pointer; }
-  #mapbar button.on { background:#7a5a18; border-color:#e8b23a; }
-  #drawer { display:none; background:#1d1d1f; border:1px solid #3a3a3c;
-            border-radius:6px; padding:10px; margin-bottom:12px; }
+  /* ---- MAP KEYS drawer: matrix rows 0x20-0x2f as columns, bits as rows,
+          plus the seven encoder rows 0x30-0x36 for knob binding ---- */
+  #drawer { display:none; padding:6px 10px 8px; border-top:1px solid #232326; overflow-x:auto; }
   #drawer.open { display:block; }
-  #matrix { display:grid; grid-template-columns:auto repeat(8,1fr); gap:4px; }
-  .tk { background:#333335; border:1px solid #4a4a4c; border-radius:4px;
-        padding:4px 6px; font-size:9px; text-align:center; cursor:pointer;
-        color:#bdbab2; }
-  .tk:hover { background:#44444a; }
-  .tk.named { border-color:#7a9a5a; }
-  .rowhdr { font-size:9px; color:var(--dim); align-self:center; }
+  #drawer .note { font-size:10px; color:var(--dim); margin-bottom:5px; max-width:1100px; }
+  #matrix { display:grid; grid-template-columns:auto repeat(16, 1fr); gap:3px; min-width:860px; }
+  #encoders { display:grid; grid-template-columns:auto repeat(7, 1fr); gap:3px; width:460px; margin-top:6px; }
+  .tk { background:#2a2a2d; border:1px solid #3e3e42; border-radius:3px; padding:2px 3px; font-size:9px;
+        text-align:center; cursor:pointer; color:#bdbab2; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
+  .tk:hover { background:#3c3c42; }
+  .tk.named { border-color:#6f8f52; color:#d5dfc8; }
+  .tk.enc { border-color:#4d5a78; }
+  .tk.enc.named { border-color:#7f8fc0; }
+  .hdr { font-size:9px; color:var(--dim); align-self:center; text-align:center; white-space:nowrap; }
+  #export { display:none; width:100%; height:80px; margin-top:6px; background:#0d0d0e; color:#bdbab2;
+            border:1px solid #3e3e42; font:10px ui-monospace, Menlo, monospace; box-sizing:border-box; }
+
+  /* ---- stage ---- */
+  #view { flex:1; position:relative; overflow:hidden; }
+  #stage { position:absolute; left:50%; top:50%; width:1420px; height:760px; overflow:hidden;
+           transform-origin:50% 50%; transform:translate(-50%,-50%) scale(1);
+           border-radius:18px; user-select:none; -webkit-user-select:none;
+           background:linear-gradient(#1c1c1e, #101011);
+           box-shadow:inset 0 1px 0 rgba(255,255,255,.09), inset 0 0 0 1px #000, 0 24px 70px rgba(0,0,0,.85); }
+  #stage > * { position:absolute; box-sizing:border-box; }
+  #strip { left:0; right:0; top:20px; height:50px; background:linear-gradient(#212124, #19191b);
+           border-top:1px solid #2d2d31; border-bottom:1px solid #0a0a0b; }
+  .jack { border-radius:50%; background:radial-gradient(circle at 50% 45%, #0c0c0d 40%, #3b3b3e 48%, #5a5a5d 60%, #2a2a2c 75%); }
+  .jack.rect { border-radius:2px; background:linear-gradient(#3a3a3d, #202022); border:1px solid #4a4a4d; }
+  .screw { width:14px; height:14px; border-radius:50%;
+           background:radial-gradient(circle at 38% 32%, #6b6b6e, #3a3a3d 55%, #1f1f21);
+           box-shadow:inset 0 0 0 1px #0a0a0b, 0 0 0 1px #2b2b2e; }
+  .screw::before, .screw::after { content:""; position:absolute; background:#141416; left:50%; top:50%; }
+  .screw::before { width:9px; height:1.5px; margin:-.75px 0 0 -4.5px; }
+  .screw::after  { width:1.5px; height:9px; margin:-4.5px 0 0 -.75px; }
+
+  /* labels: white 10px caps, function (shifted) labels red 9px */
+  .lb { color:var(--txt); font-size:10px; letter-spacing:.02em; white-space:nowrap; text-transform:uppercase;
+        transform:translate(-50%,-50%); line-height:1; }
+  .lb.r { color:var(--red); font-size:9px; }
+  .lb.s { font-size:8px; }
+  .lb.t { font-size:7px; color:#cfccc3; }
+  .lb.j { font-size:9px; color:#c9c7c0; letter-spacing:.04em; }
+  .lb.title { font-size:9px; color:#5c5c5e; letter-spacing:.32em; }
+  .lb.left { transform:translate(0,-50%); }
+  .lb.right { transform:translate(-100%,-50%); }
+  .rule { height:1px; background:var(--red); }
+  .sw { width:8px; height:8px; background:var(--red); border-radius:1px; }
+  .pillb { height:13px; border:1px solid #c9c7c0; border-radius:7px; color:var(--txt); font-size:7.5px;
+           display:flex; align-items:center; justify-content:center; text-transform:uppercase;
+           letter-spacing:.03em; line-height:1; white-space:nowrap; }
+  .pillb b { font-weight:700; margin-right:3px; }
+
+  /* keys */
+  .k { cursor:pointer; display:flex; align-items:center; justify-content:center;
+       color:#2a2a28; font-size:9px; line-height:1;
+       border:1px solid #2a2a28;
+       box-shadow:0 1px 0 #050505, 0 1px 3px rgba(0,0,0,.6), inset 0 1px 0 rgba(255,255,255,.4); }
+  .k.round { border-radius:50%; }
+  .k.pill  { border-radius:12px; }
+  .k.gray  { background:radial-gradient(circle at 42% 34%, #b3b3af, #9d9d99 50%, #8c8c88 100%); }
+  .k.white { background:radial-gradient(circle at 42% 34%, #f6f5f0, #f0efe9 50%, #d9d8d1 100%); }
+  .k.cream { background:radial-gradient(circle at 42% 34%, #f3eee0, #e9e3d0 50%, #d3ccb4 100%); }
+  .k.red   { background:radial-gradient(circle at 42% 34%, #de4239, #c8231c 50%, #a51a14 100%); color:#fff; }
+  .k .g { font-size:10px; transform:translateY(-.5px); }
+  .k .g.big { font-size:12px; }
+  .k.down { transform:translateY(1px); filter:brightness(.88);
+            box-shadow:0 0 0 #000, inset 0 1px 3px rgba(0,0,0,.45); }
+  body.mapping .k.unmapped { outline:1px dashed rgba(232,178,58,.55); outline-offset:-3px; }
+  .k.selecting, .knob.selecting { outline:2px solid #e8b23a !important; outline-offset:2px; }
+
+  /* knobs: dark cap, lighter skirt ring, white indicator at 12 o'clock */
+  .knob { border-radius:50%; background:radial-gradient(circle at 50% 38%, #4e4e50, #3a3a3c 55%, #262628);
+          box-shadow:0 0 0 1px #1a1a1b, 0 3px 6px rgba(0,0,0,.75), inset 0 1px 0 rgba(255,255,255,.12); }
+  .knob::before { content:""; position:absolute; inset:-5px; border-radius:50%; border:3px solid #5c5c5e;
+                  box-shadow:inset 0 0 0 1px #151516, 0 0 0 1px #151516, 0 2px 3px rgba(0,0,0,.6); }
+  .knob .cap { position:absolute; inset:0; border-radius:50%; }
+  .knob .cap::after { content:""; position:absolute; left:50%; top:3px; width:2px; height:32%;
+                      margin-left:-1px; background:#f2f2ee; border-radius:1px; }
+  .knob.live { cursor:ns-resize; }
+  .knob.live:hover { box-shadow:0 0 0 1px #1a1a1b, 0 3px 6px rgba(0,0,0,.75), inset 0 1px 0 rgba(255,255,255,.12), 0 0 0 2px rgba(232,178,58,.35); }
+
+  /* LEDs */
+  .led { width:7px; height:7px; border-radius:50%; background:#2b2b2b;
+         box-shadow:inset 0 0 0 1px #3a3a3a, 0 0 0 1px #141415; }
+  .led.on.green  { background:#62e06a; box-shadow:0 0 6px 1px rgba(98,224,106,.65), inset 0 0 1px rgba(255,255,255,.7); }
+  .led.on.red    { background:#ff4d3c; box-shadow:0 0 6px 1px rgba(255,77,60,.65), inset 0 0 1px rgba(255,255,255,.7); }
+  .led.on.yellow { background:#ffd23a; box-shadow:0 0 6px 1px rgba(255,210,58,.65), inset 0 0 1px rgba(255,255,255,.7); }
+
+  /* screen */
+  #bezel { left:533px; top:175px; width:297px; height:157px; background:#050506; border-radius:6px;
+           box-shadow:inset 0 0 0 1px #1c1c1e, inset 0 2px 6px rgba(0,0,0,.9), 0 1px 0 rgba(255,255,255,.05); }
+  #screen { left:540px; top:182px; width:283px; height:144px; image-rendering:pixelated; image-rendering:crisp-edges;
+            background:var(--lcd); display:block; transition:opacity .3s; }
+  #screen.dim { opacity:.3; }
+  #note { left:540px; top:182px; width:283px; height:144px; display:none; align-items:center; justify-content:center;
+          color:#d8d5cc; font-size:11px; letter-spacing:.06em; text-transform:uppercase; text-align:center; pointer-events:none; }
+  #note.show { display:flex; }
+  #note span { background:rgba(0,0,0,.55); padding:4px 10px; border-radius:4px; }
+
+  /* crossfader (inert): bed with tick marks, slit, handle */
+  #fbed { left:1032px; top:483px; width:208px; height:39px; background:#141415; border-radius:3px;
+          box-shadow:inset 0 1px 3px #000, 0 0 0 1px #2a2a2c; }
+  #fbed .tick { position:absolute; width:1px; height:4px; background:#d8d5cc; opacity:.8; }
+  #fbed .slit { position:absolute; left:8px; right:8px; top:16px; height:7px; background:#000; border-radius:2px;
+                box-shadow:inset 0 1px 2px #000, 0 0 0 1px #202022; }
+  #fhandle { left:1062px; top:478px; width:22px; height:48px; border-radius:3px;
+             background:linear-gradient(90deg, #6a6a68, #b9b9b5 30%, #cfcfcb 50%, #a8a8a4 75%, #5e5e5c);
+             border:1px solid #1a1a1a; box-shadow:0 2px 4px rgba(0,0,0,.8), inset 0 1px 0 rgba(255,255,255,.4); }
+  #fhandle::after { content:""; position:absolute; left:3px; right:3px; top:22px; height:3px; background:#3a3a38; border-radius:1px; }
 </style>
 </head>
 <body>
-<div id="unit">
-  <div id="mapbar">
-    <b>VIRTUAL PANEL</b><span class="lbl" id="imginfo"></span>
+<div id="top">
+  <div id="bar">
+    <span class="brand">VIRTUAL PANEL</span>
+    <span class="img" id="imginfo"></span>
+    <span id="phase">…</span>
+    <span id="fault"></span>
     <button id="mapbtn" onclick="toggleMap()">MAP KEYS</button>
     <button onclick="doRun(1000)">RUN 1s</button>
     <button onclick="doRun(5000)">RUN 5s</button>
     <button onclick="exportMap()">EXPORT MAP</button>
+    <span id="hint"></span>
   </div>
   <div id="drawer">
-    <div class="lbl" style="margin-bottom:6px">
-      The key matrix: events to the firmware are &lt;row&gt;&lt;column-bits&gt; on the
-      panel UART. Click a cell to tap that key and watch the screen; in
-      mapping mode, first click a panel key to select it, then a cell to bind.
+    <div class="note">
+      The key matrix: events to the firmware are &lt;row&gt;&lt;column-bits&gt; on the panel UART.
+      Click a cell to tap that key (an encoder cell turns it +1) and watch the screen; to bind,
+      click a panel key or knob first (it highlights), then the cell that drives it. Bindings persist in this browser.
     </div>
     <div id="matrix"></div>
-  </div>
-
-  <div class="row" style="align-items:flex-start">
-    <div class="col" style="gap:12px; margin-top:8px">
-      <div class="row"><div class="col"><div class="knob"></div><div class="lbl">VOLUME</div></div>
-        <div class="col"><div class="k red round" data-id="recab"><span>●</span></div><div class="lbl">REC AB</div></div>
-        <div class="col"><div class="k red round" data-id="reccd"><span>●</span></div><div class="lbl">REC CD</div></div>
-      </div>
-      <div class="row">
-        <div class="col"><div class="k" data-id="mixer">MIXER<span class="sub">PROJECT</span></div></div>
-        <div class="col"><div class="k" data-id="midi">MIDI<span class="sub">PART</span></div></div>
-      </div>
-      <div class="row">
-        <div class="col"><div class="k cream" data-id="func">FUNC</div></div>
-        <div class="col"><div class="k" data-id="cue">CUE<span class="sub">RELOAD</span></div></div>
-        <div class="col"><div class="k cream" data-id="yes">ENTER<span class="sub">YES</span></div></div>
-      </div>
-      <div class="row">
-        <div class="col"><div class="k" data-id="pattern">PTN<span class="sub">ARR</span></div></div>
-        <div class="col"><div class="k" data-id="bank">BANK<span class="sub">EDIT</span></div></div>
-        <div class="col"><div class="k cream" data-id="no">EXIT<span class="sub">NO</span></div></div>
-      </div>
-      <div class="col" style="gap:4px; margin-top:2px">
-        <div class="k round" data-id="up">▲</div>
-        <div class="row" style="gap:22px">
-          <div class="k round" data-id="left">◀</div>
-          <div class="k round" data-id="right">▶</div>
-        </div>
-        <div class="k round" data-id="down">▼</div>
-      </div>
-    </div>
-
-    <div class="col" style="margin-top:14px">
-      <div class="k big" data-id="t1">T1</div>
-      <div class="k big" data-id="t2">T2</div>
-      <div class="k big" data-id="t3">T3</div>
-      <div class="k big" data-id="t4">T4</div>
-    </div>
-
-    <div class="col">
-      <div id="screenwrap"><img id="screen" src="/screen.png" alt="LCD"></div>
-      <div id="statusline"></div>
-      <div class="row" style="margin-top:8px">
-        <div class="k" data-id="pg_playback">PLAYBACK<span class="sub">NOTE</span></div>
-        <div class="k" data-id="pg_amp">AMP<span class="sub">ARP</span></div>
-        <div class="k" data-id="pg_lfo">LFO<span class="sub">LFO</span></div>
-        <div class="k" data-id="pg_fx1">FX 1<span class="sub">CTRL 1</span></div>
-        <div class="k" data-id="pg_fx2">FX 2<span class="sub">CTRL 2</span></div>
-      </div>
-      <div class="row" style="margin-top:10px">
-        <div class="k red" data-id="rec">REC ●<span class="sub">COPY</span></div>
-        <div class="k cream" data-id="play">PLAY ▶<span class="sub">CLEAR</span></div>
-        <div class="k cream" data-id="stop">STOP ■<span class="sub">PASTE</span></div>
-      </div>
-    </div>
-
-    <div class="col" style="margin-top:14px">
-      <div class="k big" data-id="t5">T5</div>
-      <div class="k big" data-id="t6">T6</div>
-      <div class="k big" data-id="t7">T7</div>
-      <div class="k big" data-id="t8">T8</div>
-    </div>
-
-    <div class="col" style="gap:10px; margin-top:6px">
-      <div class="row">
-        <div class="col"><div class="knob"></div><div class="lbl">LEVEL</div></div>
-        <div class="col"><div class="knob"></div><div class="lbl">A</div></div>
-        <div class="col"><div class="knob"></div><div class="lbl">B</div></div>
-        <div class="col"><div class="knob"></div><div class="lbl">C</div></div>
-      </div>
-      <div class="row">
-        <div class="col"><div class="k round" data-id="tempo">T</div><div class="lbl">TEMPO</div></div>
-        <div class="col"><div class="knob"></div><div class="lbl">D</div></div>
-        <div class="col"><div class="knob"></div><div class="lbl">E</div></div>
-        <div class="col"><div class="knob"></div><div class="lbl">F</div></div>
-      </div>
-      <div class="row" style="margin-top:8px">
-        <div class="col"><div class="k big" data-id="scene_a">A</div><div class="lbl">SCENE A</div></div>
-        <div class="col"><div id="fader"></div><div class="lbl">CROSSFADER (inert)</div></div>
-        <div class="col"><div class="k big" data-id="scene_b">B</div><div class="lbl">SCENE B</div></div>
-      </div>
-    </div>
-  </div>
-
-  <div class="row" style="margin-top:18px; gap:6px">
-    <div class="col" style="gap:2px" id="trigs"></div>
+    <div id="encoders"></div>
+    <textarea id="export" readonly spellcheck="false"></textarea>
   </div>
 </div>
+<div id="view"><div id="stage">
+  <div id="strip"></div>
+  <div id="bezel"></div>
+  <img id="screen" src="/screen.png" alt="LCD" draggable="false">
+  <div id="note"><span></span></div>
+  <div id="fbed"><div class="slit"></div></div>
+  <div id="fhandle"></div>
+</div></div>
 
 <script>
 "use strict";
 const $ = s => document.querySelector(s);
-let mapMode = false, selecting = null;
+const S = $("#stage");
+const STAGE_W = 1420, STAGE_H = 760;
 
+// ---------------- geometry (stage px, element centres) ----------------
+// keys: id, x, y, w, h, shape, colour, glyph
+const KEYS = [
+  ["recab", 253, 232, 40, 40, "round", "red"], ["reccd", 318, 232, 40, 40, "round", "red"],
+  ["mixer", 213, 337, 34, 34, "round", "gray"], ["midi", 315, 337, 34, 34, "round", "gray"],
+  ["func", 130, 432, 62, 22, "pill", "cream"], ["cue", 211, 432, 62, 22, "pill", "gray"],
+  ["yes", 314, 466, 36, 36, "round", "white"],
+  ["pattern", 130, 523, 62, 22, "pill", "gray"], ["bank", 211, 523, 62, 22, "pill", "gray"],
+  ["no", 314, 523, 36, 36, "round", "white"],
+  ["up", 465, 466, 32, 32, "round", "gray", "▲"], ["left", 403, 523, 32, 32, "round", "gray", "◀"],
+  ["down", 465, 523, 32, 32, "round", "gray", "▼"], ["right", 527, 523, 32, 32, "round", "gray", "▶"],
+  ...[166, 232, 296, 356].map((y, i) => ["t" + (i + 1), 467, y, 36, 36, "round", "gray"]),
+  ...[166, 232, 296, 356].map((y, i) => ["t" + (i + 5), 895, y, 36, 36, "round", "gray"]),
+  ["pg_playback", 571, 433, 32, 32, "round", "white"], ["pg_amp", 626, 433, 32, 32, "round", "white"],
+  ["pg_lfo", 681, 433, 32, 32, "round", "white"], ["pg_fx1", 736, 433, 32, 32, "round", "white"],
+  ["pg_fx2", 791, 433, 32, 32, "round", "white"],
+  ["rec", 651, 527, 60, 24, "pill", "red", "●"], ["play", 725, 527, 60, 24, "pill", "gray", "▶"],
+  ["stop", 798, 527, 60, 24, "pill", "white", "■"],
+  ["tempo", 1013, 322, 34, 34, "round", "gray"],
+  ["scene_a", 943, 502, 52, 52, "round", "gray"], ["scene_b", 1318, 502, 52, 52, "round", "gray"],
+  ...[...Array(16)].map((_, i) => ["trig" + (i + 1), 133 + i * 74.1, 648, 54, 54, "round", "gray"]),
+  ["scale", 1315, 648, 62, 22, "pill", "gray"],
+];
+// LEDs: id, x, y, colour
+const LEDS = [
+  ["card", 900, 88, "green"],
+  ["in_a", 238, 183, "green"], ["in_b", 262, 183, "green"], ["in_c", 305, 183, "green"], ["in_d", 330, 183, "green"],
+  ["midi", 358, 337, "red"], ["func", 130, 486, "red"],
+  ...[166, 232, 296, 356].map((y, i) => ["t" + (i + 1), 425, y, "red"]),
+  ...[166, 232, 296, 356].map((y, i) => ["t" + (i + 5), 937, y, "red"]),
+  ...[571, 626, 681, 736, 791].map((x, i) => [["pg_playback", "pg_amp", "pg_lfo", "pg_fx1", "pg_fx2"][i], x, 474, "red"]),
+  ["rec", 589, 527, "red"], ["tempo", 975, 292, "red"],
+  ["scene_a", 943, 440, "red"], ["scene_b", 1318, 440, "red"],
+  ...[...Array(16)].map((_, i) => ["trig" + (i + 1), 133 + i * 74.1, 590, "red"]),
+  ["scale1", 1290, 601, "red"], ["scale2", 1310, 601, "red"], ["scale3", 1330, 601, "red"], ["scale4", 1348, 601, "red"],
+];
+// knobs: id, x, y, r, live (encoders are live; VOLUME is a pot on the unit)
+const KNOBS = [
+  ["volume", 143, 178, 28, false], ["level", 1013, 218, 26, true],
+  ["a", 1109, 218, 26, true], ["b", 1207, 218, 26, true], ["c", 1305, 218, 26, true],
+  ["d", 1109, 322, 26, true], ["e", 1207, 322, 26, true], ["f", 1305, 322, 26, true],
+];
+// labels: text, x, y, class ("" white 10px, r red 9px, s 8px, t 7px, j jack, title)
+const LABELS = [
+  ...[["Head-phones", 120], ["Main Out", 190], ["Cue Out", 262], ["Input A B", 335], ["Input C D", 405],
+      ["MIDI In", 490], ["MIDI Out", 568], ["MIDI Thru", 650], ["Compact Flash", 840], ["USB", 1005],
+      ["DC In", 1165], ["Power", 1280]].map(([t, x]) => [t, x, 55, "j"]),
+  ["Card Status", 900, 108, "s"], ["Volume", 143, 205],
+  ["A --- B", 250, 166, "s"], ["C --- D", 318, 166, "s"],
+  ["Record", 253, 262], ["Setup", 253, 276, "r"], ["Record", 318, 262], ["Setup", 318, 276, "r"],
+  ["Mixer", 213, 372], ["Project", 213, 384, "r"], ["MIDI", 315, 372], ["Part", 315, 384, "r"],
+  ["Function", 154, 462], ["Cue", 211, 462], ["Reload", 211, 474, "r"],
+  ["Enter/Yes", 314, 500],
+  ["Pattern", 130, 552], ["Arranger", 130, 566, "r"], ["Bank", 211, 552], ["Edit", 211, 566, "r"],
+  ["Exit/No", 314, 557],
+  ...[166, 232, 296, 356].flatMap((y, i) => [["T" + (i + 1), 500, y - 6], ["Mute", 500, y + 7, "r"]]),
+  ...[166, 232, 296, 356].flatMap((y, i) => [["T" + (i + 5), 858, y - 6], ["Mute", 858, y + 7, "r"]]),
+  ["Virtual Panel", 681, 150, "title"],
+  ["Playback", 571, 388], ["Note", 571, 402, "r"], ["Amp", 626, 388], ["Arp", 626, 402, "r"],
+  ["LFO", 681, 388], ["LFO", 681, 402, "r"], ["Effect 1", 736, 388], ["Ctrl 1", 736, 402, "r"],
+  ["Effect 2", 791, 388], ["Ctrl 2", 791, 402, "r"],
+  ["Copy", 651, 556, "r"], ["Clear", 725, 556, "r"], ["Paste", 798, 556, "r"],
+  ["Level", 1013, 250], ["A", 1109, 250], ["B", 1207, 250], ["C", 1305, 250],
+  ["Tempo", 1013, 350], ["Tap Tempo", 1013, 362, "r"], ["D", 1109, 350], ["E", 1207, 350], ["F", 1305, 350],
+  ["Scene A", 943, 540], ["Mute", 943, 552, "r"], ["Scene B", 1318, 540], ["Mute", 1318, 552, "r"],
+  ...[...Array(16)].map((_, i) => [String(i + 1), 133 + i * 74.1, 604, "s"]),
+  ["Scale Setup", 1315, 676, "r"],
+  ["1:4", 1290, 585, "t"], ["2:4", 1310, 585, "t"], ["3:4", 1330, 585, "t"], ["4:4", 1348, 585, "t"],
+];
+// red rules with a caption break: x1, x2, y, text, text x
+const RULES = [
+  [552, 810, 462, "Setup", 681],
+  [106, 678, 712, "Track Trigs", 390],
+  [772, 1272, 712, "Sample/MIDI Trigs", 1000],
+];
+// rear-edge jacks (decorative), at y 15: x, kind
+const JACKS = [[120, 1], [190, 2], [262, 2], [335, 2], [405, 2], [490, "din"], [568, "din"], [650, "din"],
+               [840, "cf"], [1005, "usb"], [1165, 1], [1280, "sw"]];
+
+// ---------------- build ----------------
+function el(cls, x, y, w, h) {
+  const d = document.createElement("div");
+  d.className = cls;
+  if (x !== undefined) { d.style.left = (x - w / 2) + "px"; d.style.top = (y - h / 2) + "px";
+                         d.style.width = w + "px"; d.style.height = h + "px"; }
+  S.append(d); return d;
+}
+function label(text, x, y, cls = "") {
+  const d = document.createElement("div");
+  d.className = "lb " + cls; d.textContent = text;
+  d.style.left = x + "px"; d.style.top = y + "px";
+  S.append(d); return d;
+}
+for (const [x, kind] of JACKS) {
+  if (kind === 1) el("jack", x, 15, 12, 12);
+  else if (kind === 2) { el("jack", x - 9, 15, 12, 12); el("jack", x + 9, 15, 12, 12); }
+  else if (kind === "din") el("jack", x, 15, 16, 16);
+  else if (kind === "cf") el("jack rect", x, 15, 46, 7);
+  else if (kind === "usb") el("jack rect", x, 15, 12, 7);
+  else el("jack rect", x, 15, 16, 9);
+}
+for (const [x, y] of [[32, 55], [1385, 55], [32, 700], [1385, 700]]) el("screw", x, y, 14, 14);
+for (const [id, x, y, w, h, shape, col, glyph] of KEYS) {
+  const k = el(`k ${shape} ${col}`, x, y, w, h);
+  k.dataset.id = id;
+  if (glyph) { const g = document.createElement("span"); g.className = "g" + (w > 40 ? " big" : ""); g.textContent = glyph; k.append(g); }
+}
+for (const [id, x, y, col] of LEDS) { const d = el(`led ${col}`, x, y, 7, 7); d.id = "led-" + id; }
+for (const [id, x, y, r, live] of KNOBS) {
+  const k = el("knob" + (live ? " live" : ""), x, y, 2 * r - 8, 2 * r - 8);
+  k.dataset.id = id; k.dataset.turn = 0;
+  const cap = document.createElement("div"); cap.className = "cap"; k.append(cap);
+}
+for (const [t, x, y, cls] of LABELS) label(t, x, y, cls);
+el("sw", 122, 462, 8, 8);   // "FUNCTION" legend: red labels are FUNC + key
+for (const [x1, x2, y, text, tx] of RULES) {
+  const l = label(text, tx, y, "r");
+  const half = l.offsetWidth / 2 + 5;
+  const a = el("rule"); a.style.left = x1 + "px"; a.style.top = y + "px"; a.style.width = (tx - half - x1) + "px";
+  const b = el("rule"); b.style.left = (tx + half) + "px"; b.style.top = y + "px"; b.style.width = (x2 - tx - half) + "px";
+}
+for (let i = 0; i < 16; i++) { // bank / track pills under the trig keys
+  const p = el("pillb", 133 + i * 74.1, 690, 36, 13);
+  p.innerHTML = `<b>${"ABCDEFGHIJKLMNOP"[i]}</b>T${(i % 8) + 1}`;
+}
+{ // crossfader tick marks
+  const bed = $("#fbed");
+  for (let i = 0; i <= 10; i++) for (const top of [3, 32]) {
+    const t = document.createElement("div"); t.className = "tick";
+    t.style.left = (8 + i * 19.1) + "px"; t.style.top = top + "px"; bed.append(t);
+  }
+}
+
+// ---------------- fit the stage to the window ----------------
+function fit() {
+  const v = $("#view");
+  const s = Math.min((v.clientWidth - 16) / STAGE_W, (v.clientHeight - 16) / STAGE_H);
+  S.style.transform = `translate(-50%,-50%) scale(${Math.max(0.1, s)})`;
+}
+window.addEventListener("resize", fit);
+if (window.ResizeObserver) new ResizeObserver(fit).observe($("#view"));   // the toolbar re-wrapping changes the view too
+
+// ---------------- the map ----------------
 // data-driven key map: id -> [row, bit]; discovered entries ship here,
-// everything else is bound in the MAP drawer (persisted in localStorage).
+// /map (tools/panel/key_map.json) layers over it, and the MAP drawer's
+// bindings (localStorage) over both.
 const BUILTIN = {
   // Confirmed 10 Sep 2026 by driving the emulated firmware and reading the
   // screen it drew. These are top-level screen keys; in-field editing uses
   // held-modifier chords (e.g. a FUNC row held while a value key taps).
   // The rest are still unidentified -- use MAP KEYS to bind them, then
-  // EXPORT MAP and send the JSON as a PR to seed this table.
+  // EXPORT MAP and send the JSON as a PR to seed key_map.json.
   mixer:   [0x26, 0],   // opens MIXER
   yes:     [0x26, 1],   // ENTER/YES: confirms SET DATE/TIME (writes the RTC)
   right:   [0x24, 1],   // cursor right (moves the date field)
@@ -208,150 +343,247 @@ const BUILTIN = {
   // track keys: row 0x22 bits 0-7 = T1-T8 (each sets the current-track byte 0x80000000 to its index)
   ...Object.fromEntries([...Array(8)].map((_, i) => ["t" + (i + 1), [0x22, i]])),
 };
-let overrides = {};
+let mapKeys = {}, mapKnobs = {}, mapLeds = {};   // from /map
+let overrides = {}, knobOverrides = {};          // from the drawer (localStorage)
 try { overrides = JSON.parse(localStorage.getItem("otpanel.matrix") || "{}"); } catch (e) {}
+try { knobOverrides = JSON.parse(localStorage.getItem("otpanel.knobs") || "{}"); } catch (e) {}
+let mapMode = false, selecting = null;
 
-{
-  const wrap = $("#trigs");
-  const row = document.createElement("div"); row.className = "row"; row.style.gap = "6px";
-  for (let i = 1; i <= 16; i++) {
-    const c = document.createElement("div"); c.className = "col"; c.style.gap = "2px";
-    const led = document.createElement("div"); led.className = "led"; led.id = "led" + i;
-    const k = document.createElement("div");
-    k.className = "k trig"; k.dataset.id = "trig" + i; k.textContent = i;
-    c.append(led, k); row.append(c);
-  }
-  wrap.append(row);
-}
-
-function keyOf(el) {
-  const id = el.dataset.id;
-  return overrides[id] || BUILTIN[id] || null;
-}
+const hint = m => { $("#hint").textContent = m; };
+const hex = n => "0x" + n.toString(16);
+function keyOf(el) { const id = el.dataset.id; return overrides[id] || mapKeys[id] || BUILTIN[id] || null; }
+function rowOfKnob(el) { const id = el.dataset.id; const r = knobOverrides[id] ?? mapKnobs[id]; return r == null ? null : +r; }
 
 function refreshMapped() {
   document.querySelectorAll(".k[data-id]").forEach(el => {
     const k = keyOf(el);
     el.classList.toggle("unmapped", !k);
-    el.title = k ? `row 0x${k[0].toString(16)} bit ${k[1]}` : "unmapped — use MAP KEYS";
+    el.title = k ? `${el.dataset.id}: row ${hex(k[0])} bit ${k[1]}` : `${el.dataset.id}: unmapped — use MAP KEYS`;
+  });
+  document.querySelectorAll(".knob").forEach(el => {
+    const r = rowOfKnob(el);
+    el.title = !el.classList.contains("live") ? "volume (a pot on the unit; inert here)"
+             : r != null ? `${el.dataset.id}: encoder row ${hex(r)}` : `${el.dataset.id}: unmapped — use MAP KEYS`;
   });
 }
 
 async function sendKey(row, bit, down) {
   const r = await fetch(`/key?row=${row}&bit=${bit}&down=${down ? 1 : 0}`).then(x => x.json());
-  $("#statusline").textContent =
-    `row 0x${row.toString(16)} bit ${bit} ${down ? "dn" : "up"}: ${r.result}`;
+  hint(`row ${hex(row)} bit ${bit} ${down ? "dn" : "up"}: ${r.result}`);
+  return r;
+}
+async function sendKnob(row, delta) {
+  const r = await fetch(`/knob?row=${hex(row)}&delta=${delta}`).then(x => x.json());
+  hint(`encoder ${hex(row)} ${delta > 0 ? "+" : ""}${delta}: ${r.result}`);
   return r;
 }
 
+// keys: mousedown = held, mouseup anywhere = released (chords across keys work)
 document.addEventListener("mousedown", e => {
   const el = e.target.closest(".k[data-id]");
   if (!el) return;
-  if (mapMode) {
-    document.querySelectorAll(".k.selecting").forEach(x => x.classList.remove("selecting"));
-    selecting = el; el.classList.add("selecting");
-    $("#statusline").textContent = `selected "${el.dataset.id}" — click a matrix cell to bind`;
-    return;
-  }
+  e.preventDefault();
+  if (mapMode) { select(el); return; }
   const k = keyOf(el);
   if (!k) {
     // transport has a proven fallback: the firmware's own key handlers
     const t = {play: "play", rec: "rec", stop: "stop"}[el.dataset.id];
     if (t) {
       el.classList.add("down");
-      fetch(`/transport?k=${t}`).then(x => x.json()).then(r =>
-        $("#statusline").textContent = `${t.toUpperCase()} via key handler: ${r.result}`);
+      fetch(`/transport?k=${t}`).then(x => x.json()).then(r => hint(`${t.toUpperCase()} via key handler: ${r.result}`));
       return;
     }
-    $("#statusline").textContent = `"${el.dataset.id}" is unmapped — use MAP KEYS`; return;
+    hint(`"${el.dataset.id}" is unmapped — use MAP KEYS`); return;
   }
   el.classList.add("down");
   sendKey(k[0], k[1], true);
 });
-document.addEventListener("mouseup", e => {
+document.addEventListener("mouseup", () => {
   document.querySelectorAll(".k.down").forEach(el => {
     el.classList.remove("down");
     const k = keyOf(el);
     if (k && !mapMode) sendKey(k[0], k[1], false);
   });
 });
+function select(el) {
+  document.querySelectorAll(".selecting").forEach(x => x.classList.remove("selecting"));
+  selecting = el; el.classList.add("selecting");
+  const knob = el.classList.contains("knob");
+  hint(`selected "${el.dataset.id}" — click ${knob ? "an encoder cell (0x30-0x36)" : "a matrix cell"} to bind`);
+}
 
+// encoders: wheel or vertical drag over a knob = detents on its matrix row.
+// Turns are coalesced (80 ms) since every /knob costs a 30 ms emulator run.
+const pending = new Map();
+function turn(el, detents) {
+  if (!detents) return;
+  const row = rowOfKnob(el);
+  if (row == null) { hint(`"${el.dataset.id}" knob is unmapped — use MAP KEYS`); return; }
+  el.dataset.turn = +el.dataset.turn + detents;
+  el.querySelector(".cap").style.transform = `rotate(${el.dataset.turn * 6}deg)`;   // ~6 deg per detent
+  const p = pending.get(el) || {n: 0, timer: 0};
+  p.n += detents;
+  if (!p.timer) p.timer = setTimeout(() => {
+    pending.delete(el);
+    sendKnob(row, Math.max(-127, Math.min(127, p.n)));
+  }, 80);
+  pending.set(el, p);
+}
+const wheelAcc = new Map();
+document.addEventListener("wheel", e => {
+  const el = e.target.closest(".knob.live");
+  if (!el) return;
+  e.preventDefault();
+  if (mapMode) return;
+  const dy = e.deltaMode === 1 ? e.deltaY * 20 : e.deltaY;
+  let acc = (wheelAcc.get(el) || 0) + dy;
+  const d = Math.trunc(acc / 40);              // one detent per 40 px (a mouse notch is 100 in Chrome)
+  acc -= d * 40; wheelAcc.set(el, acc);
+  turn(el, -d);                                // wheel up = clockwise = +
+}, {passive: false});
+let drag = null;
+document.addEventListener("mousedown", e => {
+  const el = e.target.closest(".knob.live");
+  if (!el) return;
+  e.preventDefault();
+  if (mapMode) { select(el); return; }
+  drag = {el, y: e.clientY};
+});
+document.addEventListener("mousemove", e => {
+  if (!drag) return;
+  const d = Math.trunc((drag.y - e.clientY) / 6);   // one detent per 6 px of drag, up = +
+  if (d) { drag.y -= d * 6; turn(drag.el, d); }
+});
+document.addEventListener("mouseup", () => { drag = null; });
+
+// ---------------- MAP KEYS drawer ----------------
 function toggleMap() {
   mapMode = !mapMode;
   $("#mapbtn").classList.toggle("on", mapMode);
   $("#drawer").classList.toggle("open", mapMode);
-  if (!mapMode) { selecting = null;
-    document.querySelectorAll(".k.selecting").forEach(x => x.classList.remove("selecting")); }
+  document.body.classList.toggle("mapping", mapMode);
+  if (!mapMode) { selecting = null; $("#export").style.display = "none";
+    document.querySelectorAll(".selecting").forEach(x => x.classList.remove("selecting")); }
+  fit();
 }
 
 function buildMatrix() {
-  const m = $("#matrix"); m.innerHTML = "";
-  const names = {};
-  for (const [id, k] of Object.entries({...BUILTIN, ...overrides}))
-    names[k[0] + ":" + k[1]] = id;
-  m.append(document.createElement("div"));
+  const m = $("#matrix"), en = $("#encoders"); m.innerHTML = ""; en.innerHTML = "";
+  const names = {}, knobNames = {};
+  for (const [id, k] of Object.entries({...BUILTIN, ...mapKeys, ...overrides})) names[k[0] + ":" + k[1]] = id;
+  for (const [id, r] of Object.entries({...mapKnobs, ...knobOverrides})) knobNames[+r] = id;
+  const cell = (into, cls, text) => { const d = document.createElement("div"); d.className = cls; d.textContent = text; into.append(d); return d; };
+  const done = () => { selecting.classList.remove("selecting"); selecting = null; buildMatrix(); refreshMapped(); };
+  // matrix rows 0x20-0x2f as columns, bits as rows
+  cell(m, "hdr", "");
+  for (let row = 0x20; row < 0x30; row++) cell(m, "hdr", hex(row));
   for (let b = 0; b < 8; b++) {
-    const h = document.createElement("div"); h.className = "rowhdr";
-    h.textContent = "bit " + b; m.append(h);
-  }
-  for (let row = 0x20; row < 0x30; row++) {
-    const h = document.createElement("div"); h.className = "rowhdr";
-    h.textContent = "0x" + row.toString(16); m.append(h);
-    for (let b = 0; b < 8; b++) {
-      const d = document.createElement("div");
+    cell(m, "hdr", "bit " + b);
+    for (let row = 0x20; row < 0x30; row++) {
       const name = names[row + ":" + b];
-      d.className = "tk" + (name ? " named" : "");
-      d.textContent = name || "·";
+      const d = cell(m, "tk" + (name ? " named" : ""), name || "·");
+      d.title = `row ${hex(row)} bit ${b}` + (name ? ` = ${name}` : "");
       d.onclick = async () => {
+        if (selecting && selecting.classList.contains("knob")) { hint("a knob binds to an encoder cell (0x30-0x36)"); return; }
         if (selecting) {
           overrides[selecting.dataset.id] = [row, b];
           localStorage.setItem("otpanel.matrix", JSON.stringify(overrides));
-          $("#statusline").textContent = `bound "${selecting.dataset.id}" → row 0x${row.toString(16)} bit ${b}`;
-          selecting.classList.remove("selecting"); selecting = null;
-          buildMatrix(); refreshMapped();
+          hint(`bound "${selecting.dataset.id}" → row ${hex(row)} bit ${b}`);
+          done();
         } else {
           await sendKey(row, b, true);
           await sendKey(row, b, false);
         }
       };
-      m.append(d);
     }
+  }
+  // the seven encoder rows 0x30-0x36 (a turn is an event, not a state)
+  cell(en, "hdr", "encoders");
+  for (let row = 0x30; row < 0x37; row++) {
+    const name = knobNames[row];
+    const d = cell(en, "tk enc" + (name ? " named" : ""), (name ? name + " " : "") + hex(row));
+    d.title = `encoder ${hex(row)}` + (name ? ` = ${name}` : "") + " — click: +1 detent";
+    d.onclick = () => {
+      if (selecting && !selecting.classList.contains("knob")) { hint("a key binds to a matrix cell (0x20-0x2f)"); return; }
+      if (selecting) {
+        knobOverrides[selecting.dataset.id] = row;
+        localStorage.setItem("otpanel.knobs", JSON.stringify(knobOverrides));
+        hint(`bound "${selecting.dataset.id}" → encoder ${hex(row)}`);
+        done();
+      } else sendKnob(row, 1);
+    };
   }
 }
 
 function exportMap() {
-  const out = {};
-  document.querySelectorAll(".k[data-id]").forEach(el => {
-    const k = keyOf(el); if (k) out[el.dataset.id] = k;
-  });
-  navigator.clipboard.writeText(JSON.stringify(out, null, 2));
-  $("#statusline").textContent = "matrix mapping JSON copied to clipboard";
+  // key_map.json shape: {"keys": {id: [row, bit]}, "knobs": {id: row}, "leds": {...}}
+  const out = {keys: {}, knobs: {}};
+  document.querySelectorAll(".k[data-id]").forEach(el => { const k = keyOf(el); if (k) out.keys[el.dataset.id] = k; });
+  document.querySelectorAll(".knob.live").forEach(el => { const r = rowOfKnob(el); if (r != null) out.knobs[el.dataset.id] = r; });
+  if (Object.keys(mapLeds).length) out.leds = mapLeds;
+  const json = JSON.stringify(out, null, 1);
+  const ta = $("#export");
+  if (mapMode) { ta.style.display = "block"; ta.value = json; ta.select(); fit(); }
+  const clip = navigator.clipboard ? navigator.clipboard.writeText(json) : Promise.reject();
+  clip.then(() => hint("panel map JSON copied to clipboard" + (mapMode ? " (and shown below the matrix)" : "")),
+            () => { if (!mapMode) toggleMap(); ta.style.display = "block"; ta.value = json; ta.select(); fit();
+                    hint("clipboard unavailable — the map JSON is selected below the matrix"); });
 }
 
 async function doRun(ms) {
-  $("#statusline").textContent = `running ${ms} ms of emulated time…`;
+  hint(`running ${ms} ms of emulated time…`);
   const r = await fetch(`/run?ms=${ms}`).then(x => x.json());
-  $("#statusline").textContent = r.ok ? `ran ${ms} ms` : `run failed: ${r.result}`;
+  hint(r.ok ? `ran ${ms} ms` : `run failed: ${r.result}`);
 }
 
-let lastSeq = -1;
+// ---------------- LEDs (only when the map names them) ----------------
+// a map entry is [byte, bit] into the 0x10 bitmap blocks (bits: hex string)
+// or an LED id ("0x21" or 33), lit when its last value is > 0x20
+function ledOn(spec, bits, ids) {
+  if (Array.isArray(spec)) {
+    const byte = parseInt(bits.substr(spec[0] * 2, 2) || "0", 16);
+    return !!((byte >> spec[1]) & 1);
+  }
+  const key = typeof spec === "number" ? "0x" + spec.toString(16).padStart(2, "0") : String(spec).toLowerCase();
+  return (ids[key] || 0) > 0x20;
+}
+function applyLeds(l) {
+  for (const [id, spec] of Object.entries(mapLeds)) {
+    const el = document.getElementById("led-" + id);
+    if (el) el.classList.toggle("on", ledOn(spec, l.bits || "", l.ids || {}));
+  }
+}
+
+// ---------------- status poll ----------------
+let lastSeq = -1, lastFault = null;
 async function poll() {
   try {
     const s = await fetch("/status").then(x => x.json());
-    $("#imginfo").textContent =
-      (s.image || "").split("/").pop() + (s.fault ? "  ⚠ " + s.fault : "");
-    const busy = s.phase && s.phase !== "ready";
-    $("#screenwrap").style.opacity = busy ? 0.35 : 1;
-    if (busy) $("#statusline").textContent = "⏳ " + s.phase + " — the screen fills in when this finishes";
-    if (s.seq !== lastSeq) {
-      lastSeq = s.seq;
-      $("#screen").src = "/screen.png?" + s.seq;
-    }
+    $("#imginfo").textContent = (s.image || "").split("/").pop();
+    const phase = s.phase || (s.booted ? "ready" : "booting");
+    const ph = $("#phase");
+    ph.textContent = phase;
+    ph.className = phase === "ready" ? "ready" : phase === "failed" ? "failed" : "busy";
+    if (s.fault !== lastFault) { lastFault = s.fault; $("#fault").textContent = s.fault ? "⚠ " + s.fault : ""; $("#fault").title = s.fault || ""; }
+    const busy = phase !== "ready";
+    $("#screen").classList.toggle("dim", busy);
+    $("#note").classList.toggle("show", busy);
+    $("#note span").textContent = busy ? `loading — ${phase}` : "";
+    if (s.seq !== lastSeq) { lastSeq = s.seq; $("#screen").src = "/screen.png?" + s.seq; }
+    if (Object.keys(mapLeds).length) applyLeds(await fetch("/leds").then(x => x.json()));
   } catch (e) {}
   setTimeout(poll, 350);
 }
 
-buildMatrix(); refreshMapped(); poll();
+async function loadMap() {
+  try {
+    const m = await fetch("/map").then(x => x.json());
+    mapKeys = m.keys || {}; mapKnobs = m.knobs || {}; mapLeds = m.leds || {};
+  } catch (e) {}
+  buildMatrix(); refreshMapped();
+}
+
+fit(); loadMap(); poll();
 </script>
 </body>
 </html>
