@@ -194,8 +194,13 @@ let mapMode = false, selecting = null;
 // data-driven key map: id -> [row, bit]; discovered entries ship here,
 // everything else is bound in the MAP drawer (persisted in localStorage).
 const BUILTIN = {
-  // discovered 10 Sep 2026 (row 0x25 bit 6 opens PATTERN SETTINGS over a modal)
-  // -- extend as the matrix gets identified.
+  // Confirmed 10 Sep 2026 by driving the emulated firmware and reading the
+  // screen it drew. These are top-level screen keys; in-field editing uses
+  // held-modifier chords (e.g. a FUNC row held while a value key taps).
+  // The rest are still unidentified -- use MAP KEYS to bind them, then
+  // EXPORT MAP and send the JSON as a PR to seed this table.
+  mixer:   [0x26, 0],   // opens MIXER
+  pattern: [0x25, 6],   // opens PATTERN SETTINGS
 };
 let overrides = {};
 try { overrides = JSON.parse(localStorage.getItem("otpanel.matrix") || "{}"); } catch (e) {}
