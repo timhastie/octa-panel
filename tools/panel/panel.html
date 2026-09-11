@@ -205,6 +205,8 @@ const BUILTIN = {
   pattern: [0x25, 6],   // opens PATTERN SETTINGS
   // trig keys: row 0x20 bits 0-7 = trigs 1-8, row 0x21 = trigs 9-16
   ...Object.fromEntries([...Array(16)].map((_, i) => ["trig" + (i + 1), [0x20 + (i >> 3), i & 7]])),
+  // track keys: row 0x22 bits 0-7 = T1-T8 (each sets the current-track byte 0x80000000 to its index)
+  ...Object.fromEntries([...Array(8)].map((_, i) => ["t" + (i + 1), [0x22, i]])),
 };
 let overrides = {};
 try { overrides = JSON.parse(localStorage.getItem("otpanel.matrix") || "{}"); } catch (e) {}
