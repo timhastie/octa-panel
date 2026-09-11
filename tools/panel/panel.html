@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Virtual Panel</title>
+<style>
+  :root {
+    --panel:#2b2b2d; --panel2:#232325; --key:#9a9a97; --key-hi:#c6c6c2;
+    --red:#c03a2b; --cream:#e8e4da; --txt:#d8d5cc; --dim:#8a877e;
+    --lcd:#c9cdc4;
+  }
+  body { margin:0; background:#161617; color:var(--txt);
+         font:12px/1.35 -apple-system, "Helvetica Neue", sans-serif;
+         display:flex; flex-direction:column; align-items:center; }
+  #unit { background:linear-gradient(#303032,var(--panel) 12%,var(--panel2));
+          border:1px solid #000; border-radius:10px; margin:18px 8px;
+          padding:16px 20px 20px; box-shadow:0 12px 40px #000a;
+          user-select:none; width:min(1180px,97vw); box-sizing:border-box; }
+  .row { display:flex; align-items:center; justify-content:center; gap:14px; }
+  .col { display:flex; flex-direction:column; gap:8px; align-items:center; }
+
+  .k { background:linear-gradient(#b9b9b5,var(--key));
+       border:1px solid #55554f; border-bottom-color:#2e2e2a;
+       border-radius:6px; color:#1c1c1a; text-align:center;
+       cursor:pointer; padding:7px 6px; min-width:52px;
+       font-weight:600; font-size:10px; letter-spacing:.02em;
+       box-shadow:0 2px 0 #1c1c1a80; position:relative; }
+  .k:active, .k.down { transform:translateY(1px); box-shadow:0 1px 0 #1c1c1a80;
+                       background:linear-gradient(#d6d6d2,var(--key-hi)); }
+  .k.red   { background:linear-gradient(#d0523f,var(--red)); color:#fff; }
+  .k.red:active { background:linear-gradient(#e06a56,#cf4736); }
+  .k.cream { background:linear-gradient(#f2efe7,var(--cream)); }
+  .k.round { border-radius:50%; width:38px; height:38px; min-width:38px;
+             padding:0; display:flex; align-items:center; justify-content:center; }
+  .k.big   { width:52px; height:52px; min-width:52px; border-radius:50%; }
+  .k .sub  { display:block; font-weight:400; font-size:8px; color:#7a2020; }
+  .k.unmapped { outline:1px dashed #6b6b64; outline-offset:-3px; }
+  .k.selecting { outline:2px solid #e8b23a; outline-offset:-2px; }
+  .lbl { font-size:9px; color:var(--dim); text-align:center; }
+
+  #screenwrap { background:#0c0c0d; border:3px solid #0a0a0a; border-radius:6px;
+                padding:10px; box-shadow:inset 0 0 18px #000; }
+  #screen { width:512px; height:256px; image-rendering:pixelated; display:block;
+            background:var(--lcd); }
+  #statusline { font-size:10px; color:var(--dim); margin-top:6px; text-align:center;
+                min-height:14px; max-width:540px; }
+
+  .knob { width:44px; height:44px; border-radius:50%;
+          background:radial-gradient(circle at 35% 30%, #b5b5b1, #7d7d79 70%, #565652);
+          border:1px solid #333; position:relative; opacity:.55; }
+  .knob::after { content:""; position:absolute; left:50%; top:4px; width:2px;
+                 height:12px; background:#2a2a28; transform:translateX(-50%); }
+
+  .trig { min-width:46px; padding:10px 4px; }
+  .led { width:7px; height:7px; border-radius:50%; background:#3a3a38;
+         margin:0 auto 3px; }
+  .led.on { background:#e5533a; box-shadow:0 0 6px #e5533a; }
+  .led.grn { background:#7ac25a; box-shadow:0 0 6px #7ac25a; }
+
+  #fader { width:170px; height:34px; background:#1b1b1c; border-radius:4px;
+           border:1px solid #000; position:relative; opacity:.55; }
+  #fader::after { content:""; position:absolute; left:46%; top:3px; width:16px;
+                  height:26px; background:linear-gradient(#cfcfcb,#8f8f8b);
+                  border-radius:3px; border:1px solid #333; }
+
+  #mapbar { margin:6px 0 12px; display:flex; gap:10px; align-items:center;
+            justify-content:center; font-size:11px; }
+  #mapbar button { background:#3a3a3c; color:var(--txt); border:1px solid #555;
+                   border-radius:4px; padding:4px 10px; cursor:pointer; }
+  #mapbar button.on { background:#7a5a18; border-color:#e8b23a; }
+  #drawer { display:none; background:#1d1d1f; border:1px solid #3a3a3c;
+            border-radius:6px; padding:10px; margin-bottom:12px; }
+  #drawer.open { display:block; }
+  #matrix { display:grid; grid-template-columns:auto repeat(8,1fr); gap:4px; }
+  .tk { background:#333335; border:1px solid #4a4a4c; border-radius:4px;
+        padding:4px 6px; font-size:9px; text-align:center; cursor:pointer;
+        color:#bdbab2; }
+  .tk:hover { background:#44444a; }
+  .tk.named { border-color:#7a9a5a; }
+  .rowhdr { font-size:9px; color:var(--dim); align-self:center; }
+</style>
+</head>
+<body>
+<div id="unit">
+  <div id="mapbar">
+    <b>VIRTUAL PANEL</b><span class="lbl" id="imginfo"></span>
+    <button id="mapbtn" onclick="toggleMap()">MAP KEYS</button>
+    <button onclick="doRun(1000)">RUN 1s</button>
+    <button onclick="doRun(5000)">RUN 5s</button>
+    <button onclick="exportMap()">EXPORT MAP</button>
+  </div>
+  <div id="drawer">
+    <div class="lbl" style="margin-bottom:6px">
+      The key matrix: events to the firmware are &lt;row&gt;&lt;column-bits&gt; on the
+      panel UART. Click a cell to tap that key and watch the screen; in
+      mapping mode, first click a panel key to select it, then a cell to bind.
+    </div>
+    <div id="matrix"></div>
+  </div>
+
+  <div class="row" style="align-items:flex-start">
+    <div class="col" style="gap:12px; margin-top:8px">
+      <div class="row"><div class="col"><div class="knob"></div><div class="lbl">VOLUME</div></div>
+        <div class="col"><div class="k red round" data-id="recab"><span>●</span></div><div class="lbl">REC AB</div></div>
+        <div class="col"><div class="k red round" data-id="reccd"><span>●</span></div><div class="lbl">REC CD</div></div>
+      </div>
+      <div class="row">
+        <div class="col"><div class="k" data-id="mixer">MIXER<span class="sub">PROJECT</span></div></div>
+        <div class="col"><div class="k" data-id="midi">MIDI<span class="sub">PART</span></div></div>
+      </div>
+      <div class="row">
+        <div class="col"><div class="k cream" data-id="func">FUNC</div></div>
+        <div class="col"><div class="k" data-id="cue">CUE<span class="sub">RELOAD</span></div></div>
+        <div class="col"><div class="k cream" data-id="yes">ENTER<span class="sub">YES</span></div></div>
+      </div>
+      <div class="row">
+        <div class="col"><div class="k" data-id="pattern">PTN<span class="sub">ARR</span></div></div>
+        <div class="col"><div class="k" data-id="bank">BANK<span class="sub">EDIT</span></div></div>
+        <div class="col"><div class="k cream" data-id="no">EXIT<span class="sub">NO</span></div></div>
+      </div>
+      <div class="col" style="gap:4px; margin-top:2px">
+        <div class="k round" data-id="up">▲</div>
+        <div class="row" style="gap:22px">
+          <div class="k round" data-id="left">◀</div>
+          <div class="k round" data-id="right">▶</div>
+        </div>
+        <div class="k round" data-id="down">▼</div>
+      </div>
+    </div>
+
+    <div class="col" style="margin-top:14px">
+      <div class="k big" data-id="t1">T1</div>
+      <div class="k big" data-id="t2">T2</div>
+      <div class="k big" data-id="t3">T3</div>
+      <div class="k big" data-id="t4">T4</div>
+    </div>
+
+    <div class="col">
+      <div id="screenwrap"><img id="screen" src="/screen.png" alt="LCD"></div>
+      <div id="statusline"></div>
+      <div class="row" style="margin-top:8px">
+        <div class="k" data-id="pg_playback">PLAYBACK<span class="sub">NOTE</span></div>
+        <div class="k" data-id="pg_amp">AMP<span class="sub">ARP</span></div>
+        <div class="k" data-id="pg_lfo">LFO<span class="sub">LFO</span></div>
+        <div class="k" data-id="pg_fx1">FX 1<span class="sub">CTRL 1</span></div>
+        <div class="k" data-id="pg_fx2">FX 2<span class="sub">CTRL 2</span></div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <div class="k red" data-id="rec">REC ●<span class="sub">COPY</span></div>
+        <div class="k cream" data-id="play">PLAY ▶<span class="sub">CLEAR</span></div>
+        <div class="k cream" data-id="stop">STOP ■<span class="sub">PASTE</span></div>
+      </div>
+    </div>
+
+    <div class="col" style="margin-top:14px">
+      <div class="k big" data-id="t5">T5</div>
+      <div class="k big" data-id="t6">T6</div>
+      <div class="k big" data-id="t7">T7</div>
+      <div class="k big" data-id="t8">T8</div>
+    </div>
+
+    <div class="col" style="gap:10px; margin-top:6px">
+      <div class="row">
+        <div class="col"><div class="knob"></div><div class="lbl">LEVEL</div></div>
+        <div class="col"><div class="knob"></div><div class="lbl">A</div></div>
+        <div class="col"><div class="knob"></div><div class="lbl">B</div></div>
+        <div class="col"><div class="knob"></div><div class="lbl">C</div></div>
+      </div>
+      <div class="row">
+        <div class="col"><div class="k round" data-id="tempo">T</div><div class="lbl">TEMPO</div></div>
+        <div class="col"><div class="knob"></div><div class="lbl">D</div></div>
+        <div class="col"><div class="knob"></div><div class="lbl">E</div></div>
+        <div class="col"><div class="knob"></div><div class="lbl">F</div></div>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <div class="col"><div class="k big" data-id="scene_a">A</div><div class="lbl">SCENE A</div></div>
+        <div class="col"><div id="fader"></div><div class="lbl">CROSSFADER (inert)</div></div>
+        <div class="col"><div class="k big" data-id="scene_b">B</div><div class="lbl">SCENE B</div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top:18px; gap:6px">
+    <div class="col" style="gap:2px" id="trigs"></div>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+let mapMode = false, selecting = null;
+
+// data-driven key map: id -> [row, bit]; discovered entries ship here,
+// everything else is bound in the MAP drawer (persisted in localStorage).
+const BUILTIN = {
+  // discovered 10 Sep 2026 (row 0x25 bit 6 opens PATTERN SETTINGS over a modal)
+  // -- extend as the matrix gets identified.
+};
+let overrides = {};
+try { overrides = JSON.parse(localStorage.getItem("otpanel.matrix") || "{}"); } catch (e) {}
+
+{
+  const wrap = $("#trigs");
+  const row = document.createElement("div"); row.className = "row"; row.style.gap = "6px";
+  for (let i = 1; i <= 16; i++) {
+    const c = document.createElement("div"); c.className = "col"; c.style.gap = "2px";
+    const led = document.createElement("div"); led.className = "led"; led.id = "led" + i;
+    const k = document.createElement("div");
+    k.className = "k trig"; k.dataset.id = "trig" + i; k.textContent = i;
+    c.append(led, k); row.append(c);
+  }
+  wrap.append(row);
+}
+
+function keyOf(el) {
+  const id = el.dataset.id;
+  return overrides[id] || BUILTIN[id] || null;
+}
+
+function refreshMapped() {
+  document.querySelectorAll(".k[data-id]").forEach(el => {
+    const k = keyOf(el);
+    el.classList.toggle("unmapped", !k);
+    el.title = k ? `row 0x${k[0].toString(16)} bit ${k[1]}` : "unmapped — use MAP KEYS";
+  });
+}
+
+async function sendKey(row, bit, down) {
+  const r = await fetch(`/key?row=${row}&bit=${bit}&down=${down ? 1 : 0}`).then(x => x.json());
+  $("#statusline").textContent =
+    `row 0x${row.toString(16)} bit ${bit} ${down ? "dn" : "up"}: ${r.result}`;
+  return r;
+}
+
+document.addEventListener("mousedown", e => {
+  const el = e.target.closest(".k[data-id]");
+  if (!el) return;
+  if (mapMode) {
+    document.querySelectorAll(".k.selecting").forEach(x => x.classList.remove("selecting"));
+    selecting = el; el.classList.add("selecting");
+    $("#statusline").textContent = `selected "${el.dataset.id}" — click a matrix cell to bind`;
+    return;
+  }
+  const k = keyOf(el);
+  if (!k) { $("#statusline").textContent = `"${el.dataset.id}" is unmapped — use MAP KEYS`; return; }
+  el.classList.add("down");
+  sendKey(k[0], k[1], true);
+});
+document.addEventListener("mouseup", e => {
+  document.querySelectorAll(".k.down").forEach(el => {
+    el.classList.remove("down");
+    const k = keyOf(el);
+    if (k && !mapMode) sendKey(k[0], k[1], false);
+  });
+});
+
+function toggleMap() {
+  mapMode = !mapMode;
+  $("#mapbtn").classList.toggle("on", mapMode);
+  $("#drawer").classList.toggle("open", mapMode);
+  if (!mapMode) { selecting = null;
+    document.querySelectorAll(".k.selecting").forEach(x => x.classList.remove("selecting")); }
+}
+
+function buildMatrix() {
+  const m = $("#matrix"); m.innerHTML = "";
+  const names = {};
+  for (const [id, k] of Object.entries({...BUILTIN, ...overrides}))
+    names[k[0] + ":" + k[1]] = id;
+  m.append(document.createElement("div"));
+  for (let b = 0; b < 8; b++) {
+    const h = document.createElement("div"); h.className = "rowhdr";
+    h.textContent = "bit " + b; m.append(h);
+  }
+  for (let row = 0x20; row < 0x30; row++) {
+    const h = document.createElement("div"); h.className = "rowhdr";
+    h.textContent = "0x" + row.toString(16); m.append(h);
+    for (let b = 0; b < 8; b++) {
+      const d = document.createElement("div");
+      const name = names[row + ":" + b];
+      d.className = "tk" + (name ? " named" : "");
+      d.textContent = name || "·";
+      d.onclick = async () => {
+        if (selecting) {
+          overrides[selecting.dataset.id] = [row, b];
+          localStorage.setItem("otpanel.matrix", JSON.stringify(overrides));
+          $("#statusline").textContent = `bound "${selecting.dataset.id}" → row 0x${row.toString(16)} bit ${b}`;
+          selecting.classList.remove("selecting"); selecting = null;
+          buildMatrix(); refreshMapped();
+        } else {
+          await sendKey(row, b, true);
+          await sendKey(row, b, false);
+        }
+      };
+      m.append(d);
+    }
+  }
+}
+
+function exportMap() {
+  const out = {};
+  document.querySelectorAll(".k[data-id]").forEach(el => {
+    const k = keyOf(el); if (k) out[el.dataset.id] = k;
+  });
+  navigator.clipboard.writeText(JSON.stringify(out, null, 2));
+  $("#statusline").textContent = "matrix mapping JSON copied to clipboard";
+}
+
+async function doRun(ms) {
+  $("#statusline").textContent = `running ${ms} ms of emulated time…`;
+  const r = await fetch(`/run?ms=${ms}`).then(x => x.json());
+  $("#statusline").textContent = r.ok ? `ran ${ms} ms` : `run failed: ${r.result}`;
+}
+
+let lastSeq = -1;
+async function poll() {
+  try {
+    const s = await fetch("/status").then(x => x.json());
+    $("#imginfo").textContent =
+      (s.image || "").split("/").pop() + (s.fault ? "  ⚠ " + s.fault : "");
+    if (s.seq !== lastSeq) {
+      lastSeq = s.seq;
+      $("#screen").src = "/screen.png?" + s.seq;
+    }
+  } catch (e) {}
+  setTimeout(poll, 350);
+}
+
+buildMatrix(); refreshMapped(); poll();
+</script>
+</body>
+</html>
