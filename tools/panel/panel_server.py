@@ -225,6 +225,20 @@ class Panel:
                        "final_bank": final_bank, "elapsed_ms": elapsed}
         self._snapshot(rt.uc if hasattr(rt, "uc") else self.r.uc)
 
+    def knob(self, row, delta):
+        """An encoder turn: matrix rows 0x30-0x36 are the seven encoders and
+        the second byte is a SIGNED detent delta (measured 10 Sep 2026: row
+        0x30 with +2 moved the MIXER's MAIN field +2, with +16 clamped at
+        +15). No release event -- a turn is an event, not a state."""
+        if not (0x30 <= row < 0x37):
+            return False, "encoder rows are 0x30-0x36"
+        delta = max(-127, min(127, int(delta)))
+        def act(rt):
+            rt.uart64.rx.extend([row, delta & 0xff])
+            rt.run(ms=30)
+            return f"row {row:#04x} delta {delta:+d}"
+        return self.do(act, timeout=120)
+
     def transport(self, what):
         """PLAY / REC / STOP through the firmware's own key handlers
         (press_key_live, RTOS_FORK.md section 9) -- the proven way to start
@@ -413,6 +427,13 @@ class Handler(BaseHTTPRequestHandler):
             ok, res = p.key(int(args.get("row", "-1"), 0), int(args.get("bit", "-1")),
                             args.get("down", "1") == "1")
             self._json({"ok": ok, "result": str(res)})
+        elif path == "/knob":
+            ok, res = p.knob(int(args.get("row", "-1"), 0), int(args.get("delta", "0")))
+            self._json({"ok": ok, "result": str(res)})
+        elif path == "/map":
+            # the identified panel map (keys, knobs, leds): tools/panel/key_map.json
+            mp = pathlib.Path(__file__).parent / "key_map.json"
+            self._send(200, mp.read_bytes() if mp.exists() else b"{}", "application/json")
         elif path == "/transport":
             ok, res = p.transport(args.get("k", ""))
             self._json({"ok": ok, "result": str(res)})
