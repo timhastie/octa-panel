@@ -200,7 +200,11 @@ const BUILTIN = {
   // The rest are still unidentified -- use MAP KEYS to bind them, then
   // EXPORT MAP and send the JSON as a PR to seed this table.
   mixer:   [0x26, 0],   // opens MIXER
+  yes:     [0x26, 1],   // ENTER/YES: confirms SET DATE/TIME (writes the RTC)
+  right:   [0x24, 1],   // cursor right (moves the date field)
   pattern: [0x25, 6],   // opens PATTERN SETTINGS
+  // trig keys: row 0x20 bits 0-7 = trigs 1-8, row 0x21 = trigs 9-16
+  ...Object.fromEntries([...Array(16)].map((_, i) => ["trig" + (i + 1), [0x20 + (i >> 3), i & 7]])),
 };
 let overrides = {};
 try { overrides = JSON.parse(localStorage.getItem("otpanel.matrix") || "{}"); } catch (e) {}
