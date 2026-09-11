@@ -50,30 +50,32 @@ def _manifest():
     return m
 
 
+def link_source(m, addr):
+    """Assemble and link cc_page2.s at `addr` -- the same placement the build
+    performs for a floating CavePatch, reproduced here byte for byte."""
+    with tempfile.TemporaryDirectory() as d:
+        o, e, b = (pathlib.Path(d) / n for n in ("cc.o", "cc.elf", "cc.bin"))
+        subprocess.run(["m68k-elf-as", "-mcpu=5407", "-o", str(o),
+                        str(ROOT / "modules/ccpage2/cc_page2.s")], check=True)
+        # The cave's fall-through is a link-time symbol (CC_NEXT) so a
+        # bridge can chain it in front of Octakit's CC handler; the
+        # manifest's default is stock's handler, and that is what the
+        # ratified bytes carry.
+        subprocess.run(["m68k-elf-ld", f"-Ttext=0x{addr:x}",
+                        *[f"--defsym={n}=0x{v:x}" for n, v in m.MODULE.cf_patches[0].defsyms],
+                        "-o", str(e), str(o)], check=True)
+        subprocess.run(["m68k-elf-objcopy", "-O", "binary", "-j", ".text",
+                        str(e), str(b)], check=True)
+        return b.read_bytes()
+
+
 def check_source_matches(m):
     """The source is the truth since 9 Sep 2026 (its count tables are labels,
     linked wherever the cave lands); the hand-patched CODE+tables it replaced
     is kept in the manifest as legacy_bytes(addr) and is the ORACLE here:
     linked at any address, the two must be byte-identical."""
-    shutil = __import__("shutil")
-    if not all(shutil.which(t) for t in ("m68k-elf-as", "m68k-elf-ld", "m68k-elf-objcopy")):
-        print("  (skip source link check: no m68k-elf toolchain)")
-        return
     for addr in (0x400d7300, 0x400d24d0):
-        with tempfile.TemporaryDirectory() as d:
-            o, e, b = (pathlib.Path(d) / n for n in ("cc.o", "cc.elf", "cc.bin"))
-            subprocess.run(["m68k-elf-as", "-mcpu=5407", "-o", str(o),
-                            str(ROOT / "modules/ccpage2/cc_page2.s")], check=True)
-            # The cave's fall-through is a link-time symbol (CC_NEXT) so a
-            # bridge can chain it in front of Octakit's CC handler; the
-            # manifest's default is stock's handler, and that is what the
-            # ratified bytes carry.
-            subprocess.run(["m68k-elf-ld", f"-Ttext=0x{addr:x}",
-                            *[f"--defsym={n}=0x{v:x}" for n, v in m.MODULE.cf_patches[0].defsyms],
-                            "-o", str(e), str(o)], check=True)
-            subprocess.run(["m68k-elf-objcopy", "-O", "binary", "-j", ".text",
-                            str(e), str(b)], check=True)
-            linked = b.read_bytes()
+        linked = link_source(m, addr)
         want = m.legacy_bytes(addr)
         assert linked == want, (f"cc_page2.s linked at 0x{addr:08x} differs from the "
                                 f"hand-patched legacy bytes ({len(linked)} vs {len(want)} B)")
@@ -96,8 +98,16 @@ def _addrs(uc, track, slot2):
 
 def main():
     m = _manifest()
+    shutil = __import__("shutil")
+    if not all(shutil.which(t) for t in ("m68k-elf-as", "m68k-elf-ld", "m68k-elf-objcopy")):
+        print("  (skip: no m68k-elf toolchain -- the cave is linked from source)")
+        return 0
     check_source_matches(m)
-    blob, pokes = m.emit(CAVE_AT)
+    # emit() returns no bytes since the source-is-truth refactor (9 Sep 2026);
+    # link the cave at the test address ourselves, as the build does at its
+    # float address.
+    _, pokes = m.emit(CAVE_AT)
+    blob = link_source(m, CAVE_AT)
     assert pokes[0] == (0x400d64a0, (0x4000e79c).to_bytes(4, "big"),
                         CAVE_AT.to_bytes(4, "big")), "dispatch poke wrong"
 
