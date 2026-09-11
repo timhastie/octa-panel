@@ -128,6 +128,11 @@ class Panel:
         self.led_bits = bytearray(64)
         self.led_ids = {}
         self.handlers = self._read_table(image)
+        try:
+            from panel_link import PanelLink     # tools/panel/panel_link.py, when present
+            self.link = PanelLink()
+        except Exception:
+            self.link = None
         threading.Thread(target=self._loop, daemon=True).start()
 
     @staticmethod
@@ -136,16 +141,39 @@ class Panel:
         off = KEY_TABLE - 0x40000000
         return [struct.unpack(">I", data[off + i * 4:][:4])[0] for i in range(KEY_COUNT)]
 
-    def _snapshot(self, uc):
+    link = None          # PanelLink: the decoded CPU->panel UART stream, when available
+    _link_pos = 0
+
+    def _lcd_rows(self, uc):
+        """64 rows x 128 bools, top row first -- what the LCD shows.
+
+        Preferred source: the panel UART stream decoded by
+        tools/panel/panel_link.py (the firmware sends the LCD its data
+        over UART@fc064000 in 0x10 <chunk> <8 bytes> blocks and scrolls
+        with its own commands, so the stream is the ground truth). Fallback:
+        the RAM framebuffer at FB, whose page ORDER on screen is not fixed
+        (renders come out with lines rotated when the firmware scrolls --
+        the 11 Sep 2026 "sample list wrapped" report)."""
+        if self.link is not None and hasattr(self, "rt"):
+            tx = self.rt.uart64.tx
+            if len(tx) > self._link_pos:
+                self.link.feed(bytes(tx[self._link_pos:]))
+                self._link_pos = len(tx)
+            try:
+                return self.link.lcd_rows()
+            except Exception as e:      # a decoder fault must not blank the panel
+                self.fault = f"panel_link: {type(e).__name__}: {e}"
         buf = bytes(uc.mem_read(FB, 1024))
-        on, off = b"\x1a", b"\xc9"   # dark pixels on a pale LCD
         rows = []
         for y in range(64):
             yy = 63 - y
             page, bit = yy >> 3, 7 - (yy & 7)
-            rows.append(b"".join(
-                on if (buf[x * 8 + page] >> bit) & 1 else off
-                for x in range(128)))
+            rows.append([(buf[x * 8 + page] >> bit) & 1 for x in range(128)])
+        return rows
+
+    def _snapshot(self, uc):
+        on, off = b"\x1a", b"\xc9"   # dark pixels on a pale LCD
+        rows = [b"".join(on if px else off for px in row) for row in self._lcd_rows(uc)]
         png = _png_gray(128, 64, rows)
         with self.lock:
             if png != self.frame:
@@ -454,8 +482,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "\n\n".join(f"== {k}\n{v}" for k, v in dump.items()).encode(), "text/plain")
         elif path == "/leds":
             with p.lock:
+                ids = dict(p.led_ids)
+                if p.link is not None:
+                    try:
+                        ids.update(p.link.leds)      # the decoder's view wins when present
+                    except Exception:
+                        pass
                 self._json({"bits": bytes(p.led_bits).hex(),
-                            "ids": {f"{k:#04x}": v for k, v in p.led_ids.items()}})
+                            "ids": {f"{k:#04x}": v for k, v in ids.items()}})
         elif path == "/run":
             ms = float(args.get("ms", 100))
             ok, res = p.do(lambda rt: rt.run(ms=min(ms, 5000)), timeout=600)
