@@ -1,39 +1,53 @@
 # The virtual front panel
 
-A clickable Octatrack in the browser, driven by the real firmware under the
-route-A emulator (`tools/emu/emu_rtos.py`). The screen is the firmware's own
-LCD; the keys go in through the panel scanner's own wire. It is a way to
-*operate* a built image before flashing — walk menus, open pages, start the
-sequencer — not just boot it.
+A clickable Octatrack, driven by the real firmware under the route-A
+emulator (`tools/emu/emu_rtos.py`). The screen is what the firmware sends
+its LCD; the keys, knobs and LEDs go over the panel's own wire. It is a way
+to *operate* a built image before flashing — walk menus, open pages, turn
+knobs, start the sequencer — not just boot it.
+
+**As an app (macOS):** `bash tools/panel/app/build.sh` once, then open
+`out/Virtual Panel.app` — a native window that starts the server itself,
+loads the default project (`out/_projects/otlive/…`) and offers
+File ▸ Open Project… (`tools/panel/app/README.md`).
+
+**In a browser:**
 
 ```sh
-.venv/bin/python3 tools/panel/panel_server.py                 # built image (out/mainos_bus.bin) if present, else stock
-.venv/bin/python3 tools/panel/panel_server.py --image out/raw/section_3_MAIN_OS.bin
+.venv/bin/python3 tools/panel/panel_server.py                 # stock OS image
+.venv/bin/python3 tools/panel/panel_server.py --image out/mainos_bus.bin   # a built remix
 .venv/bin/python3 tools/panel/panel_server.py --project ~/octa/backups/<snap>/<project>
 ```
 
-Open <http://localhost:8563/>.
+Open <http://localhost:8563/>. Boot takes ~5 s; a project load ~1½ min
+(the page says so). The SET DATE/TIME dialog the firmware opens on every
+boot is closed for you with YES (which stores the clock in RAM).
+
+Almost every control is wired (`tools/panel/key_map.json`, 47 keys, 7
+encoders and 40 LEDs measured — `KEYMAP.md` has the evidence): keys press,
+encoders turn with the mouse wheel or a vertical drag, LEDs follow the
+firmware. Unwired: REC AB/CD and SCALE SETUP are inferred from their FUNC
+layers; the crossfader is decorative.
 
 ## What is real, and what it took to find
 
-**The screen** is the firmware's LCD framebuffer at `0x460d1f80`, found by
-hooking the memory writes the draw primitives make during a menu draw. It is
-**column-major**: 128 columns of 8 page-bytes, and within a page byte **bit 7
-is the topmost pixel** of its eight rows (`pixel(x,y) = buf[x*8 + (63-y)//8]`
-bit `7-(63-y)%8`). The server rasterizes it to a PNG each pump and the page
-re-fetches on change. This is pixel-exact — it draws icons, dials and the
-selection the text-capture oracle (`tools/remix/`) never could.
+**The screen** is decoded from what the firmware sends the panel processor
+over UART@`0xfc064000` (`tools/panel/panel_link.py`, protocol in
+`PANEL_LINK.md`): `0x10`–`0x17 <column> <8 bytes>` LCD blocks (page = opcode
+& 7, page 7 on top, bit 0 the top pixel of a band), `0x2r <mask>` LED bitmap
+rows, `0x3n <id>` LED levels, a few one-byte commands. Rendering the RAM
+framebuffer at `0x460d1f80` instead comes out with lines rotated (the
+firmware's page order on screen is not fixed), which is what the first
+version did — kept only as a fallback.
 
-**The keys** are matrix reports on the panel UART at `0xfc064000` — the same
-line the firmware sends its LED traffic out on, receive-interrupt already
-armed. A key event is two bytes: `<row> <column-bitmask>`, a set bit held, a
-cleared bit released (`0x20`–`0x2f` seen so far). The server keeps per-row
-state so held-modifier chords (FUNC-style) work; verified by opening MIXER
-(`0x26` bit 0) and PATTERN SETTINGS (`0x25` bit 6) and by ticking the SET
-DATE/TIME field with a held chord.
+**The keys** are matrix reports on the same UART: `<row> <column-bitmask>`,
+a set bit held, a cleared bit released — rows `0x20`/`0x21` the trig keys,
+`0x22` the track keys, `0x23`–`0x26` everything else. The server keeps
+per-row state so held chords (FUNC+…) work. **Encoders** are rows
+`0x30`–`0x36` with a signed detent delta as the second byte.
 
-**The LEDs** come back on the same UART and are parsed for the panel
-(`0x10 <offset> <8 bytes>` bitmap blocks; `<id> <value>` pairs).
+**The LEDs** are the `0x2r <mask>` rows: `key_map.json` names each LED as
+`[row, bit]`; `/leds` returns the 17 row bytes.
 
 The older jump-table path (`press_key_live`, `RTOS_FORK.md` §9) is kept in
 the server as `press()` — it calls a key's handler directly, which changes

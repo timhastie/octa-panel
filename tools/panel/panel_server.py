@@ -186,6 +186,17 @@ class Panel:
             self.r, self.rt = r, rt
             self.booted = True
             self._snapshot(r.uc)
+            # Every boot opens SET DATE/TIME (the "last set" record lives in
+            # RAM at 0x80000080 and is zero on a fresh boot). YES (matrix
+            # 0x26 bit 1) stores the clock and closes it (measured 11 Sep
+            # 2026); on the bare main screen YES would instead open the
+            # ARM ALL popup, so press it exactly once, here, while the
+            # dialog is certainly up.
+            self.phase = "closing the clock dialog"
+            rt.run(ms=400)
+            rt.uart64.rx.extend([0x26, 0x02]); rt.run(ms=60)
+            rt.uart64.rx.extend([0x26, 0x00]); rt.run(ms=300)
+            self._snapshot(r.uc)
             if self.project:
                 self.phase = "loading project (about a minute)"
                 self._load_project(rt)
@@ -481,14 +492,21 @@ class Handler(BaseHTTPRequestHandler):
                     dump[th.name] = "".join(traceback.format_stack(f)[-12:])
             self._send(200, "\n\n".join(f"== {k}\n{v}" for k, v in dump.items()).encode(), "text/plain")
         elif path == "/leds":
+            # "bits": one byte per LED bitmap row (rows 0..16 of the 0x2r /
+            # 0xa0+r messages, decoded by panel_link) -- key_map.json's leds
+            # are [row, bit] into exactly this. "ids": the 0x3n <id> level
+            # nibbles. Without panel_link the old naive parser's bytes remain.
             with p.lock:
                 ids = dict(p.led_ids)
+                bits = bytes(p.led_bits)
                 if p.link is not None:
                     try:
-                        ids.update(p.link.leds)      # the decoder's view wins when present
+                        rows = p.link.led_rows
+                        bits = bytes(rows.get(i, 0) for i in range(17))
+                        ids = dict(p.link.leds)
                     except Exception:
                         pass
-                self._json({"bits": bytes(p.led_bits).hex(),
+                self._json({"bits": bits.hex(),
                             "ids": {f"{k:#04x}": v for k, v in ids.items()}})
         elif path == "/run":
             ms = float(args.get("ms", 100))
