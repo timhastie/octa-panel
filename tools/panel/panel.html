@@ -340,6 +340,9 @@ async function poll() {
     const s = await fetch("/status").then(x => x.json());
     $("#imginfo").textContent =
       (s.image || "").split("/").pop() + (s.fault ? "  ⚠ " + s.fault : "");
+    const busy = s.phase && s.phase !== "ready";
+    $("#screenwrap").style.opacity = busy ? 0.35 : 1;
+    if (busy) $("#statusline").textContent = "⏳ " + s.phase + " — the screen fills in when this finishes";
     if (s.seq !== lastSeq) {
       lastSeq = s.seq;
       $("#screen").src = "/screen.png?" + s.seq;

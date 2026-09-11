@@ -117,6 +117,7 @@ class Panel:
         self.project = project            # (set_name, project_name) to load at boot
         self.internal_clock = internal_clock
         self.loaded = None                # load_project_live's tuple once done
+        self.phase = "booting"            # booting -> loading project -> ready
         self.actions = queue.Queue()
         self.lock = threading.Lock()
         self.frame = b""          # latest PNG
@@ -158,9 +159,12 @@ class Panel:
             self.booted = True
             self._snapshot(r.uc)
             if self.project:
+                self.phase = "loading project (about a minute)"
                 self._load_project(rt)
+            self.phase = "ready"
         except Exception as e:  # boot is all-or-nothing
             self.fault = f"boot: {type(e).__name__}: {e}"
+            self.phase = "failed"
             return
         while True:
             try:
@@ -353,7 +357,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/status":
             with p.lock:
                 self._json({"booted": p.booted, "seq": p.seq, "ran_ms": p.ran_ms,
-                            "fault": p.fault, "image": str(p.image)})
+                            "fault": p.fault, "image": str(p.image), "phase": p.phase})
         elif path == "/keys":
             self._json({"table": f"0x{KEY_TABLE:08x}",
                         "handlers": [f"0x{h:08x}" for h in p.handlers],
