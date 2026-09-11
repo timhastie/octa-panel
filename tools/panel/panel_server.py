@@ -47,6 +47,55 @@ KEY_COUNT = 66
 IDX_REC, IDX_PLAY, IDX_STOP = 27, 28, 29   # measured: 0x4000a274/0x4000a200/0x4000a1e0
 
 
+def install_rtc(clock=None):
+    """Put a real-time clock on the DSPI (found 10 Sep 2026): the firmware
+    reads a DS1390-style SPI RTC on chip-select 2 -- one transaction per
+    register (`<reg> 00`, CONT held between the two frames), registers
+    0x01 sec, 0x02 min, 0x03 hour, 0x04 weekday, 0x05 date, 0x06 month,
+    0x07 year, all BCD; 0x00 hundredths, 0x0e status; one write `9e 07`
+    (0x1e := 7) at boot. Stock emu_rtos.Dspi answers 0 to everything, which
+    is exactly the 2000-00-00 the SET DATE/TIME dialog shows. Replies must
+    be delimited by the CONT bit, not by counting frames (one boot-time
+    transaction is three frames long). Writes to time registers are kept,
+    so setting the clock through the dialog sticks for the session."""
+    import datetime
+    regs = {}
+    def bcd(n):
+        return ((n // 10) << 4) | (n % 10)
+    def now_regs():
+        t = clock() if clock else datetime.datetime.now()
+        return {0x00: 0, 0x01: bcd(t.second), 0x02: bcd(t.minute), 0x03: bcd(t.hour),
+                0x04: t.isoweekday(), 0x05: bcd(t.day), 0x06: bcd(t.month),   # 1 = Monday (measured: 4 draws THURSDAY)
+                0x07: bcd(t.year % 100), 0x0e: 0}
+    def write(self, off, size, val, replay=False):
+        if off == self.PUSHR:
+            if replay:
+                return
+            attr, data = val >> 16, val & 0xff
+            cont, pcs = bool(attr & 0x8000), attr & 0x3f
+            st = getattr(self, "_tx", None)
+            rep = 0
+            if st is None:
+                st = self._tx = [pcs, data, 0]
+                if pcs == 2 and not data & 0x80:
+                    rep = {**now_regs(), **regs}.get(data & 0x7f, 0)
+            else:
+                st[2] += 1
+                reg = (st[1] & 0x7f) + st[2] - 1
+                if st[0] == 2:
+                    if st[1] & 0x80:
+                        regs[reg] = data          # a write: remember it
+                    else:
+                        rep = {**now_regs(), **regs}.get(reg, 0)
+            self.rx.append(rep)
+            self.pushed += 1
+            if not cont:
+                self._tx = None
+        elif off != self.SR:
+            self.regs[off] = val
+    er.Dspi.write = write
+
+
 def _png_gray(w, h, rows):
     """Minimal 8-bit grayscale PNG (stdlib only)."""
     def chunk(tag, data):
@@ -344,6 +393,8 @@ def main():
     ap.add_argument("--set", default="OCTABAM")
     ap.add_argument("--name", default=None)
     ap.add_argument("--port", type=int, default=8563)
+    ap.add_argument("--no-rtc", action="store_true",
+                    help="leave the DSPI RTC unmodelled (the firmware then reads 2000-00-00 00:00:00)")
     ap.add_argument("--midi-clock", action="store_true",
                     help="keep the project's CLOCK RECEIVE setting (default: clear it so the "
                          "sequencer runs on its own clock -- no MIDI clock ever arrives here)")
@@ -372,6 +423,8 @@ def main():
         (tree / a.set / "AUDIO").mkdir(parents=True, exist_ok=True)
         card = ec.build_image(str(tree), size_mb=64)
 
+    if not a.no_rtc:
+        install_rtc()
     Handler.panel = Panel(image, card, project=project, internal_clock=not a.midi_clock)
     Handler.html = (pathlib.Path(__file__).parent / "panel.html").read_bytes()
     srv = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)
