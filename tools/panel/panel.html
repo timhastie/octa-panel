@@ -97,12 +97,18 @@
   .k.red   { background:radial-gradient(circle at 42% 34%, #de4239, #c8231c 50%, #a51a14 100%); color:#fff; }
   .k .g { font-size:10px; transform:translateY(-.5px); }
   .k .g.big { font-size:12px; }
-  .k.down { transform:translateY(1px); filter:brightness(.88);
+  .k.down, .k.held { transform:translateY(1px); filter:brightness(.88);
             box-shadow:0 0 0 #000, inset 0 1px 3px rgba(0,0,0,.45); }
+  /* Shift-held key (an emulator convenience, see the mousedown handler):
+     pressed look plus a faded green tint until Shift is released */
+  .k.held::after { content:""; position:absolute; inset:0; border-radius:inherit;
+                   background:rgba(98,224,106,.45); pointer-events:none; }
   body.mapping .k.unmapped { outline:1px dashed rgba(232,178,58,.55); outline-offset:-3px; }
   .k.selecting, .knob.selecting { outline:2px solid #e8b23a !important; outline-offset:2px; }
 
-  /* knobs: dark cap, lighter skirt ring, white indicator at 12 o'clock */
+  /* knobs: dark cap, lighter skirt ring, white indicator at 12 o'clock.
+     The cap is rotated in JS: a live encoder shows its bounded position
+     (-64..+63 detents over -150..+150 deg, 0 = centre, see turn()); VOLUME stays put. */
   .knob { border-radius:50%; background:radial-gradient(circle at 50% 38%, #4e4e50, #3a3a3c 55%, #262628);
           box-shadow:0 0 0 1px #1a1a1b, 0 3px 6px rgba(0,0,0,.75), inset 0 1px 0 rgba(255,255,255,.12); }
   .knob::before { content:""; position:absolute; inset:-5px; border-radius:50%; border:3px solid #5c5c5e;
@@ -292,7 +298,7 @@ for (const [id, x, y, w, h, shape, col, glyph] of KEYS) {
 for (const [id, x, y, col] of LEDS) { const d = el(`led ${col}`, x, y, 7, 7); d.id = "led-" + id; }
 for (const [id, x, y, r, live] of KNOBS) {
   const k = el("knob" + (live ? " live" : ""), x, y, 2 * r - 8, 2 * r - 8);
-  k.dataset.id = id; k.dataset.turn = 0;
+  k.dataset.id = id; k.dataset.pos = 0;    // live knobs: net detents sent, -64..+63, 0 = centre (not persisted)
   const cap = document.createElement("div"); cap.className = "cap"; k.append(cap);
 }
 for (const [t, x, y, cls] of LABELS) label(t, x, y, cls);
@@ -363,7 +369,8 @@ function refreshMapped() {
   document.querySelectorAll(".knob").forEach(el => {
     const r = rowOfKnob(el);
     el.title = !el.classList.contains("live") ? "volume (a pot on the unit; inert here)"
-             : r != null ? `${el.dataset.id}: encoder row ${hex(r)}` : `${el.dataset.id}: unmapped — use MAP KEYS`;
+             : r != null ? `${el.dataset.id}: encoder row ${hex(r)} — wheel/drag turns (-64..+63 from where the firmware sits), double-click returns to 0`
+             : `${el.dataset.id}: unmapped — use MAP KEYS`;
   });
 }
 
@@ -372,13 +379,22 @@ async function sendKey(row, bit, down) {
   hint(`row ${hex(row)} bit ${bit} ${down ? "dn" : "up"}: ${r.result}`);
   return r;
 }
-async function sendKnob(row, delta) {
+async function sendKnob(row, delta, note = "") {
   const r = await fetch(`/knob?row=${hex(row)}&delta=${delta}`).then(x => x.json());
-  hint(`encoder ${hex(row)} ${delta > 0 ? "+" : ""}${delta}: ${r.result}`);
+  hint(`encoder ${hex(row)} ${delta > 0 ? "+" : ""}${delta}: ${r.result}${note}`);
   return r;
 }
 
-// keys: mousedown = held, mouseup anywhere = released (chords across keys work)
+// keys: mousedown = held, mouseup anywhere = released (chords across keys work).
+// Shift-held chords (emulator-only, one mouse has no second finger): with the
+// Shift key down, a click on a key while nothing is latched LATCHES it -- down
+// goes out, up does not, and the key shows a green tint (.held, never .down,
+// so the global mouseup below leaves it alone). Further clicks, Shift or not,
+// press other keys normally on top (down, then up on mouseup); the server
+// keeps per-row state so FUNC+MIXER etc. reach the firmware as a real chord,
+// and FUNC+arrow x N is one click per press. Clicking the latched key again
+// releases it; Shift keyup, window blur or Escape release everything.
+let shiftHeld = false;
 document.addEventListener("mousedown", e => {
   const el = e.target.closest(".k[data-id]");
   if (!el) return;
@@ -395,6 +411,13 @@ document.addEventListener("mousedown", e => {
     }
     hint(`"${el.dataset.id}" is unmapped — use MAP KEYS`); return;
   }
+  if (el.classList.contains("held")) {         // already down at the firmware: this click lets go
+    el.classList.remove("held"); sendKey(k[0], k[1], false); return;
+  }
+  const shift = shiftHeld || e.shiftKey;     // e.shiftKey: Shift went down before the page had focus
+  if (shift && !document.querySelector(".k.held")) {
+    el.classList.add("held"); sendKey(k[0], k[1], true); return;
+  }
   el.classList.add("down");
   sendKey(k[0], k[1], true);
 });
@@ -405,6 +428,23 @@ document.addEventListener("mouseup", () => {
     if (k && !mapMode) sendKey(k[0], k[1], false);
   });
 });
+function releaseHeld() {
+  document.querySelectorAll(".k.held").forEach(el => {
+    el.classList.remove("held");
+    const k = keyOf(el);
+    if (k) sendKey(k[0], k[1], false);
+  });
+}
+// "keydown"/"keyup" with e.key (WKWebView and Chrome agree on "Shift");
+// a held Shift may auto-repeat keydown on some systems, hence e.repeat.
+document.addEventListener("keydown", e => {
+  if (e.key === "Shift") { if (!e.repeat) shiftHeld = true; return; }
+  if (e.key === "Escape" && !e.repeat) releaseHeld();
+});
+document.addEventListener("keyup", e => {
+  if (e.key === "Shift") { shiftHeld = false; releaseHeld(); }
+});
+window.addEventListener("blur", () => { shiftHeld = false; releaseHeld(); });   // the keyup would never reach us
 function select(el) {
   document.querySelectorAll(".selecting").forEach(x => x.classList.remove("selecting"));
   selecting = el; el.classList.add("selecting");
@@ -414,28 +454,73 @@ function select(el) {
 
 // encoders: wheel or vertical drag over a knob = detents on its matrix row.
 // Turns are coalesced (80 ms) since every /knob costs a 30 ms emulator run.
+//
+// The unit's encoders are endless; here each live knob is BOUNDED like a
+// pot (emulator convenience, nothing of it reaches the firmware): a virtual
+// position = the net detents sent since the page loaded or the knob was
+// last double-clicked, -64..+63 (128 positions, 127 detents of travel),
+// drawn as the indicator sweeping 300 deg from 7 o'clock (-64) to 5
+// o'clock (+63). It starts at 0 = the centre, NOT at an end: the firmware's
+// parameter sits wherever the project left it (OTLIVE: LEV 108/127, PTCH
+// 0.0 bipolar, 11 Sep 2026), so a knob anchored at its start could never
+// turn down. Only the detents the position actually moved are sent, so at
+// either end nothing more goes out. Double-click sends -position and
+// returns the knob to 0 (= where the firmware was).
+// The firmware honours the full +/-127 per report (STRT 0..127: +25 -> 25,
+// -25 -> 0, +127 -> 127, -127 -> 0, +16 -> 31, 11 Sep 2026) and clamps
+// each PARAMETER at its own range (MIXER MAIN stops at +15), so a knob
+// turned past a parameter's end drifts from its position and the
+// double-click then overshoots back past it; accepted.
+const POS_MIN = -64, POS_MAX = 63, SWEEP = 300;
+const signed = n => (n > 0 ? "+" : "") + n;
+function drawKnob(el) {
+  el.querySelector(".cap").style.transform =
+    `rotate(${-SWEEP / 2 + (+el.dataset.pos - POS_MIN) * SWEEP / (POS_MAX - POS_MIN)}deg)`;
+}
+document.querySelectorAll(".knob.live").forEach(drawKnob);   // all start at 0 (centre, ~12 o'clock)
 const pending = new Map();
 function turn(el, detents) {
   if (!detents) return;
   const row = rowOfKnob(el);
   if (row == null) { hint(`"${el.dataset.id}" knob is unmapped — use MAP KEYS`); return; }
-  el.dataset.turn = +el.dataset.turn + detents;
-  el.querySelector(".cap").style.transform = `rotate(${el.dataset.turn * 6}deg)`;   // ~6 deg per detent
+  const pos = +el.dataset.pos;
+  const moved = Math.max(POS_MIN, Math.min(POS_MAX, pos + detents)) - pos;
+  if (!moved) { hint(`${el.dataset.id} at its ${detents > 0 ? "end" : "start"} (${signed(pos)}) — nothing sent`); return; }
+  el.dataset.pos = pos + moved;
+  drawKnob(el);
   const p = pending.get(el) || {n: 0, timer: 0};
-  p.n += detents;
+  p.n += moved;                                // |n| <= 127 by construction
   if (!p.timer) p.timer = setTimeout(() => {
     pending.delete(el);
-    sendKnob(row, Math.max(-127, Math.min(127, p.n)));
+    sendKnob(row, p.n, ` (pos ${signed(+el.dataset.pos)})`);
   }, 80);
   pending.set(el, p);
 }
+document.addEventListener("dblclick", e => {
+  const el = e.target.closest(".knob.live");
+  if (!el) return;
+  e.preventDefault();
+  if (mapMode) return;
+  const row = rowOfKnob(el);
+  if (row == null) { hint(`"${el.dataset.id}" knob is unmapped — use MAP KEYS`); return; }
+  const p = pending.get(el);
+  if (p) { clearTimeout(p.timer); pending.delete(el); }
+  const seen = +el.dataset.pos - (p ? p.n : 0);   // what the firmware has actually received
+  el.dataset.pos = 0;
+  drawKnob(el);
+  if (seen) sendKnob(row, -seen, " (back to 0)");
+  else hint(`${el.dataset.id} already at 0 — nothing sent`);
+});
 const wheelAcc = new Map();
 document.addEventListener("wheel", e => {
   const el = e.target.closest(".knob.live");
   if (!el) return;
   e.preventDefault();
   if (mapMode) return;
-  const dy = e.deltaMode === 1 ? e.deltaY * 20 : e.deltaY;
+  // with Shift down (a latched chord: FUNC + encoder) browsers report the
+  // vertical wheel as deltaX (Chrome, WebKit); take it when deltaY is 0
+  const raw = e.deltaY || (e.shiftKey ? e.deltaX : 0);
+  const dy = e.deltaMode === 1 ? raw * 20 : raw;
   let acc = (wheelAcc.get(el) || 0) + dy;
   const d = Math.trunc(acc / 40);              // one detent per 40 px (a mouse notch is 100 in Chrome)
   acc -= d * 40; wheelAcc.set(el, acc);

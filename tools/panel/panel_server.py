@@ -42,6 +42,43 @@ FB = 0x460d1f80          # LCD framebuffer, COLUMN-major: 128 columns x 8 bytes,
                          # bit 7 of a page byte is the LOWEST of its 8 rows --
                          # pixel(x,y) = buf[x*8 + (63-y)//8] bit (7 - (63-y)%8)
                          # (verified: renders the SET DATE/TIME dialog legibly)
+                         # -- a FALLBACK only: it is not a copy of what the panel
+                         # shows (no page rotation, row/column or bit order maps
+                         # it onto the decoded stream; best 669/1024 bytes wrong
+                         # on AMP SETUP, 12 Sep 2026, KEYMAP.md)
+UI_WINDOW = 0x460d175c      # the UI's popup slot. NOT "a SETUP window or 0" (the first
+                            # version annotated /knob on nonzero and so on every page
+                            # after a YES/NO, verifier 12 Sep 2026): it is POPUP while
+                            # ANY popup is drawn from that record -- the SET DATE/TIME
+                            # dialog, MIXER, TEMPO, PATTERN SETTINGS, the PROJECT menu,
+                            # ARM ALL / DISARM ALL and the page SETUP windows -- and
+                            # 0x46c7d384 (the record after it, flags closed) on the
+                            # main screen and page 1 after YES closed the dialog; 0
+                            # after a popup closes (fix_lab.log, fix_lab2.log).
+POPUP = 0x46c7d34c          # the popup record: +0x08 x0, +0x0c y0, +0x18 x1, +0x20 flags
+                            # (0x21 open, 0x01 closed), +0x28 rows. What tells the page
+                            # SETUP windows apart is their geometry: every one of them
+                            # (PLAYBACK/AMP/LFO/FX1/FX2, the second press of the page
+                            # key) is x 7..0xf4, y 0, 0x40 rows, and nothing else is
+                            # (MIXER 10/0/0xec/0x40, PROJECT menu 5/0/0xf6/0x40, TEMPO
+                            # 0x1c/8/0xca/0x30, PATTERN SETTINGS 8/3/0xf2/0x3a, ARM ALL
+                            # 0x25/0x17/0xb8/0x12, DISARM ALL 0x1e/0x17/0xc6/0x12, the
+                            # clock dialog 0xf/7/0xe6/0x32; measured 12 Sep 2026,
+                            # KEYMAP.md). The record keeps its last geometry after a
+                            # close, hence the slot check as well.
+SETUP_GEOMETRY = (7, 0, 0xf4, 0x40)
+
+
+def setup_window_open(uc):
+    """True while a page's SETUP window is the popup on screen (see POPUP)."""
+    if int.from_bytes(uc.mem_read(UI_WINDOW, 4), "big") != POPUP:
+        return False
+    rec = bytes(uc.mem_read(POPUP, 0x2c))
+    word = lambda off: int.from_bytes(rec[off:off + 4], "big")  # noqa: E731
+    return ((word(0x08), word(0x0c), word(0x18), word(0x28)) == SETUP_GEOMETRY
+            and bool(word(0x20) & 0x20))
+
+
 KEY_TABLE = 0x400d2954   # per-key jump table: 66 longword handlers
 KEY_COUNT = 66
 IDX_REC, IDX_PLAY, IDX_STOP = 27, 28, 29   # measured: 0x4000a274/0x4000a200/0x4000a1e0
@@ -110,10 +147,12 @@ def _png_gray(w, h, rows):
 class Panel:
     """Owns the emulator thread; everything Unicorn happens on it."""
 
-    def __init__(self, image, card, pump_ms=25.0, project=None, internal_clock=True):
+    def __init__(self, image, card, pump_ms=25.0, project=None, internal_clock=True,
+                 play_pump_ms=10.0):
         self.image = image
         self.card = card
         self.pump_ms = pump_ms
+        self.play_pump_ms = play_pump_ms   # the pump while frame mode is on (see _loop)
         self.project = project            # (set_name, project_name) to load at boot
         self.internal_clock = internal_clock
         self.loaded = None                # load_project_live's tuple once done
@@ -154,11 +193,7 @@ class Panel:
         the RAM framebuffer at FB, whose page ORDER on screen is not fixed
         (renders come out with lines rotated when the firmware scrolls --
         the 11 Sep 2026 "sample list wrapped" report)."""
-        if self.link is not None and hasattr(self, "rt"):
-            tx = self.rt.uart64.tx
-            if len(tx) > self._link_pos:
-                self.link.feed(bytes(tx[self._link_pos:]))
-                self._link_pos = len(tx)
+        if self._feed_link():
             try:
                 return self.link.lcd_rows()
             except Exception as e:      # a decoder fault must not blank the panel
@@ -171,10 +206,30 @@ class Panel:
             rows.append([(buf[x * 8 + page] >> bit) & 1 for x in range(128)])
         return rows
 
+    def _feed_link(self):
+        """Hand the decoder the panel UART bytes sent since the last call.
+        False when there is no decoder (the RAM framebuffer is the source)."""
+        if self.link is None or not hasattr(self, "rt"):
+            return False
+        tx = self.rt.uart64.tx
+        if len(tx) > self._link_pos:
+            self.link.feed(bytes(tx[self._link_pos:]))
+            self._link_pos = len(tx)
+        return True
+
     def _snapshot(self, uc):
+        # Render only when an LCD block landed since the last render
+        # (PanelLink.dirty): the pump calls this every 25 ms of firmware and
+        # a render is 0.7 ms (lcd_rows 0.30 + PNG 0.40, measured 12 Sep
+        # 2026) -- at idle it was the loop's only work. The RAM fallback
+        # has no such flag and renders every call, as before.
+        if self._feed_link() and self.frame and not self.link.dirty:
+            return
         on, off = b"\x1a", b"\xc9"   # dark pixels on a pale LCD
         rows = [b"".join(on if px else off for px in row) for row in self._lcd_rows(uc)]
         png = _png_gray(128, 64, rows)
+        if self.link is not None:
+            self.link.dirty = False
         with self.lock:
             if png != self.frame:
                 self.frame = png
@@ -225,7 +280,18 @@ class Panel:
                         self.busy_since = None
                 t = time.perf_counter()
                 self.busy_since = t
-                rt.run(ms=self.pump_ms)
+                # Shorter pumps while the sequencer runs: in frame mode 25 ms
+                # of firmware is ~0.46 s wall (54 emulated ms per wall s,
+                # measured 12 Sep 2026) and a click first waits for the pump
+                # in progress, then runs its own 50 ms. 10 ms pumps cut the
+                # wait to ~0.18 s; the per-pump work (snapshot 0.7 ms, LED
+                # parse) stays under 1 %, and where run() stops does not
+                # move any firmware event, so the emulated timing is the
+                # same. The emulation itself is the cost: one emulated
+                # second is 1.9M emu_start bursts, 2.9M Intc.pending calls,
+                # 515k EMAC + 564k ISA-C shims (cProfile, 12 Sep 2026) --
+                # all in tools/emu, nothing of it in this file.
+                rt.run(ms=self.pump_ms if not rt.frame else min(self.pump_ms, self.play_pump_ms))
                 self.busy_since = None
                 self.ran_ms = rt.sample / er.SAMPLE_HZ * 1000.0
                 self._snapshot(r.uc)
@@ -259,7 +325,9 @@ class Panel:
         # research's fidelity settings and they cost ~100x wall time (50 ms
         # of firmware = 5.5 s, measured 11 Sep 2026) -- every click took 11 s
         # and the panel looked hung. Frame mode goes on with PLAY, off with
-        # STOP (transport()); the exact clock is never needed for the UI.
+        # STOP (_before_play / _after_stop, shared by the matrix path key()
+        # and the handler path transport()); the exact clock is never
+        # needed for the UI.
         self.loaded = {"mounted": mounted, "posted": posted, "saved_bank": saved_bank,
                        "final_bank": final_bank, "elapsed_ms": elapsed}
         self._snapshot(rt.uc if hasattr(rt, "uc") else self.r.uc)
@@ -275,24 +343,69 @@ class Panel:
         def act(rt):
             rt.uart64.rx.extend([row, delta & 0xff])
             rt.run(ms=30)
-            return f"row {row:#04x} delta {delta:+d}"
+            note = ""
+            if row < 0x36 and setup_window_open(rt.uc):
+                # A-F on a SETUP page (AMP/LFO/PLAYBACK/FX SETUP, the second
+                # press of a page key): the Part byte changes and the box is
+                # drawn into RAM, but the firmware sends no LCD block for the
+                # edit under the emulator (none within 3 s idle; a LEVEL +1
+                # or a held FUNC flushed the box once each after a long run
+                # of edits, never reliably) -- the page redraws when it is
+                # closed (page key) and reopened (page key twice: the press
+                # after a close only re-selects the page). KEYMAP.md, 12 Sep
+                # 2026. Single detents only accumulate there (3 per step
+                # clockwise, 4 back); +2..+7 is about one step. Page 1
+                # flushes every report and gets no note -- also under the
+                # ARM/DISARM ALL popup a YES/NO leaves on it (that popup is
+                # drawn from the same record with its own geometry).
+                note = (" (SETUP page: the value changed; the box redraws after the page key"
+                        " closes the page and, pressed twice more, reopens it)")
+            return f"row {row:#04x} delta {delta:+d}{note}"
         return self.do(act, timeout=120)
+
+    # PLAY and STOP as the panel scanner reports them (key_map.json, measured
+    # 11 Sep 2026): row 0x25 bit 0 and row 0x24 bit 7. FUNC is 0x25 bit 5.
+    PLAY_KEY = (0x25, 0)
+    STOP_KEY = (0x24, 7)
+    FUNC_KEY = (0x25, 5)
+
+    def _before_play(self, rt):
+        """What every PLAY needs BEFORE the key lands, whichever path
+        delivers it (the matrix report in key(), the jump-table handler in
+        transport()). Tracks only start if the pattern flags them active
+        and the fixture projects have every flag clear (activate_tracks);
+        the DSP frame interrupt is what steps the sequencer, so frame mode
+        goes on (~17x wall time while it is on; off again in _after_stop).
+        Without this the matrix PLAY only flipped the transport word and
+        lit the PLAY LED: the position bar never moved (12 Sep 2026)."""
+        flags = self.activate_tracks(rt)
+        if not rt.frame:
+            rt.frame = True
+            rt.next_frame = rt.sample + er.FRAME_PERIOD
+        return flags
+
+    def _after_stop(self, rt):
+        rt.frame = False
 
     def transport(self, what):
         """PLAY / REC / STOP through the firmware's own key handlers
-        (press_key_live, RTOS_FORK.md section 9) -- the proven way to start
-        the transport until the matrix cells for these keys are mapped."""
+        (press_key_live, RTOS_FORK.md section 9) -- the fallback the page
+        used for these keys before their matrix cells were measured; kept
+        for scripting. Same helpers around the key as key() uses."""
         if what == "play":
-            # press_play_live = PLAY's own handler + FW_START_TRACK per track;
-            # tracks only start if the pattern flags them active, so make sure.
-            # The DSP frame interrupt is what steps the sequencer, so frame
-            # mode comes on here (and costs wall time while it is on).
+            # PLAY's own handler + FW_START_TRACK per track, as
+            # rt.press_play_live does but WITHOUT its exact_clock(): that
+            # instruction-count hook is the sequencer research's timing
+            # setting, costs ~100x wall time and never comes off again
+            # (every click took 11 s, 11 Sep 2026). The matrix path never
+            # needed it and the position bar advances without it.
             def play(rt):
-                flags = self.activate_tracks(rt)
-                if not rt.frame:
-                    rt.frame = True
-                    rt.next_frame = rt.sample + er.FRAME_PERIOD
-                return f"d0={rt.press_play_live()} active={flags} (frame mode on: slower while playing)"
+                flags = self._before_play(rt)
+                d0 = rt.press_key_live(er.KEY_PLAY)
+                for t in range(8):
+                    rt.run(until=lambda r: r.pc == er.MAIN_SPIN)
+                    rt.call_as_main(er.FW_START_TRACK, args=(t,))
+                return f"d0={d0} active={flags} (frame mode on: slower while playing)"
             return self.do(play, timeout=120)
         handler = {"rec": er.KEY_REC, "stop": er.KEY_STOP}.get(what)
         if handler is None:
@@ -300,7 +413,7 @@ class Panel:
         def press(rt):
             d0 = rt.press_key_live(handler)
             if what == "stop":
-                rt.frame = False
+                self._after_stop(rt)
             return f"d0={d0}" + (" (frame mode off)" if what == "stop" else "")
         return self.do(press, timeout=120)
 
@@ -354,23 +467,65 @@ class Panel:
 
     busy_since = None
     ACTION_LIMIT = 20.0      # wall seconds an action may hold the emulator
+    RUN_SLICE_MS = 5.0       # emulated ms per slice of run_ms() (5 ms wall idle, ~0.1 s playing)
 
     def _watchdog(self):
-        """Abort an action that holds the emulator too long: Unicorn's
-        emu_stop() is safe from another thread, and Rtos.run's burst loop
-        then returns. The action reports the abort; the pump carries on."""
+        """Flag an action that holds the emulator too long (self.abort);
+        run_ms() checks the flag between its slices and gives up.
+
+        It cannot stop the action itself: Unicorn's emu_stop() from another
+        thread ends one BURST, and Rtos.run() then simply starts the next
+        (it loops step() until its ms elapse or its until() holds) -- the
+        first version called emu_stop() here and /run?ms=5000 while frame
+        mode was on still held the emulator for 356 s wall (verifier,
+        12 Sep 2026). An early-ended burst is also charged its whole
+        quantum (Rtos.step: instrs += n), a timing glitch for nothing, so
+        emu_stop() is gone."""
         while True:
             time.sleep(1.0)
             t0 = self.busy_since
             if t0 is not None and time.perf_counter() - t0 > self.ACTION_LIMIT:
                 self.aborted = (self.aborted or 0) + 1
-                try:
-                    self.r.uc.emu_stop()
-                except Exception:
-                    pass
-                self.busy_since = time.perf_counter()   # re-arm; stop once per limit
+                self.abort = True
+                self.busy_since = time.perf_counter()   # re-arm; flag once per limit
 
     aborted = 0
+    abort = False
+
+    def run_ms(self, rt, ms, wall=None):
+        """rt.run(ms=ms) in RUN_SLICE_MS slices, stopping early after `wall`
+        seconds (one under ACTION_LIMIT by default, so the budget and not
+        the watchdog is what ends it) or on the watchdog's flag; /status
+        ran_ms follows the slices. Where a slice ends moves no firmware
+        event (timers, frames and the panel UART advance by sample count),
+        so the emulated timing is the plain run's. Needed because a long
+        rt.run() is uninterruptible (see _watchdog) and in frame mode 5000
+        ms of firmware is minutes of wall time: the page's RUN 1s / RUN 5s
+        buttons froze it for the whole of that. Measured 12 Sep 2026
+        (fix_srv.log): while playing /run?ms=1000 returned in 17.0 s at 59
+        emulated ms per wall s (the pump's rate) and /run?ms=5000 stopped
+        at 1202 ms after 20.1 s; idle, 1000 ms is instant (idle time is
+        skipped to the next timer). Returns a one-line report."""
+        wall = self.ACTION_LIMIT - 1.0 if wall is None else wall
+        t0 = time.perf_counter()
+        s0 = rt.sample
+        end = s0 + ms * er.SAMPLE_HZ / 1000.0
+        self.abort = False
+        why = "done"
+        while rt.sample < end:
+            left = (end - rt.sample) / er.SAMPLE_HZ * 1000.0
+            rt.run(ms=min(left, self.RUN_SLICE_MS))
+            self.ran_ms = rt.sample / er.SAMPLE_HZ * 1000.0
+            if self.abort:
+                why = "watchdog"; break
+            if time.perf_counter() - t0 > wall:
+                why = f"{wall:.0f} s wall budget"; break
+        ran = (rt.sample - s0) / er.SAMPLE_HZ * 1000.0
+        dt = time.perf_counter() - t0
+        rate = f" ({ran / dt:.0f} emulated ms per wall s{', frame mode on' if rt.frame else ''})" if dt > 0.2 else ""
+        if why == "done":
+            return f"ran {ran:.0f} ms in {dt:.1f} s{rate}"
+        return f"ran {ran:.0f} of {ms:.0f} ms in {dt:.1f} s: {why}{rate}"
 
     def do(self, fn, timeout=30.0):
         """Run fn(rt) on the emu thread, return (ok, result-or-error)."""
@@ -417,10 +572,25 @@ class Panel:
         else:
             self.row_state[row] = self.row_state.get(row, 0) & ~(1 << bit)
         state = self.row_state[row]
+        # PLAY going down (not under FUNC: FUNC+PLAY is CLEAR PATTERN) gets
+        # the same preparation the /transport path always had; STOP going
+        # down takes frame mode off again after the key. The page has sent
+        # PLAY as its matrix cell since the map was measured, and a bare
+        # matrix PLAY started the transport but never stepped it (12 Sep
+        # 2026 report: play icon and the first bar, no LEDs, no progress).
+        func_held = bool(self.row_state.get(self.FUNC_KEY[0], 0) & (1 << self.FUNC_KEY[1]))
+        play = down and (row, bit) == self.PLAY_KEY and not func_held
+        stop = down and (row, bit) == self.STOP_KEY
         def act(rt):
+            note = ""
+            if play:
+                note = f" (play: active={self._before_play(rt)}, frame mode on)"
             rt.uart64.rx.extend([row, state])
             rt.run(ms=50)
-            return f"row {row:#04x} = {state:#04x}"
+            if stop:
+                self._after_stop(rt)
+                note = " (stop: frame mode off)"
+            return f"row {row:#04x} = {state:#04x}{note}"
         return self.do(act, timeout=120)
 
 
@@ -509,8 +679,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"bits": bits.hex(),
                             "ids": {f"{k:#04x}": v for k, v in ids.items()}})
         elif path == "/run":
+            # sliced, wall-bounded (run_ms): a plain rt.run(ms=5000) in frame
+            # mode held the emulator for minutes (12 Sep 2026)
             ms = float(args.get("ms", 100))
-            ok, res = p.do(lambda rt: rt.run(ms=min(ms, 5000)), timeout=600)
+            ok, res = p.do(lambda rt: p.run_ms(rt, min(ms, 5000)), timeout=600)
             self._json({"ok": ok, "result": str(res)})
         else:
             self._send(404, b"?", "text/plain")

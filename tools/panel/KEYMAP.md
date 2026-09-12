@@ -184,3 +184,265 @@ boot) follows the REC key; row 9 bit 1 lights in CHROMATIC trig mode.
 - The PROJECT-menu LED (row 15 bit 0) clears one LED refresh late: still
   set after the third NO closed the menu, cleared at the next MIXER open
   (E5 `menu_no2`, `menu_mixer_open`; E3 `menu_no2` the same).
+
+## 12 Sep 2026: PLAY through the matrix; the SETUP pages' encoders
+
+Scratch (gitignored): `out/_agents/panel-server/` -- `srv_play.py` (PLAY/STOP
+through `/key` on an own server, port 8581), `lab_pages.py`..`lab_pages6.py`
+(scripted, OTLIVE/PROJECT loaded, `lab2.Lab2` from the keymap scratch),
+their `.log`s, `profile_frame_on.txt`, PNGs `S_*` (server), `P_*` `Q_*`
+`R_*` `T_*` `U_*` `V_*` (labs, 3x). Stock image, route A, as above.
+
+### PLAY 0x25.0 / STOP 0x24.7 through `/key`
+
+- The matrix PLAY starts the transport (`0x800065b8` := 1, LED row 11
+  01->08, tempo LED row 4 bit 6 on, the play icon and beat box 1 drawn) but
+  the sequencer only steps under the DSP frame interrupt, which
+  `panel_server.key()` never switched on -- only the old `/transport` path
+  did. Now PLAY going down (not under FUNC) runs `activate_tracks` + frame
+  mode before the key and STOP going down turns frame mode off after it;
+  `/transport` shares the two helpers (and no longer calls `exact_clock`).
+- Measured on the own server (`srv_play.log`, two runs): idle 850-880
+  emulated ms per wall second (the pump's 30 ms sleeps); playing 54.4 /
+  55.5 emulated ms per wall second (18x). The four beat boxes under the
+  BPM: box 1 filled at PLAY (`S_play_001*.png`), box 2 at 3176 / 3183
+  emulated ms = 57-59 s wall (`S_play_002*.png`), the play triangle
+  toggles with it. Inside the firmware (`lab_pages5.log`, `watch_mem`):
+  the 24-PPQN tick byte `0x800065b6` counts 0..6 and wraps every ~840
+  emulated ms (ticks 142, 128, 150, 136, 150 ms apart -- six per 16th
+  step), the step byte `0x800065b5` once per wrap. So one 16th step is
+  ~840 emulated ms = **~15 wall seconds at 120 BPM**, a beat box ~70 s, a
+  bar ~4.7 min. Nominal is 20.8 ms per tick / 125 ms per step: the
+  firmware's clock runs ~6.7x slow in emulated time because only ~414 of
+  the nominal 2756 frame interrupts per emulated second are delivered
+  (`lab_pages.log`: 414 frames, 750,980 bursts, 173M charged instructions
+  in one emulated second -- the emulated CPU is saturated and the frame
+  latch remembers one edge). That is `tools/emu`, not the panel.
+- Trig LEDs: rows 0-3 never change while playing, GRID RECORDING off or
+  on (3 steps = 24 ticks each, `lab_pages5.log`): the LED state array
+  `0x460ba9ae` is written once, at PLAY (row 4 bit 6, the tempo LED, pc
+  `0x400137d4`); the blink phase `0x460ba98c` is written 0 every ~20 ms
+  (nonzero in grid-rec mode, 64 of 128 writes, and the rows sent do not
+  change). The running light is not computed under the emulator. Grid rec
+  shows the poked trigs (rows 0-3 = 01) as before; PLAY/STOP/tempo/REC
+  LEDs behave as in E2.
+- Profile (`profile_frame_on.txt`, cProfile over one emulated second in
+  frame mode: 35.4 s profiled, 18.1 s plain): unicorn `emu_start` 1.94M
+  calls 5.2 s tottime, `Intc.pending` 2.95M calls 4.5 s, `Intc.asserted`
+  3.4 s, `mem_read` 2.96M 1.8 s, `Rtos.step` 735k 1.6 s,
+  `_emac_load_shim` 515k 1.5 s, `reg_read` 3.15M 1.2 s, `_isa_c_shim`
+  564k. panel_server's own share per pump: `link.lcd_rows` 0.30 ms + PNG
+  0.40 ms, `_parse_leds` negligible. Changed in panel_server: the PNG is
+  rendered only when an LCD block arrived (`PanelLink.dirty`), and the
+  pump is 10 ms instead of 25 while frame mode is on (a click waits at
+  most ~0.18 s instead of ~0.46 s for the pump in progress: PLAY down
+  through `/key` 1.99 s vs 2.20 s, STOP 1.48 vs 1.58 s). Nothing else in
+  the file costs anything; the 18x is the emulation.
+
+### The SETUP pages (second press of a page key)
+
+- Page key once = page 1 (AMP: `ATK HOLD REL VOL BAL`, 47 blocks, LED
+  row 8 bit 4); again = the SETUP window (`AMP SETUP` / `LFO SETUP` /
+  `PLAYBACK SETUP` / FX1's, 114-120 blocks, window slot `0x460d175c` :=
+  `0x46c7d34c`); again = page 1 (slot cleared, 114-120 blocks).
+  `P_amp2.png`, `P_lfo2.png`, `P_pb2.png`, `P_amp3.png`. The press after
+  a close is swallowed: measured through the own server (`srv_setup.log`,
+  `S_setup_*.png`) AMP presses 1..7 give page 1, SETUP, page 1, nothing
+  (seq unchanged, the window slot stays 0 -- the press re-selects the
+  page), SETUP, page 1, nothing; lab_pages2's "ignored fourth LFO press"
+  was the same. So reopening a SETUP page after closing it is the page
+  key TWICE, and an encoder turned between those two presses edits page 1
+  (`srv_setup.log`: B -8 landed on HOLD).
+- Encoders A-F edit the SETUP boxes of the current track (T5, index 4) in
+  the bank blob at `PART_PTR` = `0x400e21e0`, mirrored at `0x8000095c..`
+  and SRAM `0x100a523e..`: AMP SETUP A..F -> `0x401712d0..d5` = AMP(4)
+  SYNC(2) ATCK(2) FX1(4) FX2(4) TRIG(5) (PARAM_PAGES.md p6..p11; ATCK IS
+  drawn, TRIG is not, F edits it anyway). LFO SETUP A -> PMTR
+  `0x401712ca` (30), B -> WAVE `0x401712cd` (19), C -> MULT `0x401712e2`
+  (7), D -> TRIG `0x401712e5` (8), E/F -> SPD/DEP = the page-1 bytes
+  `0x401710da` / `0x401710dd`, delta applied as is. PLAYBACK SETUP A ->
+  LOOP `0x401711b8`, F -> TSNS `0x401711bd`. Page 1 for comparison: AMP
+  A..E -> `0x401710e0..e4` (F = XVOL changes nothing, not drawn), LFO
+  SPD1..DEP3 -> `0x401710da..df`, each report applied exactly (+1, +2,
+  -3) and flushed in 2-6 blocks.
+- The rule (`lab_pages4.log`, PMTR held mid-range, the accumulator
+  `0x46c7d246` found by a whole-RAM diff and read before/after every
+  report): a SETUP box runs the report through an accelerating enum editor.
+  +1 reports only accumulate -- 1, 2, then the third steps the value and
+  clears it (three detents per step clockwise); -1 goes -1, -2, -3, the
+  fourth steps and leaves -1 (four per step back). +2..+7 are about one
+  step each (+2 alternates 0 and +1), +8/+9 two, and +12/+16/+24 come out
+  backwards (15->6, 15->7, 15->10; -12/-16/-24 undo them): the enum wraps
+  modulo its count. Two +1 reports in one run behave as two reports. So a
+  slow wheel is 3-4 detents per value on these boxes and the page's
+  coalesced deltas beyond +-9 go the wrong way. No modifier is involved:
+  FUNC held, the spare cells 0x23.4-7 / 0x26.6-7 / 0x25.3-4 / 0x23.3 held,
+  rows 0x27-0x2f, arrows, YES change nothing about it (`lab_pages.log`);
+  no encoder-push cell exists in rows 0x23-0x2f.
+- The display: the edit IS drawn (the RAM buffer `0x460d1f80` changes,
+  e.g. `0x460d2136..0x460d21a7` for the AMP box) but **no LCD block is
+  sent** -- not within 3 s idle, not after a tap of the non-key cell
+  0x27.0, a zero-delta LEVEL or A report, LEVEL +1/-1, or FUNC held 250 ms
+  (`lab_pages3.log`, `lab_pages6.log`). The box shows the new value when
+  the page is redrawn: leave and re-enter it (`P_amp3.png` then the next
+  opening), or -- seen once each on AMP SETUP after a long run of edits
+  -- LEVEL +1 (7 blocks, `P_amp2_level+1.png`: AMP TTRG, SYNC OFF, FX1/FX2
+  RTRG) and FUNC held (19 blocks, `P_amp2_func_down.png`). Page 1 flushes
+  every report. Whatever flushes the window on hardware does not run
+  under route A (the same family as the PROJECT menu's cursor and the
+  ARM/DISARM ALL timeouts above). panel_server cannot mirror the RAM
+  buffer instead: it is not a copy of the LCD (no page rotation, row/
+  column order or bit order maps it onto the decoded stream; best 669 of
+  1024 bytes wrong on AMP SETUP, 805+ on the main screen). `/knob` now says
+  in its result, while a SETUP window is the popup on screen (the geometry
+  test of the next section -- NOT "`0x460d175c` set", which the first
+  version used and which holds on the main screen too), that the value
+  changed and the box redraws when the page is re-entered.
+
+## 12 Sep 2026, later: the popup slot, `/run` while playing, the LED sender
+
+Verifier follow-up on the section above. Scratch: `out/_agents/panel-server/`
+`fix_lab.py` (window-slot survey + LED-driver hooks while playing),
+`fix_lab2.py` (the popup record per window), `fix_lab3.py` / `fix_lab4.py`
+(who sends the LED rows), `fix_srv.py` (own server, port 8582), their
+`.log`s, PNGs `F_*` `G_*` `H_*` `J_*` (labs, 3x) and `Z_*` (server).
+
+### The popup slot `0x460d175c` is not "SETUP or 0"
+
+`fix_lab.log`, `fix_lab2.log` (fresh instance, OTLIVE/PROJECT, every state
+read after a 400 ms settle):
+
+| state | slot | popup record `0x46c7d34c`: x0 y0 x1 flags rows |
+|---|---|---|
+| boot, SET DATE/TIME up (before and after the load) | `0x46c7d34c` | 0f 07 e6 21 32 |
+| main after YES; AMP page 1 after it | `0x46c7d384` | (record B, flags 01) |
+| AMP / LFO / PLAYBACK / FX1 / FX2 second press (SETUP) | `0x46c7d34c` | **07 00 f4 21 40** (all five) |
+| a SETUP window closed (third press); page 1s after that | `0x0` | 07 00 f4 **01** 40 (kept) |
+| MIXER | `0x46c7d34c` | 0a 00 ec 21 40 |
+| TEMPO | `0x46c7d34c` | 1c 08 ca 21 30 |
+| PATTERN SETTINGS (FUNC+BANK) | `0x46c7d34c` | 08 03 f2 21 3a |
+| PROJECT menu (FUNC+MIXER) | `0x46c7d34c` | 05 00 f6 21 40 |
+| ARM ALL (YES on main) / DISARM ALL (NO on main) | `0x46c7d34c` | 25 17 b8 21 12 / 1e 17 c6 21 12 |
+| AMP page 1 with DISARM ALL still drawn | `0x46c7d34c` | 1e 17 c6 21 12 |
+| AMP SETUP opened over it | `0x46c7d34c` | 07 00 f4 21 40 |
+| MIXER, TEMPO, PATTERN SETTINGS, menu closed | `0x0` | flags 01 |
+
+So the slot names the popup RECORD (`0x46c7d34c` for every popup the panel
+opens, `0x46c7d384` for the record after it, left there when YES closed
+the clock dialog), and the record is a geometry: +0x08 x0, +0x0c y0,
++0x18 x1, +0x20 flags (0x21 open, 0x01 closed), +0x28 rows. What is
+particular to the page SETUP windows is their shape -- x 7..0xf4, y 0,
+0x40 rows -- shared by all five and by nothing else measured (the PROJECT
+menu is 5..0xf6, the MIXER 10..0xec). `panel_server.setup_window_open`
+tests slot == `0x46c7d34c` and that geometry with the open flag; the
+DISARM ALL popup a NO leaves on page 1 (never times out under route A,
+above) no longer trips the note, and the verifier's zero-delta report on
+the main screen does not either (`fix_srv.log`, section 1). RECORDING
+SETUP (FUNC+RECAB) was not shape-measured; `fix_srv.log` says whether the
+note fires there.
+
+### `/run` while frame mode is on
+
+`Rtos.run(ms=)` loops `step()` until its ms elapse; Unicorn's `emu_stop()`
+from another thread ends one burst and `run()` starts the next, so
+panel_server's 20 s watchdog never ended anything (its docstring said it
+did): `/run?ms=5000` while playing held the emulator 356 s (verifier).
+`/run` now runs 5 ms slices (`Panel.run_ms`) and gives up after a 19 s
+budget (one under the watchdog, which stays as the backstop), reporting
+what ran; `/status ran_ms` moves with the slices. Slice boundaries move no
+firmware event (timers, frames and the panel UART advance by sample
+count). Measured on the own server (`fix_srv.log`, port 8582, OTLIVE):
+while playing `/run?ms=1000` returned in 17.0 s wall, 59 emulated ms per
+wall s -- the pump's own rate (58.2 over the 65 s play window), so the
+verifier's 14 ms/s during the unsliced 356 s run was not the emulation's
+rate; `/run?ms=5000` stopped at 1202 ms after 20.1 s; `/status ran_ms`
+advanced in all 36 one-second polls (45-70 ms each). Idle, `/run?ms=1000`
+is instant (idle time is skipped to the next timer expiry). Same run:
+PLAY down through `/key` 0.82 s, the beat box 2 redraw at 54.8 s wall =
+3163 emulated ms (`Z_play_02_0055s.png`), STOP down 1.01 s, idle 862
+before / 796 emulated ms per wall s after, NO taps 0.05 s. The `/knob`
+note (`fix_srv.log` section 1): off on the main screen, on the DISARM ALL
+popup, on AMP page 1 under that popup (A +1 redrew ATK, seq 6->7,
+`Z_amp1_popup_A+1.png`), after a SETUP close, on MIXER, TEMPO, RECORDING
+SETUP (its own narrower shape, `Z_recording_setup.png`) and PLAYBACK page
+1; on for AMP SETUP, AMP SETUP reopened and LFO SETUP.
+
+### Trig LEDs while playing: the sequencer's per-tick message never reaches the UI task
+
+- First, a correction that changes how the section above reads: **the OS
+  image loads at `0x40000400`** (`scripts/disasm.sh`'s base is right;
+  `fix_lab5.log`: the RAM bytes at `0x40013620` are the file's bytes at
+  offset `0x13220`). Absolute operands in the code are RAM addresses, so
+  a static scan of the file must add 0x400 to file offsets and nothing to
+  operands. With that, the `pc 0x400137d4` of the section above is exactly
+  the store `moveb %d0,%a0@(0,%d4:l)` inside set_led (RAM `0x40013784`:
+  set_led(index, on)), i.e. the write-hook pc is precise -- and
+  `fix_lab.py`'s "the LED driver is never entered" (hooks placed at file
+  offsets, 0x400 too low) is void; `fix_lab6.py` re-did it at the RAM
+  entries.
+- The LED driver (RAM): `0x40013634` send `0x20+row <mask>` through the
+  panel-UART ring writer `0x40010aa4`; `0x400136a8` flush the rows whose
+  state^blink changed; `0x400136f4` set_led_timed; `0x40013784`
+  set_led(index, on); `0x40013810` init (133 LEDs); `0x4001387c` the
+  timed-LED countdown; blink-mask setters at `0x400131a0`..`0x40013354`;
+  state array `0x460ba9ae` (17 rows), blink `0x460ba98c`, last-sent
+  `0x460ba99d`. Its callers, measured (`fix_lab6.log`, entry hooks with
+  return addresses): a REC toggle or a track key is 90-137 driver entries
+  -- blink-mask housekeeping from `0x40034e4c/e52`, `0x40044030/40`,
+  `0x4004d580` (the UI's periodic pass, ~every 37 ms), the page/trig
+  redraw (`0x400353xx`, `0x40083fxx`), then `flush` from
+  `0x40041aec`/`0x400487xx`/`0x4004e948` and 1-5 `send_row`s -- and **0**
+  set_led calls: the trig, REC and track LEDs are drawn by rewriting the
+  blink masks, not through set_led.
+- PLAY (frame mode on, both grid-rec off and on): exactly **one** set_led
+  in 1.8 s of play, at 5.3 ms -- `set_led(38 = row 4 bit 6, 3)`, the tempo
+  LED, from `0x40056f2a` in the **ui** task -- and then nothing but the
+  periodic housekeeping (16+16+7 blink clears per 600 ms, one flush pair
+  from `0x40061efe/f04`) while the tick byte `0x800065b6` runs 2, 4, 0,
+  2, 4, 0, 3 per 300 emulated ms and the step byte `0x800065b5` 0, 1, 2
+  (~900 emulated ms per 16th here). STOP is a 517-entry full LED redraw.
+  Nothing is queued for the panel at all during the play windows
+  (`fix_lab3.log` / `fix_lab4.log`: 0 bytes in 1.2-1.5 s).
+- `0x40056f2a` is the UI task's message loop (`0x40056c72`: receive from
+  the UI queue `0x460d1664` via `0x40000d00`, dispatch on the message's
+  type byte): under a 24-count at `0x460d1e10` it flashes the tempo LED
+  once per beat -- the per-tick message handler. A running light on the
+  trig rows is work of the same kind and would come the same way. The
+  queue's posters (enqueue `0x40000c3c`, static scan at the right base):
+  `0x4009c506` once at transport start (message `0x400abaca`, right after
+  `0x800065b8` := 1 -- the one set_led above), `0x400a4dd2` from the
+  sequencer's tick path (message `0x400abacb`, after bumping the tick
+  counter `0x80006511`, gated on `0x46107568 == 0`, which the start
+  clears), `0x40055cd6` the periodic UI refresh (`0x400a727a`, a
+  countdown at `0x400c0cf0`), `0x40040b70` a UI-internal one.
+  `fix_lab7.log` (the enqueue hooked on the UI queue, the loop's receive
+  hooked at `0x40056c7c`): under route A the tick message IS posted and
+  received -- type 7 every ~140 emulated ms (one per 24-PPQN tick; 4-5
+  per 600 ms), the type-2 start once, posts and receives matching to the
+  0.1 ms -- and its handler only runs the beat counter (a flash every 24
+  ticks = ~3.3 s emulated = ~57 s wall here, the same period as the beat
+  box). Nothing else is ever posted to the UI queue while playing.
+- The trig-row light itself (`fix_lab8.log`, the pass `0x40043fdc`
+  hooked): it is a **flash per trig, not a chase**. The pass runs on
+  events only (2 per REC toggle or PLAY, 1 in 1.2 s of play, 9 at STOP),
+  and for each of the 16 trig LEDs clears the blink and, if the LED's bit
+  in the 16-bit mask `0x460d1794` is set, `set_led(led, 0xa)` (a timed
+  flash) and clears the bit. The mask's setters: the trig-key handler
+  (`0x40044614` / `0x400446d2`, bit = the key, after the sequencer calls
+  `0x4009f3a4` / `0x4009b5c8`) and a UI message handler at `0x400622da`
+  that ORs the message's trig byte into it -- the "trigs fired" note from
+  the sequencer. `0x460d1736` is the GRID RECORDING flag (REC writes 1 at
+  `0x400487c0`, 0 at `0x40048798`); with it set the pass takes the
+  position branch (`0x40034bd4`, pattern/track/page) and clears the mask
+  (`0x40043ffa`) before drawing the placed trigs. Measured while playing
+  (grid off and on, poked trigs on steps 1/5/9/13, step byte 0 -> 4): the
+  mask is written only by those clears, no bit is ever set, no flash --
+  because the only messages the sequencer posts to the UI are the start
+  and the tick; the trigs-fired one never comes (the fired trig is the
+  DSP side of the frame path, RTOS_FORK section 10). That is the gap: an
+  emulator one, in the sequencer-to-UI notification of fired trigs, not
+  in the tick and not in the LED driver. The PLAY and tempo LEDs (row 11
+  bit 3, row 4 bit 6) do light at PLAY through `/key` now, which is what
+  the "no sequencer LEDs" of the report referred to together with the
+  never-moving position; the per-trig flashes will need `tools/emu` to
+  post that message. panel_server carries what the firmware sends.
