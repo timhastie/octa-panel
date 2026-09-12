@@ -112,8 +112,26 @@ EMAC-fixed Unicorn (`scripts/build_unicorn.sh`), `vendor/dsp56300` pinned to
 - **SETUP pages** (2nd press of a page key): encoders edit the Part bytes but
   the window does not redraw until closed and reopened; their enum editor
   accumulates detents and runs backwards past ±9 (server chunks to ±7).
-- **Speed:** port backend ≈ 0.36–0.4 s wall per 16th step at 120 BPM (~3×
-  slower than real time); never enable `rt.exact_clock()` on route A (100×).
+- **Speed (12 Sep 2026, milestones O15a–O15f in COLDFIRE_PORT.md):** the port
+  was 0.22× real time because it stepped ONE instruction at a time with
+  bookkeeping around each (Intc::top/deliver 43 %, timers 9 %, pc() 6 %;
+  Musashi itself < 5 %). Now: event-horizon bursts (run to the next timer /
+  frame / DMA / peripheral event, exact tail), LTO, a 4 KB page table for
+  memory, opt-in PGO (`bash tools/emu/ot_emu/pgo.sh` → out/emu/ot_emu, +28 %;
+  a plain cmake build is LTO-only), bursts through boot/load/batch, and
+  wall-clock pacing (`pace on [rate]`, `run <ms> wall <s>`, `pacestatus`;
+  the server sends `pace on 1` and shows `rt` = × real time in /status and
+  the page). Measured: **1.47–1.6× real time without the cores** (paced to
+  1.00; LED chase 125.0 ms per 16th by wall clock), **0.15× with --dsp**
+  (the two DSP interpreters are ~85 % of that wall; exact interleave keeps
+  audio bit-identical — see O12), boot to ready 5.4 s (was 39), 23 s with
+  --dsp (was 57). THE GATE for any core change:
+  `out/_agents/speed-oracle/oracle.sh out/emu/ot_emu.ref-1e76ac5 <cand>
+  --build-dir <tree>` = 28 byte-identical checks (README beside it); the
+  frozen pre-speed binary is out/emu/ot_emu.ref-1e76ac5 (untracked, keep).
+  Speed bench: `OT_EMU=<bin> .venv/bin/python3 out/_agents/speed/bench.py
+  <tag> [--dsp]`. Diagnostics: OT_BURST=0 (old loop), OT_STEPFAST=0,
+  OT_BURST_STATS=1. Never enable `rt.exact_clock()` on route A (100×).
 - LCD framebuffer in RAM (0x460d1f80) is NOT what the screen shows (page
   order rotates) — always render from the UART stream.
 - **Popups** are drawn from the record at 0x46c7d34c while the UI slot
@@ -148,9 +166,15 @@ EMAC-fixed Unicorn (`scripts/build_unicorn.sh`), `vendor/dsp56300` pinned to
   push (not found in the matrix); trig LEDs 9-16 colour vs hardware.
 - Upstream octabam main has moved (recfix, PR #97/#129, Workbench); this fork
   is a 10 Sep clone — merging upstream is pending.
-- Playback still ~3× slower than real time (port), ~9× with the DSP cores
-  (`--dsp`, the default now) rendering audio. Cue out and core 1 are not
-  captured; the crossfader and audio inputs have no panel path.
+- With the DSP cores (`--sound on`, the default) playback is ~0.15× real
+  time: the pair costs ~5.5 wall s per emulated s (DSP::execOp 24 %, the
+  per-instruction wrapper stepCore 21 %). Under the strict bit-identity
+  contract the ceiling is ≤ 0.4–0.55×; real time needs lazy batching of the
+  cores and/or a thread per core (E2/E3 in out/_agents/speed-plan/REPORTS.md),
+  which moves ±1 LSB in a few reverb samples (O12) — a relaxed PCM tolerance
+  with everything else byte-exact is the intended contract for that phase.
+  Cue out and core 1 are not captured; the crossfader and audio inputs have
+  no panel path.
 - `.ot` slice files are not seeded onto the card with their samples; the pool
   is wiped and re-seeded at every server start (files added through the
   page survive only while that server runs, or if they are also in an
