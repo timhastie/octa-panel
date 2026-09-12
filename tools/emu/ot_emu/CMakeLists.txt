@@ -15,6 +15,35 @@ endif()
 
 set(OT_VENDOR "${CMAKE_CURRENT_SOURCE_DIR}/../../../vendor" CACHE PATH "vendored emulator cores")
 
+# O15b: link-time optimisation for Release builds. The run loop crosses the
+# library boundary on every instruction (m68kops.c -> m68k_read_memory_* ->
+# Machine::read*, Musashi's execute_one -> Machine::stepFast); LTO lets the
+# linker inline across the vendored core, ot_machine and ot_emu, which the
+# per-translation-unit build cannot. Full `-flto` (one module at link time)
+# measured faster than CMake's AppleClang default `-flto=thin` (O15b); the
+# switch is here so either can be re-measured. OT_LTO=OFF restores the plain
+# build (the bisect knob: the bytes the emulator produces must not depend on
+# it). Set before add_subdirectory so the vendored targets inherit it; the
+# CheckIPOSupported guard keeps a toolchain without LTO building as before.
+option(OT_LTO "link-time optimisation for Release builds (O15b)" ON)
+set(OT_LTO_MODE "full" CACHE STRING "LTO flavour: full (-flto) or thin (-flto=thin)")
+if(OT_LTO)
+	include(CheckIPOSupported)
+	check_ipo_supported(RESULT _ot_ipo OUTPUT _ot_ipo_msg LANGUAGES C CXX)
+	if(_ot_ipo)
+		if(OT_LTO_MODE STREQUAL "full")
+			foreach(_lang C CXX)
+				set(CMAKE_${_lang}_COMPILE_OPTIONS_IPO "-flto")
+			endforeach()
+		endif()
+		set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+		set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO ON)
+		message(STATUS "ot_emu: LTO ${OT_LTO_MODE} (${CMAKE_C_COMPILE_OPTIONS_IPO}) for Release builds")
+	else()
+		message(STATUS "ot_emu: LTO not supported by this toolchain, building without: ${_ot_ipo_msg}")
+	endif()
+endif()
+
 # mc68k: Musashi plus the ColdFire mode, the HI08 host-port register file and
 # the on-chip peripheral scaffolding. Vendored, GPLv3 -- the same posture as
 # vendor/dsp56300: tooling and patches are shared, built binaries never are.

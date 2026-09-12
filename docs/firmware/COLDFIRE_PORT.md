@@ -3303,3 +3303,102 @@ changed no decision).
   panel's idle pump and `run`s simply finish sooner.
 - Route A is not the oracle here; the 28 checks are port-vs-port against
   the frozen binary, as the speed-oracle README says.
+
+## Milestone O15b — link-time optimisation: +11 % on top of the bursts, bit for bit ✅ (12 Sep 2026, branch `panel-ui`)
+
+Step 2 of the speed plan; `tools/emu/ot_emu/CMakeLists.txt` only, no
+source change. The run loop crosses a library boundary on every
+instruction (`m68kops.c` -> `m68k_read_memory_*` -> `Machine::read*`,
+Musashi's `execute_one` -> `Machine::stepFast`), and a per-translation-unit
+build cannot inline across it. The speed-mem investigation measured full
+`-flto` at 1.17x on the pre-burst code; this lands it in the build.
+
+**What changed.** `option(OT_LTO ON)` + `OT_LTO_MODE full|thin` (cache
+string), set BEFORE the `add_subdirectory` calls so the vendored targets
+inherit it: `include(CheckIPOSupported)` / `check_ipo_supported(LANGUAGES C
+CXX)` guards it (a toolchain without LTO builds as before and says so at
+configure), then `CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE` (and
+`_RELWITHDEBINFO`) `ON`. CMake's AppleClang default for IPO is
+`-flto=thin` (`Modules/Compiler/Clang.cmake`); in `full` mode
+`CMAKE_C/CXX_COMPILE_OPTIONS_IPO` are overridden to `-flto` so the whole
+program is one module at link time, as the investigation measured. Verified
+on the verbose build (`out/_agents/impl-2-lto/build.build.log`): `-flto` on
+109 of 167 compile lines -- all of `68kEmu` (`m68kops.c`, `m68kcpu.c`,
+`mc68k.cpp`, ...), `dsp56kEmu`, `dsp56kBase`, `ot_machine`, `ot_emu` and
+the test programs -- and on every link line (`-O3 -DNDEBUG -flto -arch
+arm64 ... -o ot_emu`). The 58 without it are `asmjit` (its own
+`cmake_minimum_required(VERSION 3.5)` leaves policy CMP0069 OLD in that
+subtree, so the property is ignored there; asmjit is the JIT's assembler and
+is not on the interpreter's path). `OT_LTO=OFF` reproduces the pre-change
+build exactly (no `-flto` anywhere, `ot_emu` 2,789,704 bytes as before) --
+the bisect knob. Default `cmake --fresh -B out/emu -S tools/emu/ot_emu &&
+cmake --build out/emu -j8` now builds with full LTO; nothing else changed:
+no CLI, command, reply or log line.
+
+**Measured** (12 Sep 2026, the same M5 Mac, macOS 26.5, AppleClang 21.0.0,
+CMake 4.4.3; `bench.py`, all four binaries in one session, one after the
+other, no other emulator running; logs `out/_agents/impl-2-lto/impl2_*.log`,
+`bench_series.txt`). Reference = `out/emu/ot_emu.ref-1e76ac5`; Step 1 =
+this tree at commit `cada0f2`, rebuilt as `build-pre` with `-DOT_LTO=OFF`;
+LTO = `build` (full); thin = `build-thin` (`-DOT_LTO_MODE=thin`).
+
+| measurement | reference | Step 1 (no LTO) | **full LTO** | thin LTO |
+|---|---|---|---|---|
+| play, no `--dsp` (emulated ms per wall s) | 217 | 879, 874 | **977, 977** | 978, 976 |
+| play, `--dsp` | 96 | 132, 135 | **147, 147** | 144 |
+| boot + fixture load to `ready`, no `--dsp` | 39.5 s | 10.4-10.7 s | **9.8-10.1 s** | 9.6-9.7 s |
+| boot + fixture load to `ready`, `--dsp` | 60.9 s | 28.6-29.0 s | **26.7-27.4 s** | 26.9 s |
+| `ot_emu` size (bytes) | 2,788,712 | 2,789,704 | **2,273,512** (-18.5 %) | 2,384,360 |
+| link step of `ot_emu` alone (re-link, warm) | -- | 0.35-0.56 s | **5.4-5.7 s** | 1.8-2.1 s |
+| full `--fresh` configure + build, `-j8` | -- | 15.3-16.7 s | **19.3 s** | 16.7 s |
+
+Ratios: full LTO over Step 1 **1.115x** without `--dsp` (977 / 876.5) and
+**1.10x** with (147 / 133.5) -- the plan asked for >= 1.08x on the burst
+binary and estimated >= 1.1x; over the reference in the same session
+**4.5x** (977 / 217) and **1.53x** (147 / 96). Thin LTO ties without the
+cores (976-978) and is 2 % slower with them (144 vs 147) for a 3x faster
+link; full stays the default, as the plan says. The `--dsp` gain is
+smaller, as O15a's was: the cores are ~50 % of the wall (speed-dsp's
+profile) and their interleave cannot change, so only the ColdFire half
+speeds up. `lib68kEmu.a` grows 1,097,752 -> 1,500,856 bytes (bitcode, not
+machine code, until the final link).
+
+**The gate: 28 PASS, 0 FAIL** (`out/_agents/speed-oracle/reports/
+20260912-075538-impl2-lto.txt`, copy in `out/_agents/impl-2-lto/oracle1-
+report.txt`; 57 s wall): boot logs identical, `serial_a` 5731 / 9257 bytes
+identical, goldens 12,757 / 26,367 bytes identical, `run3_core0.wav`
+7,936,292 bytes identical, the UART A stream 18,297 / 18,309 bytes
+identical step by step, 109 peeks identical, 47 run stamps with max
+|dsample| = 0 and |dframes| = 0, `interdsp.pcm` 497,788 bytes identical,
+ctest 7 / 7 in the LTO tree (also 7 / 7 in `build-pre` and `build-thin`).
+Under the parallel battery the candidate's jobs took: `card` 10.6 s (Step 1:
+12.0 s), `render` 37.7 s (41.7), `inter` boot 10.9 s + 4.2 s of `run` (11.9
++ 4.6), `interdsp` 28.0 s + 28.2 s (30.8 + 31.4). Floating-point results
+did not move: the DSP pipe PCM and the render WAV are the sensitive
+outputs, and both are byte-identical (`-flto` adds no fast-math or
+reassociation flag; the compile lines are otherwise unchanged).
+
+**What it does not do.** No PGO yet (step 4 of the plan adds
+`OT_PGO_PROFILE=<path>` in this file); no page-table memory path (step 3);
+asmjit is not LTO'd (not needed -- the JIT is not used). Every build now
+pays 5-6 s at the link for `ot_emu` and again for each test program (four
+in this tree, three in `vendor/mc68k`); a tree that iterates on one source
+file re-links everything through LTO -- configure with `-DOT_LTO=OFF` for
+that. Debug builds (`-DCMAKE_BUILD_TYPE=Debug`) are untouched. Route A and
+the panel server are not affected (the server builds `out/emu` with the
+default configure, so it gets the LTO binary).
+
+**Verified** (`out/_agents/impl-2-lto-verify0/`, the same Mac, later the
+same morning): a fresh default configure + build reproduces the builder's
+`ot_emu` byte for byte (sha256 `b25c12b6…`, 2,273,512 bytes; LLVM bitcode
+in every `68kEmu`, `dsp56kEmu`, `dsp56kBase`, `ot_machine` and `ot_emu`
+object, Mach-O only in asmjit); a build from a source copy with the
+`option(OT_LTO ...)` line commented out reproduces the Step 1 binary byte
+for byte (2,789,704 bytes, no `-flto`); a Debug configure carries `-flto`
+in nothing but CMake's own IPO probe. Oracle rerun with `--fresh` (both
+sides re-executed): **28 PASS, 0 FAIL**, 111 s. Bench, serial, in one
+session: no `--dsp` reference 218, no LTO 942 / 911, **LTO 1027 / 1010**
+(1.10x, 4.7x the reference; ready 10.3-10.4 s -> 9.4 s); `--dsp` reference
+99, no LTO 135 / 136, **LTO 147 / 148** (1.09x, 1.49x; ready 28.3-28.7 s ->
+26.4-26.5 s). ctest 7 / 7 in both trees; the vendored `dsp56kTestRunner`
+(EXCLUDE_FROM_ALL) also links under LTO.
