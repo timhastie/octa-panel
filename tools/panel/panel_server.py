@@ -1153,7 +1153,9 @@ class Handler(BaseHTTPRequestHandler):
         path, _, q = self.path.partition("?")
         args = dict(kv.split("=", 1) for kv in q.split("&") if "=" in kv)
         if path == "/":
-            self._send(200, self.html, "text/html; charset=utf-8")
+            # read per request: a page fix must not need a server (or app) restart
+            page = pathlib.Path(__file__).parent / "panel.html"
+            self._send(200, page.read_bytes() if page.exists() else self.html, "text/html; charset=utf-8")
         elif path == "/screen.png":
             with p.lock:
                 self._send(200, p.frame or _png_gray(128, 64, [b"\x40" * 128] * 64), "image/png")

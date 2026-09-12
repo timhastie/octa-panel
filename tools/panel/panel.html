@@ -634,7 +634,9 @@ function ledOn(spec, bits, ids) {
 }
 function applyLeds(l) {
   for (const [id, spec] of Object.entries(mapLeds)) {
-    const el = document.getElementById("led-" + id);
+    // key_map.json names LEDs "led_trig1"; the elements are "led-trig1"
+    // (the first version looked up "led-led_trig1" and lit nothing, 12 Sep 2026)
+    const el = document.getElementById("led-" + id.replace(/^led_/, ""));
     if (el) el.classList.toggle("on", ledOn(spec, l.bits || "", l.ids || {}));
   }
 }
