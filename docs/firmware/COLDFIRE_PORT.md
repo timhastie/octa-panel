@@ -4326,3 +4326,118 @@ on the idle machine: 1475.
   cut short when every register is 8 hex digits (up to 215 bytes); a
   pre-existing limit, left as it is because changing it would change an
   existing command's output.
+
+## Milestone O16a — the oracle in the repo, a second frozen reference, and the Phase B audio contract ✅ (12 Sep 2026, branch `panel-ui`)
+
+Phase B (the DSP pair: lazy batching / a thread per core, E2/E3 in
+`out/_agents/speed-plan/REPORTS.md`) cannot be held to bit-identical audio:
+O12 measured that ANY change of the core interleave (quanta 1 / 64 / 2,000 /
+50,000) moves a few samples of a reverb return by one LSB at the host-frame
+edge (frame 641 on that fixture), while the hardware runs the two cores
+truly in parallel — a different interleave is not less faithful. What must
+not move is the firmware's observable behaviour: screens, LEDs, sequencer
+timing, the goldens' dispatch order. This step makes that contract a tool.
+
+### What changed (`tools/emu/ot_emu/oracle/`, new; nothing in the emulator)
+
+- `out/_agents/speed-oracle/` (Phase A's gate, O15a–O15f) is now
+  `tools/emu/ot_emu/oracle/` — `oracle.sh`, `drive.py`, `tmo.py`,
+  `cmp_text.py`, `cmp_stamps.py`, the README — as a maintained tool. Every
+  input is a flag or an environment variable with the Phase A path as its
+  default: `--ref`/`OT_ORACLE_REF` (`out/emu/ot_emu.ref-73c2815`; a first
+  positional still overrides), `--image`, `--card` (card/inter/interdsp),
+  `--card2` (render), `--set`/`--project` (`OTLIVE`/`PROJECT`), `--out`
+  (cache + reports, `out/_oracle/`), `OT_ORACLE_PY`. No firmware byte and no
+  fixture is in git: the image and the two card images stay under `out/`.
+  `drive.py` takes `--image/--card/--set/--project` and finds the repo root
+  from its new depth; `tmo.py`, `cmp_text.py`, `cmp_stamps.py` are unchanged.
+- The cache is keyed on the binary's sha256 AND on the job's inputs
+  (`inputs.txt`: path, size, mtime of the image and card, set, project; the
+  interactive jobs also the driver's sha) — a changed fixture reruns.
+- **`cmp_audio.py`** replaces `cmp` for the two audio captures.
+  `cmp_audio.py A B [--fmt s16|wav24|auto] [--tol L] [--frac P] [--len-tol N]`
+  reports on one line: frames per side, max |diff|, the differing count and
+  percent, the first differing frame (channel, both values), the onset frame
+  (first frame with any non-zero sample) per side, a trailing length
+  difference, and a SHIFT HINT when B equals A displaced by ±1..3 frames; then
+  PASS/FAIL. PASS needs the WAV header identical, |frames_A − frames_B| ≤
+  len-tol, max |diff| ≤ tol, differing ≤ P % of the compared samples, and the
+  onset frame identical (alignment is never tolerated). Byte-identical files
+  short-circuit without decoding. Pure Python (the venv has no numpy):
+  2,645,416 24-bit samples decode and compare in 0.4 s.
+- `oracle.sh` gains `--audio-tol <lsb16>` (interdsp.pcm), `--wav-tol <lsb24>`
+  (render.wav), `--audio-frac <percent>`; `--frame-tol N` now also bounds the
+  audio captures' LENGTH (a frame edge on a run boundary). All default 0 =
+  the strict Phase A gate. Everything else — logs, serial, goldens,
+  `oracle.py`, UART stream, per-step sizes, peeks, replies, `ready` — stays
+  byte-strict whatever the flags.
+- `phase_b.sh CAND [--build-dir DIR]` runs the candidate against BOTH
+  references with the Phase B tolerances (`--audio-tol 2 --wav-tol 8
+  --audio-frac 0.5 --frame-tol 1`); the second pass only compares (the
+  candidate's runs are cached).
+- **The second frozen reference:** `out/emu/ot_emu.ref-73c2815` =
+  `out/emu/ot_emu` at HEAD `73c2815` (Phase A's PGO binary, sha256
+  `3c7d2111891c…`, the binary the last Phase A report gated 28/28), copied
+  with `cp -p` and made read-only. Untracked, like `ref-1e76ac5`; keep both.
+
+### The Phase B contract (decided for the DSP work; B0 and B1 held at 0)
+
+Everything the oracle checks stays byte-identical — boot logs, serial,
+goldens (dispatch order and stamps), the UART A stream (LCD/LEDs), peeks,
+`run` stamps — EXCEPT the two audio artefacts, which may differ from the
+reference within: `interdsp.pcm` (16-bit) max |diff| ≤ 2 LSB and ≤ 0.5 % of
+samples differing; `run3_core0.wav` (24-bit words) max |diff| ≤ 8 and
+≤ 0.5 % differing; the audio must stay sample-ALIGNED (the onset frame
+identical); the frame counts in `run` replies and the captures' length may
+differ by at most 1 (`--frame-tol 1`), only where a frame edge lands on a
+run boundary. A step whose diff exceeds that FAILS. Phase B steps are gated
+against BOTH references: strict against `ref-73c2815` on the non-audio
+checks (and, since the two references are byte-identical on every check,
+equally against `ref-1e76ac5`); the audio tolerance against either.
+
+### Measured (12 Sep 2026, the same M5 Mac, macOS 26.5; reports under `out/_oracle/reports/`, logs under `out/_agents/speed-b0/`)
+
+| run | result | wall | report |
+|---|---|---|---|
+| `ref-73c2815` vs itself (determinism; ctest on a fresh plain-LTO HEAD tree, `out/_agents/speed-b0/build`) | **28 PASS, 0 FAIL** | 47 s | `20260912-130930-b0-refref-73c2815` |
+| `ref-1e76ac5` vs `ref-73c2815`, strict | **28 PASS, 0 FAIL** | 106 s (the 73c2815 side cached; the pre-speed side: card 42 s, render 73 s, interdsp boot 63 s + 43 s of `run`) | `20260912-131027-b0-1e76ac5-vs-73c2815` |
+| negative control: `ref-73c2815` wrapped with `--rtc 1000000001`, WITH the Phase B tolerances on | **14 PASS, 13 FAIL** (27 checks, no ctest) | 44 s | `20260912-131239-b0-negctrl` |
+| `phase_b.sh` on the plain-LTO HEAD build (sha `089bd73fb869`) | **28 PASS vs `ref-1e76ac5`, 28 PASS vs `ref-73c2815`** | 54 s + 4 s | `20260912-131324-…`, `20260912-131418-b0-phaseb-headlto` |
+
+The negative control fails where Phase A's did — the `rtc` boot-log line,
+the goldens at char 4870 (dispatch stamps moved 0.08 samples; `card.oracle_py`
+one disagreement), `card.serial_a` at byte 5147, the UART stream at byte
+5234 (the dialog's seconds digit), the clock record `..2e28` → `..2e29` —
+and the two audio captures stay identical (the RTC does not reach the DSP):
+the tolerance flags loosen nothing outside the audio. Per job on the Phase A
+binary under the full parallel load: stock 1.0 s, card 6.6 s, render 27 s,
+inter boot 6.6 s + 2.9 s of `run` (4,490 emulated ms), interdsp boot 20.5 s
++ 25 s of `run`, ctest 5.8 s.
+
+`cmp_audio.py` checked on the real captures (the Phase A `interdsp.pcm`,
+124,447 frames, onset frame 98; `run3_core0.wav`, 330,677 frames x 8 slots,
+onset frame 282,744): identical → PASS in 0.02 / 0.04 s; 300 PCM samples
+moved by ±1..2 → `max 2, 0.1125 %`, FAIL strict, PASS at `--tol 2 --frac
+0.5`; the same moved by +3 → FAIL `max 3 > 2`; the PCM shifted by one frame
+→ FAIL `onset moved: frame 98 vs 99` (+ `SHIFT HINT: B == A shifted −1
+frame(s)`); one frame shorter → FAIL at `--len-tol 0`, PASS at `--len-tol 1`
+with 0 samples differing; 500 WAV words moved by ±3..8 → `max 8, 0.0189 %`.
+The shift hint is only emitted when the unshifted window is itself out of
+tolerance (a first version fired on every shift inside digital silence).
+
+### What it does not do
+
+- The emulator is untouched: no source under `tools/emu/ot_emu/*.cpp/.h`
+  changed, no CLI flag or output moved; the HEAD tree built for the ctest
+  half is byte-identical to both references on all 28 checks.
+- `out/_agents/speed-oracle/` is left in place (its reports and cached runs
+  are Phase A's record; CONTEXT.md's "THE GATE" line still names it — the
+  maintained copy is `tools/emu/ot_emu/oracle/`, and CONTEXT.md should be
+  pointed at it with the next CONTEXT edit).
+- The audio tolerance bounds |diff| and the differing fraction; it does not
+  judge audibility or structure. A Phase B step that uses it must say where
+  the diff sits (`cmp_audio.py`'s first differing frame) and why (O12).
+- Nothing in the battery exercises `pace on`, threads, or shutdown timing;
+  the Phase B steps that add threads must prove those separately (a
+  `-fsanitize=thread` Debug build through `drive.py`, a measured quit/EOF/
+  SIGTERM).
