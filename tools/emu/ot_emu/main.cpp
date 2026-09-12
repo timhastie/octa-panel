@@ -828,6 +828,7 @@ int main(int _argc, char** _argv)
 	std::string dspWrites;		// O9: per-frame NON-ZERO WRITE counts per 256-word region of both cores' X and Y -> FILE
 	std::string coverage;		// O9b: every ColdFire PC executed from the transport start on, with its count -> FILE (diff two runs)
 	bool frameTimer = false;	// O9b: keep the free-running 16-sample frame timer with --dsp (default: the DSP's bank word is the frame edge)
+	double dspLazy = ot::DspPair::g_lazyDefault;	// O16c: --dsp-lazy N -- the pair's ticks are booked and replayed in chunks of up to N DSP instructions at the ColdFire's touch points (0 = the per-tick path); the default in every mode, byte-identical to it
 	std::string pokeAfterLoad;	// O9c: "addr=byte;addr=byte" written after the load, before the frames (drive an apply the load skips)
 	int mainLevel = -1;			// O9b: post sys command 4 (SET MAIN LEVEL) with this level after the load; -1 = don't (the emulated load never does, and every voice then renders at gain zero)
 	bool mainLevelGiven = false;	// 12 Sep 2026: --interactive defaults it to 64 (the panel wants sound); `--main-level off` keeps the -1. The batch default stays -1.
@@ -879,6 +880,7 @@ int main(int _argc, char** _argv)
 		else if(a == "--dsp-drain-paced")		dspDrainPaced = true;
 		else if(a == "--dsp-verbose")			dspVerbose = true;
 		else if(a == "--dsp-quantum" && i + 1 < _argc)	ot::DspPair::g_quantum = std::atof(_argv[++i]);	// O12: the core interleave quantum (instructions)
+		else if(a == "--dsp-lazy" && i + 1 < _argc)	dspLazy = std::atof(_argv[++i]);	// O16c: lazy batching of the pair, N DSP instructions (0 = exact)
 		else if(a == "--edma-log" && i + 1 < _argc)	edmaLog = _argv[++i];
 		else if(a == "--dsp-peek" && i + 1 < _argc)	dspPeek = _argv[++i];
 		else if(a == "--block-log" && i + 1 < _argc)	blockLog = _argv[++i];
@@ -1030,7 +1032,14 @@ int main(int _argc, char** _argv)
 		static_cast<unsigned long long>(m.instructions()),
 		static_cast<unsigned long long>(m.v4eExecuted()));
 	if(dspPair)
+	{
 		std::printf("dsp        : after the boot\n%s", dspPair->report().c_str());
+		// O16c: the boot above ran the pair tick by tick (no Rtos yet to
+		// sync it, and the boot has no sample clock). From here the RTOS
+		// runs it lazily -- the same schedule, replayed in chunks -- in
+		// every mode unless --dsp-lazy 0 asks for the per-tick path.
+		dspPair->setLazy(dspLazy);
+	}
 
 	if(profile)
 	{

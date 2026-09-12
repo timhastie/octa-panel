@@ -87,6 +87,13 @@ namespace ot
 		// Returns the samples actually advanced: fewer than `_n` when the
 		// co-processor raised a host word the machine should take NOW (O9b).
 		virtual double tickSamples(double _n) = 0;
+		// O16c: bring the co-processor up to everything booked so far. A
+		// co-processor that runs on every tick has nothing to do here; a
+		// LAZY one (DspPair::setLazy) runs its backlog. The run loop calls it
+		// before tickTimers()/deliver() -- the point where the co-processor's
+		// state becomes observable to the CPU -- at every burst end and exact
+		// step; the co-processor calls it itself before any host-port access.
+		virtual void sync() {}
 		// O9b: called when core `_core` puts a word in its host port OUTSIDE a
 		// read-back pull -- the DSP's bank id, which on hardware is what the
 		// frame interrupt announces (the frame handler reads it with no ready

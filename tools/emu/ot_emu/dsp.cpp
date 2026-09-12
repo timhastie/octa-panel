@@ -57,6 +57,7 @@ namespace ot
 											// instead, this held the block's last two DATA words
 											// and read as if the firmware sent a dest of 0x030000.
 		uint64_t nextTrace = 0;			// the fast-forward skips past exact multiples
+		uint64_t slotCounter = 0; uint32_t slotDsr2 = 0;	// O16c: the DSP counter and DSR2 at the last ESAI frame callback (a slot exec)
 		uint32_t lastPcLo = 0, lastPcHi = 0;	// the PC window of the last few instructions
 		int windowRun = 0;
 		uint32_t lastTx[2] = {0, 0};		// slot 0 of the last output frame, TX0/TX1
@@ -102,6 +103,7 @@ namespace ot
 		// transmit underrun to stdout (3,260 lines over one boot). Off unless
 		// asked: `setVerbose(true)` restores them.
 		setVerbose(false);
+		if(const char* e = std::getenv("OT_DSP_EDGELOG"); e && *e && *e != '0') m_edgeLog = true;	// O16c: one stderr line per bank write seen from a chunk (the guard's evidence)
 		for(int i = 0; i < 2; ++i)
 		{
 			m_cores.emplace_back(new Core);
@@ -264,6 +266,11 @@ namespace ot
 				// completes (checked against a --dsp-peek of the ring: the
 				// tone on ring words 2/4 reports as 2/4).
 				const uint32_t dsr2 = c.px->read(0xffffe7, dsp56k::Nop);
+				// O16c: the edge guard's grid point -- this callback runs inside
+				// a slot exec, after that slot's DMA word (execTX: writeSlotToFrame
+				// then writeTXimpl), so (counter, DSR2) here pin the slot cadence.
+				c.slotCounter = c.dsp->getInstructionCounter();
+				c.slotDsr2 = dsr2 & 0xffffff;
 				const uint32_t rot = (dsr2 - 9) & 7;
 				if(!c.rotSeen) { c.rotMin = c.rotMax = rot; c.rotSeen = true; }
 				c.rotMin = std::min(c.rotMin, rot); c.rotMax = std::max(c.rotMax, rot);
@@ -339,6 +346,15 @@ namespace ot
 			std::fprintf(stderr, "dspstat runDue=%llu passes=%llu stepCore=%llu",
 				static_cast<unsigned long long>(m_stats.runDue), static_cast<unsigned long long>(m_stats.passes),
 				static_cast<unsigned long long>(m_stats.stepCalls));
+			// O16c: the lazy side (all zero on the exact schedule but the host counts).
+			std::fprintf(stderr, " | lazy=%.0f hostR=%llu hostW=%llu syncs=%llu chunks=%llu chunkmean=%.1f chunkmax=%.0f edges=%llu edgelate mean=%.2f max=%.0f (dsp instr) edges-late=%llu edges-in-idle-skips=%llu guardticks=%llu predictions=%llu",
+				m_lazy, static_cast<unsigned long long>(m_stats.hostReads), static_cast<unsigned long long>(m_stats.hostWrites),
+				static_cast<unsigned long long>(m_stats.syncs), static_cast<unsigned long long>(m_stats.chunks),
+				m_stats.chunks ? m_stats.chunkSum / static_cast<double>(m_stats.chunks) : 0.0, m_stats.chunkMax,
+				static_cast<unsigned long long>(m_stats.edges),
+				m_stats.edges ? m_stats.edgeLateSum / static_cast<double>(m_stats.edges) : 0.0, m_stats.edgeLateMax,
+				static_cast<unsigned long long>(m_stats.edgesLate), static_cast<unsigned long long>(m_stats.edgesIdle),
+				static_cast<unsigned long long>(m_stats.guardTicks), static_cast<unsigned long long>(m_stats.predictions));
 			for(int i = 0; i < 2; ++i)
 			{
 				const Core& c = *m_cores[i];
@@ -552,6 +568,10 @@ namespace ot
 		}
 		if(_addr < g_window || _addr >= g_windowEnd)
 			return false;
+		// O16c: the DSP is where the ColdFire would have found it -- the
+		// backlog runs before the register is read (a no-op when exact).
+		++m_stats.hostReads;
+		catchUp();
 		// THE LANES. A 16-bit port (CS2, CSCR2 = 0x180): the odd byte of a
 		// halfword is the register the stride names, (a >> 2) & 7, and the even
 		// byte is the register BEFORE it. ✅ Decoded 8 Sep 2026 from route A's
@@ -597,6 +617,8 @@ namespace ot
 		}
 		if(_addr < g_window || _addr >= g_windowEnd)
 			return false;
+		++m_stats.hostWrites;
+		catchUp();		// O16c: the word lands on the DSP the ColdFire is looking at
 		for(uint32_t i = 0; i < _size; ++i)
 		{
 			const auto a = _addr + i;
@@ -621,6 +643,7 @@ namespace ot
 
 	void DspPair::pushHalfwords(const uint32_t _addr, const std::vector<uint16_t>& _hw)
 	{
+		catchUp();		// O16c: DMA0's state below is the DSP's NOW, not a burst ago
 		// ⚠️ DMA0 AS OF THE KICK IS THE **PREVIOUS** BLOCK'S ARMING, and that is
 		// not a defect. The command's two argument words and the CVR write all
 		// precede the kick, but the CVR only INJECTS the interrupt: the DSP has
@@ -643,6 +666,7 @@ namespace ot
 
 	size_t DspPair::pullHalfwords(const uint32_t _addr, const int _core, std::vector<uint16_t>& _out, const size_t _n)
 	{
+		catchUp();		// O16c (runCoreUntil does too; here for the m_sel swap's sake)
 		const int sel = m_sel;
 		m_sel = _core & 1;
 		Core& c = cur();
@@ -668,6 +692,7 @@ namespace ot
 
 	bool DspPair::runCoreUntil(const int _core, const std::function<bool()>& _ready, const uint64_t _budget)
 	{
+		catchUp();		// O16c: the pull runs the core AHEAD of the due count; the backlog goes first
 		Core& c = *m_cores[_core & 1];
 		Core& other = *m_cores[(_core & 1) ^ 1];
 		for(uint64_t n = 0; n < _budget; ++n)
@@ -697,11 +722,140 @@ namespace ot
 	void DspPair::tickInstructions(const uint64_t _n)
 	{
 		m_due += static_cast<double>(_n) * m_ratio;
-		runDue();
+		// O16c: exact (m_lazy == 0) runs the cores now, every tick; lazy only
+		// books the tick and replays the backlog when it reaches the cap
+		// inside a burst -- the run loop's sync() and the host-port touch
+		// points replay it otherwise -- or at once while the edge guard's
+		// window is open (dsp.h), which is the exact tick again.
+		if(m_lazy <= 0.0)
+		{
+			runDue();
+			return;
+		}
+		m_pendingTicks += _n;
+		if(m_due - m_ranDue >= m_lazy || m_due >= m_edgeGuard)
+			runChunk();
+	}
+
+	// O16c: THE CHUNK. The ticks booked since the cores last ran, replayed
+	// as the exact schedule would have run them: the same `+= m_ratio`
+	// additions from the same value (so every limit is the same double), and
+	// for each, core 0 to it then core 1 to it -- runDue's one pass per tick
+	// (its quantum never bites on a tick, O16b). The cross-core interleave,
+	// every idle step's room and every peripheral event therefore fall on
+	// the same DSP instruction as under the exact schedule; what the chunk
+	// saves is the per-tick call and its pass bookkeeping. ❌ A first
+	// version ran the backlog through runDue itself, i.e. in 64-instruction
+	// quanta: core 0's mailbox waits on core 1 then ended up to a quantum
+	// early or late, and with them the bank write and the host ring's drain
+	// -- the frame interrupt and the eDMA completion moved by up to 61
+	// ColdFire instructions, a UART block crossed a run boundary and the
+	// audio moved by thousands of LSB where a parameter ramp met a frame
+	// (out/_agents/speed-b2/, the guard-interdsp reports).
+	void DspPair::runChunk()
+	{
+		const uint64_t n = m_pendingTicks;
+		if(!n)
+			return;
+		m_pendingTicks = 0;
+		const double due = m_due;
+		++m_stats.chunks;
+		m_stats.chunkSum += due - m_ranDue;
+		if(due - m_ranDue > m_stats.chunkMax) m_stats.chunkMax = due - m_ranDue;
+		if(due >= m_edgeGuard && due <= m_edgeWindowEnd)
+			++m_stats.guardTicks;
+		double d = m_ranDue;
+		m_ranDue = due;		// before the passes: a probe from inside them finds nothing pending
+		Core& c0 = *m_cores[0];
+		Core& c1 = *m_cores[1];
+		const bool plain0 = !c0.faulted && c0.boot->finished(), plain1 = !c1.faulted && c1.boot->finished();
+		for(uint64_t k = 0; k < n; ++k)
+		{
+			d += m_ratio;
+			if(plain0)
+			{
+				while(static_cast<double>(c0.executed) < d)
+					if(!stepBody(c0, 0, d))	// false only on a fault, which set executed := limit
+						break;
+			}
+			else
+				stepCore(0, d);				// held / faulted: executed := limit, as runDue has it
+			if(plain1)
+			{
+				while(static_cast<double>(c1.executed) < d)
+					if(!stepBody(c1, 1, d))
+						break;
+			}
+			else
+				stepCore(1, d);
+		}
+		if(m_edgeSeen || due >= m_edgeWindowEnd)
+			predictEdge();
+	}
+
+	// O16c: the edge guard's prediction (dsp.h). Called at the end of a lazy
+	// runDue when the window is behind us or an edge has just fired. The
+	// grid: the last ESAI frame callback ran inside a slot exec at counter
+	// `slotCounter` with DMA2's pointer at `slotDsr2` (that slot's word
+	// included); every later slot exec is one esaiCyclesPerSlot on and moves
+	// the pointer one word, so the boundary slot is `togo` slots on. The
+	// exec that crossed the grid point can be late by the instruction that
+	// crossed it (a `rep` counts its iterations at once): the guard opens
+	// three slots early to cover it, and closes one slot after the boundary
+	// (the poll's window is that one slot; a write after it never comes).
+	void DspPair::predictEdge()
+	{
+		++m_stats.predictions;
+		Core& c = *m_cores[0];
+		const double now = m_due;
+		const double cps = static_cast<double>(c.esaiCyclesPerSlot);
+		const double frame = cps * static_cast<double>(g_esaiSlots);	// one ESAI frame (a sample): the callback's own cadence
+		m_edgeSeen = false;
+		m_edgeGuard = 1e300;
+		m_edgeWindowEnd = now + frame;			// no window: look again after the next callback can have run
+		if(!c.boot->finished() || c.faulted || !m_hostWordHook)
+			return;
+		const uint32_t dsr2 = c.slotDsr2;
+		if(dsr2 < 0x8000 || dsr2 > 0x80ff || c.slotCounter == m_edgeSlot)
+		{
+			// Not payload A's ring, or no ESAI frame since the last look
+			// (the ESAI is not running, or the last window closed within
+			// the frame of the callback it was made from): nothing to
+			// predict from -- a frame on there is a fresh grid point. ❌ A
+			// first version waited a whole ring half (128 slots) here, which
+			// is the boundaries' own period, so every retry landed after
+			// the next boundary: 152 of 413 edges late (edgelog.txt).
+			m_edgeSlot = c.slotCounter;
+			return;
+		}
+		m_edgeSlot = c.slotCounter;
+		const uint32_t w = dsr2 & 0xff;
+		const uint32_t togo = w <= 0x70 ? 0x70 - w : w <= 0xf0 ? 0xf0 - w : 0x70 + 0x100 - w;
+		// Counter units -> executed units (the pair's `executed` runs on the
+		// same counter, offset by the boot ROM's hold) -> due units (core 0
+		// is at the due count at the end of every runDue, give or take an
+		// instruction).
+		const double offset = static_cast<double>(c.executed) - static_cast<double>(c.dsp->getInstructionCounter());
+		const double tb = static_cast<double>(c.slotCounter) + static_cast<double>(togo) * cps + offset;
+		if(tb + cps < now)
+			return;		// the boundary slot is behind us already (a window that passed): the next look is an ESAI frame on
+		m_edgeGuard = tb - 3.0 * cps;
+		m_edgeWindowEnd = tb + cps + 256.0;
+	}
+
+	// O16c: the backlog, now. Nothing to do when exact (m_ranDue == m_due
+	// after every tick) or when a nested caller (a probe from inside runDue's
+	// own hooks) finds runDue already on it.
+	void DspPair::catchUp()
+	{
+		++m_stats.syncs;
+		if(m_pendingTicks)
+			runChunk();
 	}
 
 	double DspPair::tickSamples(const double _n)
 	{
+		catchUp();		// O16c: the burst before the idle skip, before its own per-sample steps
 		if(!m_hostWordHook)
 		{
 			m_due += _n * m_ips;
@@ -711,6 +865,7 @@ namespace ot
 		// One sample at a time, so that a frame edge inside a ColdFire idle
 		// skip ends the skip AT the edge, not a period later.
 		double done = 0.0;
+		m_inSamples = true;
 		while(done < _n)
 		{
 			const double step = std::min(1.0, _n - done);
@@ -721,6 +876,7 @@ namespace ot
 			if(m_hostWordFired)
 				break;
 		}
+		m_inSamples = false;
 		return done;
 	}
 
@@ -828,6 +984,32 @@ namespace ot
 		{
 			c.bankWriteAt = c.executed;
 			{ const int sel = m_sel; m_sel = i; note("bank", c.hdi().txData().size()); m_sel = sel; }
+			if(m_lazy > 0.0)
+			{
+				// O16c: how far the ColdFire's booked count is past this edge
+				// = how late the ColdFire will see it (0 on the exact schedule).
+				// An edge inside an idle skip is counted apart: there the
+				// ColdFire's clock jumps a whole sample at a time with or
+				// without lazy batching (tickSamples), and the lateness is the
+				// skip's own.
+				m_edgeSeen = true;
+				if(m_inSamples)
+					++m_stats.edgesIdle;
+				else
+				{
+					const double late = m_due - static_cast<double>(c.executed);
+					++m_stats.edges;
+					if(late > 0.0) { m_stats.edgeLateSum += late; if(late > m_stats.edgeLateMax) m_stats.edgeLateMax = late; }
+					if(late > 2.0)		// more than the tick's own step: the guard's window was not open
+						++m_stats.edgesLate;
+					if(m_edgeLog)
+						std::fprintf(stderr, "edge exec=%llu due=%.0f late=%.0f guard=%.0f end=%.0f slotctr=%llu slotdsr2=%06x dsr2now=%06x ctr=%llu pcring=%x %x %x %x\n",
+							static_cast<unsigned long long>(c.executed), m_due, late, m_edgeGuard, m_edgeWindowEnd,
+							static_cast<unsigned long long>(c.slotCounter), c.slotDsr2, c.px->read(0xffffe7, dsp56k::Nop) & 0xffffff,
+							static_cast<unsigned long long>(c.dsp->getInstructionCounter()),
+							c.pcRing[(c.pcRingPos + 62) % 64], c.pcRing[(c.pcRingPos + 61) % 64], c.pcRing[(c.pcRingPos + 60) % 64], c.pcRing[(c.pcRingPos + 59) % 64]);
+				}
+			}
 			if(m_hostWordHook(0))
 				m_hostWordFired = true;
 		}
@@ -925,6 +1107,7 @@ namespace ot
 		// core is stepped through stepBody with the limit test inline.
 		const double due = m_due;
 		++m_stats.runDue;
+		m_ranDue = due;		// O16c: the cores are at the due count after this (tickSamples books whole samples; a lazy chunk goes through runChunk)
 		for(;;)
 		{
 			bool ran = false;
@@ -952,12 +1135,18 @@ namespace ot
 			if(!ran)
 				break;
 		}
+		if(m_lazy > 0.0 && (m_edgeSeen || due >= m_edgeWindowEnd))
+			predictEdge();
 	}
 
 	// -- probes ---------------------------------------------------------------
 
+	// O16c: a probe observes the pair NOW, which under lazy batching means
+	// after the backlog. The probes are const in the interface; the backlog
+	// is the pair's own bookkeeping, hence the cast (a no-op when exact).
 	uint32_t DspPair::peekP(const int _core, const uint32_t _addr) const
 	{
+		const_cast<DspPair*>(this)->catchUp();
 		return m_cores[_core & 1]->mem->get(dsp56k::MemArea_P, _addr);
 	}
 	// The shared window is read from the pair's own array: Memory::get
@@ -965,19 +1154,21 @@ namespace ot
 	// the window, so a peek at 0x30000+ through it was blind (O9, 8 Sep).
 	uint32_t DspPair::peekX(const int _core, const uint32_t _addr) const
 	{
+		const_cast<DspPair*>(this)->catchUp();
 		if(_addr >= g_shareLo && _addr < g_shareHi)
 			return m_shared[_addr - g_shareLo];
 		return m_cores[_core & 1]->mem->get(dsp56k::MemArea_X, _addr);
 	}
 	uint32_t DspPair::peekY(const int _core, const uint32_t _addr) const
 	{
+		const_cast<DspPair*>(this)->catchUp();
 		if(_addr >= g_shareLo && _addr < g_shareHi)
 			return m_shared[_addr - g_shareLo];
 		return m_cores[_core & 1]->mem->get(dsp56k::MemArea_Y, _addr);
 	}
-	uint32_t DspPair::pc(const int _core) const { return m_cores[_core & 1]->dsp->getPC().toWord(); }
+	uint32_t DspPair::pc(const int _core) const { const_cast<DspPair*>(this)->catchUp(); return m_cores[_core & 1]->dsp->getPC().toWord(); }
 	bool DspPair::faulted(const int _core) const { return m_cores[_core & 1]->faulted; }
-	uint64_t DspPair::idleSkipped(const int _core) const { return m_cores[_core & 1]->idleSkipped; }
+	uint64_t DspPair::idleSkipped(const int _core) const { const_cast<DspPair*>(this)->catchUp(); return m_cores[_core & 1]->idleSkipped; }
 	// The DSP's own host DMA, as its frame handlers arm it (P:0x588 reads two
 	// host words into DDR0/DCO0 and starts DMA0 = HORX -> X memory; P:0x597
 	// does the same for DMA1 = X memory -> HOTX). Reading them says where the
@@ -985,6 +1176,7 @@ namespace ot
 	// what an end-of-run peek of a buffer the DSP has already consumed cannot.
 	std::string DspPair::blockNote(const int _core)
 	{
+		catchUp();
 		Core& c = *m_cores[_core & 1];
 		char b[192];
 		std::snprintf(b, sizeof b,
@@ -1007,16 +1199,19 @@ namespace ot
 		// pointer, which post-increments as the block drains, so the caller can
 		// find where the words it just sent actually landed.
 		if(_space == 'R')
+		{
+			const_cast<DspPair*>(this)->catchUp();
 			return const_cast<dsp56k::Peripherals56362*>(m_cores[_core & 1]->px.get())->read(0xffffee, dsp56k::Nop);
+		}
 		return _space == 'P' ? peekP(_core, _addr) : _space == 'Y' ? peekY(_core, _addr) : peekX(_core, _addr);
 	}
 
-	bool DspPair::hostRingEmpty(const int _core) const { return !m_cores[_core & 1]->hdi().hasRXData(); }
+	bool DspPair::hostRingEmpty(const int _core) const { const_cast<DspPair*>(this)->catchUp(); return !m_cores[_core & 1]->hdi().hasRXData(); }	// O16c: the gate asks about the ring NOW
 	uint64_t DspPair::pulled(const int _core) const { return m_cores[_core & 1]->pulled; }
 	uint64_t DspPair::pullShort(const int _core) const { return m_cores[_core & 1]->pullShort; }
 	uint64_t DspPair::mailboxWords(const int _from) const { return m_mail[_from & 1].words; }
 	bool DspPair::bootFinished(const int _core) const { return m_cores[_core & 1]->boot->finished(); }
-	uint64_t DspPair::executed(const int _core) const { return m_cores[_core & 1]->executed; }
+	uint64_t DspPair::executed(const int _core) const { const_cast<DspPair*>(this)->catchUp(); return m_cores[_core & 1]->executed; }
 	uint64_t DspPair::hostWordsIn(const int _core) const { return m_cores[_core & 1]->wordsIn; }
 	uint64_t DspPair::hostWordsOut(const int _core) const { return m_cores[_core & 1]->wordsOut; }
 	uint64_t DspPair::hostCommands(const int _core) const { return m_cores[_core & 1]->commands; }
@@ -1083,6 +1278,7 @@ namespace ot
 
 	std::string DspPair::report() const
 	{
+		const_cast<DspPair*>(this)->catchUp();		// O16c: the report is of the pair NOW
 		std::string s;
 		for(int i = 0; i < 2; ++i)
 		{

@@ -428,6 +428,7 @@ namespace ot
 		// OT_STEPFAST=0 = Machine::step inside bursts (diagnosis only).
 		static int burstQuantum();
 		static bool burstStepFast();
+		static bool dspSyncAtTick();		// O16c: OT_DSP_SYNC=0 = no per-burst sync of a lazy pair (a measurement knob)
 		uint64_t forces() const { return m_forces; }
 		uint32_t currentTcb() { return curTcb(); }
 		void setAtaLatency(double _samples) { m_ataLatency = _samples; }

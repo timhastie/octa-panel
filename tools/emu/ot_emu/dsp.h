@@ -230,10 +230,42 @@ namespace ot
 		static double g_quantum;		// O12: --dsp-quantum N (default 64); huge = each core runs its whole due span in turn
 		void runDue();
 		bool stepCore(int _i, double _limit);
+		// O16c: LAZY BATCHING (proposal E2). With `_n` = 0 (the default, and
+		// the boot's and the batch's schedule) every tick runs the cores to
+		// the due count at once: the O12 interleave, bit for bit. With `_n`
+		// > 0 a tick only BOOKS the due count, and the cores run in one
+		// chunk -- runDue over the whole backlog, the quantum interleave
+		// inside it -- at the points where the ColdFire can observe or
+		// affect them: sync() (the run loop, before tickTimers()/deliver()
+		// at every burst end and exact step), any host-port access (read /
+		// write / the eDMA's push and pull / the ring gate), tickSamples (the
+		// idle skip, one sample at a time as before), every probe, and when
+		// the backlog reaches `_n` instructions inside a burst. The
+		// ColdFire's own clock and the ESAI clock (one slot per ips/8 DSP
+		// instructions) are unchanged: only WHEN the pair's work is done
+		// moves, by at most one burst or `_n`, whichever is less -- the
+		// frame edge (the bank word) is seen at the end of the burst it
+		// fell in instead of at the instruction. That is the Phase B audio
+		// contract (O16a) at most -- and with the chunk replaying the
+		// tick sequence and the edge guard (below) it is byte-identical in
+		// practice (the O16c gate). `--dsp-lazy N` in main.cpp; the default
+		// in every mode is g_lazyDefault.
+		static constexpr double g_lazyDefault = 4160.0;		// one sample
+		void setLazy(const double _n) { m_lazy = _n > 0.0 ? _n : 0.0; m_edgeGuard = 1e300; m_edgeWindowEnd = m_lazy > 0.0 ? 0.0 : 1e300; }	// a first prediction at the first lazy runDue
+		double lazy() const { return m_lazy; }
+		void sync() override { catchUp(); }
+		void catchUp();		// run the backlog now (a no-op when there is none, and always when exact)
+		void runChunk();	// the backlog, replayed tick by tick (dsp.cpp)
 		// O16b: the pair's own counters -- runDue calls and passes, stepCore
 		// wrapper calls, interpreter steps and idle steps per core. Free to
 		// keep (one add each); printed on stderr at exit with OT_DSP_STATS=1.
-		struct Stats { uint64_t runDue = 0, passes = 0, stepCalls = 0, interp[2] = {0, 0}, idleSteps[2] = {0, 0}; };
+		// O16c adds the lazy side: host-port reads/writes, chunks (runDue
+		// calls that had a backlog) with the sum and max of the backlog in
+		// DSP instructions, and the frame edge's lateness -- at the bank
+		// write, how far the ColdFire's booked count was ahead of core 0.
+		struct Stats { uint64_t runDue = 0, passes = 0, stepCalls = 0, interp[2] = {0, 0}, idleSteps[2] = {0, 0};
+			uint64_t hostReads = 0, hostWrites = 0, syncs = 0, chunks = 0, edges = 0, edgesIdle = 0, edgesLate = 0, guardTicks = 0, predictions = 0;
+			double chunkSum = 0.0, chunkMax = 0.0, edgeLateSum = 0.0, edgeLateMax = 0.0; };
 		const Stats& stats() const { return m_stats; }
 		// Run ONE core until `_ready` or `_budget` instructions (the read-back
 		// needs the DSP to produce each word). Returns whether it became ready.
@@ -271,6 +303,28 @@ namespace ot
 		int m_sel = 0;
 		double m_ratio, m_ips;
 		double m_due = 0.0;
+		double m_ranDue = 0.0;		// O16c: the due count the cores were last run to (== m_due when exact)
+		uint64_t m_pendingTicks = 0;	// O16c: ticks booked since then (each one `+= m_ratio`; runChunk replays them)
+		double m_lazy = 0.0;		// O16c: the backlog, in DSP instructions, that forces a chunk inside a burst; 0 = exact
+		bool m_inSamples = false;	// O16c: inside tickSamples (an edge there is the idle skip's, not the batching's)
+		// O16c: THE EDGE GUARD. The one event the DSP raises on its own that
+		// the ColdFire must see at the instruction -- the bank word (P:0x73,
+		// the frame edge) -- is predictable: the dispatcher writes it when
+		// DMA2's source pointer (DSR2) equals 0x8070 or 0x80f0, a one-slot
+		// window, and DSR2 advances one word per ESAI slot exec, which the
+		// vendored clock fires every esaiCyclesPerSlot instructions from its
+		// m_lastClock. So from DSR2 and the counter at the last frame
+		// callback (a slot exec) the boundary slot is known, and the pair
+		// ticks EXACTLY (runDue per ColdFire instruction, the pre-O16c
+		// schedule) from three slots before it until one slot after or
+		// until the write fires; lazily elsewhere. `predictEdge` sets the
+		// window in due units; stepBody's bank-write path reports an edge
+		// outside a window as `edgesLate` (a misprediction, measurable).
+		double m_edgeGuard = 1e300, m_edgeWindowEnd = 1e300;
+		bool m_edgeSeen = false;
+		uint64_t m_edgeSlot = 0;		// the slot counter the last prediction was made from
+		bool m_edgeLog = false;
+		void predictEdge();
 		bool m_logOn = false;
 		uint64_t m_traceEvery = 0, m_traceFrom = 0;
 		bool m_idleSkip = true;

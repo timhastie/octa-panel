@@ -4582,3 +4582,187 @@ instruction whatever wraps them.
   both destroy the pair.
 - No thread, no new flag, no CLI change: batch mode and every script that
   drives `ot_emu` see the same bytes (the 28 checks, twice).
+
+## Milestone O16c — lazy batching of the DSP pair: the ticks booked and replayed in chunks, the frame edge guarded, bit for bit ✅ (12 Sep 2026, branch `panel-ui`)
+
+Phase B's step B2 (proposal E2 of `out/_agents/speed-plan/REPORTS.md`,
+prototyped as `out/_agents/speed-dsp/build1`'s `--dsp-lazy`). The pair no
+longer runs after every ColdFire instruction: a tick only BOOKS the due
+count, and the backlog runs in one chunk at the points where the ColdFire
+can observe or affect the cores. Held to the STRICT gate in the end (0
+tolerance, both references, 28/28), not the Phase B audio tolerance it was
+allowed: the two designs that moved the schedule failed the gate by far
+more than an LSB, and the one that ships is the exact schedule replayed.
+`dsp.cpp`, `dsp.h`, `rtos.cpp`, `rtos.h`, `machine.h`, `main.cpp`. Default
+on in every mode; `--dsp-lazy 0` restores the per-tick path.
+
+### What changed
+
+- **`Coprocessor::sync()`** (`machine.h`, default no-op): "bring the
+  co-processor up to everything booked so far". `Rtos::runLoop` calls it
+  before `tickTimers()`/`deliver()` at every burst end and `stepOnce` after
+  every exact instruction -- the point where the pair's state becomes
+  observable (the frame latch, the eDMA gate) and where the old loop had
+  already run it (inside each instruction's tick). `OT_DSP_SYNC=0` drops
+  those two calls (a measurement knob: what the per-burst sync costs).
+- **`DspPair::setLazy(N)`** (`--dsp-lazy N`, default
+  `g_lazyDefault` = 4160 = one sample; 0 = exact): `tickInstructions`
+  adds `ratio` to `m_due` as before and counts the tick; the backlog runs
+  through **`runChunk`** when it reaches N inside a burst, at `sync()`, at
+  every host-port touch point (`read`/`write` of the window, the eDMA's
+  `pushHalfwords`/`pullHalfwords`/`hostRingEmpty` gate, `runCoreUntil`,
+  `blockNote`, `peekWord`), before the idle skip's `tickSamples` (which
+  then steps one sample at a time as before), and inside every probe
+  (`peekP/X/Y`, `pc`, `executed`, `idleSkipped`, `report`; const, so they
+  cast -- what they observe is the pair NOW). The boot (before the Rtos)
+  is exact: its report is in every boot log.
+- **`runChunk` REPLAYS the tick sequence**: the same `+= m_ratio`
+  additions from the same value (every limit the same double), and for
+  each, core 0 to it then core 1 to it -- `runDue`'s one pass per tick
+  (its 64-quantum never bites on a tick, O16b). So the cross-core
+  interleave, every idle step's room and every peripheral event fall on
+  the same DSP instruction as under the per-tick schedule; the chunk saves
+  the per-tick call and its pass bookkeeping, nothing else. `tickSamples`
+  (the ColdFire idle skip, whole samples, 64-quanta) and the exact
+  `--dsp-lazy 0` path still go through `runDue`.
+- **THE EDGE GUARD** (`predictEdge`): the one event the DSP raises on its
+  own that the ColdFire must see at the instruction is the bank word
+  (P:0x73, the frame edge). It is predictable: the dispatcher writes it
+  when DMA2's source pointer equals 0x8070 or 0x80f0 (a one-slot equality
+  window, O8), DSR2 advances one word per ESAI slot exec (`writeSlotToFrame`
+  triggers the DMA before the frame callback), and the slot cadence is
+  `esaiCyclesPerSlot` = 520 instructions on the DSP's own counter. The
+  frame sink records (counter, DSR2) at each callback -- a slot exec -- and
+  from that grid point the boundary slot is `togo` slots on; from three
+  slots before it until one slot after (or until the write fires) every
+  tick is exact (`m_due >= m_edgeGuard` in `tickInstructions`), lazily
+  elsewhere; a prediction that finds no new callback retries one ESAI frame
+  (8 slots) later. `stepBody`'s bank-write path reports an edge that fires
+  outside a window as `edges-late`. Edges inside idle skips are the skip's
+  own (whole samples, as before) and counted apart.
+- **Counters** on the O16b `OT_DSP_STATS=1` line: `hostR/hostW`,
+  `syncs`, `chunks` with the mean and max backlog, `edges` with their
+  lateness, `edges-late`, `edges-in-idle-skips`, `guardticks`,
+  `predictions`. `OT_DSP_EDGELOG=1`: one stderr line per bank write seen
+  from a chunk (the guard's evidence, `out/_agents/speed-b2/edgelog*.txt`).
+  No command, reply or stdout line changed.
+
+### The two designs that failed the gate, measured (`out/_agents/speed-b2/`)
+
+1. **The chunk through `runDue` (64-instruction quanta), no guard** -- the
+   E2 prototype's shape. Bench **244 / 246 / 244** ms per wall s (+46 %),
+   `ready` 7.6 s. Gate: `interdsp.stamps` max |dsample| 16.63 (a run end
+   moved a frame period), the PCM 16 frames short and **max |diff| 4301,
+   16.6 % of samples differing** (`20260912-142635-b2-lazy`). Not a shift
+   (the best frame shift is 0 in every window) and not an LSB drift: at
+   frame 49703 the candidate reads 6806, 12851, 22777 where the reference
+   has 6689, 11889, 20756 -- a gain ramp one frame ahead, converging to
+   1-LSB tails. The frame interrupt was delivered up to a chunk late
+   (mean 1141 DSP instructions for the 6 % of edges that fall in bursts,
+   max 4158), the block reached the DSP that much later, and where that
+   crossed a bank boundary the port's known 15/17-frame jitter moved: a
+   parameter block met its audio a frame off.
+2. **The same chunk with the guard.** `edges-late` 152 of 413 on the first
+   build (the retry after a window waited 128 slots = the boundaries' own
+   period, so every retry landed past the next boundary; `edgelog.txt`),
+   0 of 412 once the retry was one ESAI frame -- and the gate still failed:
+   UART 18309 vs 18301 bytes (a block crossed the PLAY step), stamps
+   max |dsample| 46.82, PCM 42 % differing (`20260912-144242-b2-guard2-
+   interdsp`); the batch WAV byte-identical but its log's ack tail with
+   vector 0x48 (the eDMA completion) acknowledged at other PCs. The
+   cross-core interleave: inside a 64-quantum chunk core 0's mailbox
+   waits on core 1 end up to a quantum early or late, and with them the
+   bank write and the host ring's drain -- by up to 61 ColdFire
+   instructions, enough to move both interrupts.
+
+Replaying the tick sequence (above) removed every difference:
+`20260912-144621-b2-replay-interdsp` 8/8 with the PCM byte-identical.
+
+### Measured (12 Sep 2026, the same M5 Mac, macOS 26.5; nothing else running; logs under `out/_agents/speed-b2/`)
+
+**The gate** (`tools/emu/ot_emu/oracle/`, final binary sha `0605bde48918`,
+`--build-dir` for ctest):
+
+| run | result | report |
+|---|---|---|
+| `phase_b.sh` vs `ref-1e76ac5` (Phase B tolerances) | **28 PASS, 0 FAIL**, 36 s | `20260912-145609-b2-final` |
+| `phase_b.sh` vs `ref-73c2815` | **28 PASS, 0 FAIL**, 3 s (cached) | `20260912-145646-b2-final` |
+| strict, no tolerance flag, vs `ref-73c2815` | **28 PASS, 0 FAIL** | `20260912-145702-b2-final-strict` |
+| B2 vs itself (determinism) | **27 PASS, 0 FAIL**, 36 s | `20260912-145706-b2-determinism` |
+
+Every check byte-identical, the audio included: `interdsp.pcm` 124,447
+frames identical (max |diff| 0, 0 % differing, onset frame 98),
+`run3_core0.wav` 330,677 frames identical (onset 282,744), the UART stream
+18,309 bytes, 47 run stamps with |dsample| = 0, the boot logs and the batch
+log with the pair's own report (executed, idle-skipped, bank latency)
+identical -- which is why the default is on in the batch too.
+`edges-late` **0** of 741 chunk edges over the bench session (+10,727 in
+idle skips), 0 of 413 in the edge log.
+
+**Speed** (`out/_agents/speed/bench.py --dsp`, HEAD = `git archive HEAD`
+built in `build-head/`, both plain LTO, alternated round by round;
+emulated ms per wall s, the 16 runs' wall in brackets):
+
+| round | HEAD (B1) | B2 | `ready` HEAD / B2 |
+|---|---|---|---|
+| r1 | 169 (23.69 s) | **203** (19.72 s) | 18.5 / 14.9 s |
+| r2 | 166 (24.05 s) | **204** (19.60 s) | 19.6 / 14.5 s |
+| r3 | 168 (23.87 s) | **203** (19.70 s) | 18.8 / 14.4 s |
+| mean | 167.7 | **203.3 (+21 %)**; wall 23.87 → 19.67 s (−18 %) | 19.0 → **14.6 s (−23 %)** |
+| `--dsp-lazy 64` / `1024` | – | 199 / 202 | – |
+| `OT_DSP_SYNC=0` | – | 206 (the per-burst sync is free: the host port syncs it first) | – |
+| `--dsp-lazy 0` (the per-tick path) | – | 166 = HEAD | 20.1 s |
+| no `--dsp` | 1434 | 1418 (noise; the pair is not constructed) | 5.4 / 5.4 s |
+
+**Where the ceiling is** (`stats.py`, the play phase = boot→PLAY + 4 s):
+the pair's work is identical to HEAD's -- core 0 763.2 M due, 26.0 M
+idle-skipped, **733.2 M interpreted** (HEAD 733.6 M), core 1 324.3 M
+interpreted with 61.3 M idle steps (HEAD 324.3 M / 61.3 M) -- and what the
+chunk removed is the per-tick wrapper: `runDue` calls 356.3 M → 0.10 M,
+passes 709.5 M → 6.2 M, 38.1 M chunks of 9.4 ticks on average (the
+firmware makes 8.2 M host-port accesses per emulated second while playing:
+8.83 M reads, 25.3 M writes over the phase, most of them the eDMA's
+halfwords), 2.3 M guard ticks (0.65 %). Per emulated second the pair now
+costs ~4.2 wall s of the 4.9 (the ColdFire ~0.7): ~1 G interpreted DSP
+instructions per 4.16 s at ~4 ns each is the vendored interpreter's own
+throughput, E4's ground and outside this plan. Profile (`sample`, 10 s
+mid-play, `agg.py`): `stepBody` self 25.0 %, `runChunk` 3.8 % (was
+`runDue` 7.7 %), `op_Parallel` 5.2 %, the pair 69 % inclusive.
+
+**The panel end to end** (`panel_e2e.py`, `panel_server.py --port 8584
+--sound on` on the OTLIVE fixture, this binary): `ready` after 14.7 s;
+idle 999.7 emulated ms per wall s, `/status rt` median 1.000 (0.993-1.007),
+child 31 % of a core; PLAY: the trig rows chase (31 LED-state changes in
+12 s), **playing 206 emulated ms per wall s, `rt` median 0.203**
+(0.190-0.226; O15f/B1 measured ~0.15-0.17), child 97 %; `/audio/pcm` of
+the last second 44,100 frames, 88,200 non-zero samples; STOP closed
+`take-003.wav`, 406,020 frames = 9.2 s, 1,624,124 bytes; `rt` 0.993 back
+at idle, no fault, no restart.
+
+**Shutdown** (`shutdown.py`, `--interactive --dsp` with `audio start
+main`): `quit` 22 ms, EOF 22 ms, SIGTERM 22 ms, SIGTERM with `run 2000` in
+flight 23 ms. No thread was added (the chunk runs on the caller's thread),
+so there is nothing for `-fsanitize=thread` to find; the determinism run
+above is the deterministic-handshake proof.
+
+### What it does not do
+
+- It does not batch across the host port: a chunk ends at every host-port
+  access and burst end, and while playing the firmware touches the port
+  34.1 M times in 356 M instructions (the eDMA's halfwords included), so
+  the mean chunk is 9.4 ticks and N (64..4160) barely matters.
+  The gain is the wrapper, not the interpreter; the interpreter is ~85 % of
+  the `--dsp` wall.
+- The schedule-moving designs are not shipped, not even opt-in: they
+  failed the Phase B contract by orders of magnitude (16-42 % of samples,
+  thousands of LSB), because the port's frame/bank phase is one slot from
+  a boundary and any lateness of the frame interrupt or any cross-core
+  skew moves it. The contract's LSB expectation (O12) was about the
+  interleave inside a chunk with the ColdFire's view held; that view is
+  what has to stay exact.
+- The edge guard is payload A's: it knows the ring (X:0x8000-0x80ff), the
+  two boundaries and P:0x73. A payload that moves them gets no window and
+  the edge lands a chunk late (`edges-late` says so); `--dsp-lazy 0` is
+  the fallback.
+- `OT_DSP_STATS` prints at destruction, as in O16b; `OT_DSP_EDGELOG` is a
+  diagnostic and prints nothing without the variable.

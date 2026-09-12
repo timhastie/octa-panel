@@ -98,6 +98,21 @@ namespace ot
 		return f;
 	}
 
+	// O16c: OT_DSP_SYNC=0 drops the run loop's sync of a lazy pair at burst
+	// ends and exact steps, leaving only the host-port touch points and the
+	// `--dsp-lazy N` backlog cap -- the frame edge is then seen up to N DSP
+	// instructions late instead of one burst. A measurement knob (how much
+	// the per-burst sync costs), not a mode: nothing prints, nothing else moves.
+	bool Rtos::dspSyncAtTick()
+	{
+		static const bool s = []
+		{
+			const char* const e = std::getenv("OT_DSP_SYNC");
+			return !e || std::atoi(e) != 0;
+		}();
+		return s;
+	}
+
 	Rtos::~Rtos()
 	{
 		// stderr only, opt-in: stdout is diffed byte for byte by the oracles.
@@ -725,6 +740,8 @@ namespace ot
 		const uint32_t pcStop = _s.pcArmed ? _s.pc : 1u;
 		const bool gateEnds = _s.untilGate;
 		const bool spinEnds = _s.idleSkip;
+		Coprocessor* const co = m_machine.coprocessor();
+		const bool syncCo = dspSyncAtTick();
 		m_wake = true;
 
 		while(m_sample < end)
@@ -888,7 +905,15 @@ namespace ot
 				}
 				m_burstStats.burstInstr += static_cast<uint64_t>(i);
 				executed += static_cast<uint64_t>(i);
-				m_wake = false;		// before the pair: a wake raised inside them forces an exact step next
+				// O16c: a lazy pair runs its backlog HERE, where the old loop
+				// had already run it (inside each instruction's tick): before
+				// the timers and the delivery, so an edge or a drained ring
+				// due inside the burst is seen at the burst's end -- and
+				// before the clear below, as a wake the pair raised inside the
+				// burst was cleared here too (deliver() reads the latch itself).
+				if(co && syncCo)
+					co->sync();
+				m_wake = false;		// before the timers: a wake raised inside them forces an exact step next
 				tickTimers();
 				deliver();
 				continue;
@@ -949,6 +974,10 @@ namespace ot
 		if(!m_firstSwitch.first && pc == g_handoff)
 			m_firstSwitch.first = curTcb();
 
+		// O16c: the exact step syncs a lazy pair after every instruction --
+		// the pre-O16c schedule, instruction for instruction.
+		if(auto* co = m_machine.coprocessor(); co && dspSyncAtTick())
+			co->sync();
 		tickTimers();
 		deliver();
 		return true;
