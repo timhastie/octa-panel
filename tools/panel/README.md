@@ -188,6 +188,64 @@ key alone, held 1.2 s, twice, and under 20 held modifiers — only the
 double tap of T1–T8 hit. KEYMAP.md's "UP held + track key" (E3) was two
 T2 taps that happened to fall inside the window.
 
+## Hearing the unit
+
+With the port backend the server starts the child with `--dsp` by default
+(`--sound on`; `--sound off` boots without the cores, and so does
+`--backend routea`, which has no sound at all): the two DSP56303 cores
+render, and core 0's **main L/R** — the words the ESAI puts out to the
+DAC, 16-bit (the 24-bit word's top two bytes), 44100 Hz — comes over the
+`--interactive` pipe (`audio start main` / `audio read`, O14k in
+`COLDFIRE_PORT.md`). Cue and core 1 are not captured. What `--dsp` costs:
+boot + fixture load ~50–60 s instead of ~40, and while the sequencer plays
+the emulator runs ~9x slower than real time (100–110 emulated ms per wall
+s, measured 12 Sep 2026, against ~350 without the cores); idle, the child
+still renders (silence) but skips its idle time, ~2000–2700 emulated ms
+per wall s.
+
+The server drains the child's ring after every pump (25 ms of firmware)
+and every action into a ring of its own — the last **180 s**, addressed
+by absolute frame number since the capture began (the count keeps rising
+across respawns, re-inserts and sound switches; the child's own ring
+restarts each time) — and, while frame mode is on, into a **take**:
+**PLAY opens `out/_panel_takes_<port>/take-NNN.wav`, STOP closes it.**
+That is the hardware feeling: press PLAY, the unit plays, press STOP, you
+have what it played. The file is 16-bit stereo 44.1 kHz with its RIFF
+sizes re-patched after every append, so it is a valid WAV at every
+moment (a reader mid-take gets what is there so far); a take open at a
+reboot or at exit is closed as it stands. Takes are numbered on from what
+the folder already holds and never wiped.
+
+| route | does |
+|---|---|
+| `GET /status` | adds `sound` (the child runs `--dsp` and its capture is on) and `sound_note` (why not, when not) |
+| `GET /audio/status` | `{sound, on, rate: 44100, captured, end, first, cap, dropped, peak: [l, r], take, takes, note}` — `end` = frames ever captured, `first` = the oldest still in the ring, `cap` = 7 938 000, `dropped` = frames the child overwrote unread, `peak` of the last non-empty read, `take` = `{n, recording, frames, seconds, file, start}` while one is open (else null), `takes` = every take as `{n, file, frames, seconds}`; plus `busy`/`phase` (a reboot in progress), `takes_dir`, and `drain` (what the drain itself costs the pump: reads, wall_ms, max_ms) |
+| `GET /audio/pcm?from=<frame>&max=<frames>` | raw LE int16 stereo frames from `max(from, first)`, at most `max` (default 88 200, cap 441 000), `application/octet-stream` with `X-Audio-From` (where the body really starts), `X-Audio-Frames`, `X-Audio-End`, `X-Audio-Rate`; **204** with `X-Audio-End` when `from >= end`. Served from the ring on the HTTP thread: 1–2 ms for 2 s of audio |
+| `GET /audio.wav?take=N` | that take as `audio/wav`, `Content-Disposition: attachment; filename="octatrack-take-NNN.wav"`; a missing take is a 404 JSON |
+| `GET /audio.wav?from=&to=` | ring frames as `octatrack-main-out.wav` (default: everything held); an empty range is a 404 JSON |
+| `GET /audio/enable?on=1\|0` | reboot the child with/without `--dsp`, the card re-insert's own mechanics: `/status phase` reads `switching sound on (reboot, ~1 min)` / `switching sound off (reboot, ~40 s)`, `booted` false meanwhile, the clock dialog closed after; `ok: false` + `note` while a re-insert or switch runs, while booting, when already in that state, or under route A. Takes and the ring survive it |
+
+Measured 12 Sep 2026 on the OTLIVE fixture (`out/_agents/monitor-server/`,
+`verify.py`, logs beside it): the drain costs the idle pump ~0.3 ms per
+25 ms of firmware once the pipe reader was buffered (it was 2.2 ms with
+`readline()` on the raw pipe, a syscall per byte); playing, `end` grows
+at 44 100 per emulated second (`/status ran_ms` deltas); the take opens
+with 0 frames at the PLAY key and the first sound is at frame 81 (1.8 ms
+after it, the pattern's saved trig on step 1); a take of 2.65 emulated s
+took 25.8 s of wall.
+
+**The honest playback note.** Nothing here paces the unit to wall time:
+while it plays, the child renders ~9x slower than real time, so anyone
+*listening* live is behind, and in bursts — the page's MONITOR plays
+what has arrived and waits when it runs dry; a replayed take plays at
+real time. Two more things the fixture taught: `/audio/status peak` at
+32767 means the DSP itself is clipping (the fixture's slots 1 and 2 loop
+`first-0`/`second-0` at GAIN 75/72 from step 1 — the spike's `tree2`
+copy, `out/_agents/audio/tree2`, has them at 48 with looping off, which
+is where the `third-0.wav x 0.70` figure comes from); and the VOLUME pot
+on the panel is the monitor's gain only, as the hardware pot sits after
+the DAC.
+
 ## No unit to hand? Real projects from public test fixtures
 
 Two open-source Octatrack tools ship projects saved on real units (OS

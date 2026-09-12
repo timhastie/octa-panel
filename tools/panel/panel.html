@@ -120,6 +120,68 @@
   #card:hover .slot, #card.open .slot { border-color:#e8b23a; box-shadow:0 0 6px rgba(232,178,58,.45); }
   #card.drop { background:rgba(98,224,106,.1); }
   #card.drop .slot { border-color:#8fe39a; box-shadow:0 0 8px rgba(98,224,106,.6); }
+  /* HEAD-PHONES: the MONITOR jack (JACKS x 120). #hp is a transparent hit
+     area over jack + label: a click plugs the headphones in (the page then
+     streams GET /audio/pcm into WebAudio) or pulls them out; .plugged draws
+     the plug seated in the jack, cable off the top of the stage. #vu is the
+     L/R level meter beside it (peak hold), lit only while monitoring.
+     VOLUME (.knob.pot) is the monitor's gain, a real pot here. */
+  #hp { cursor:pointer; border-radius:4px; }
+  #hp:hover { background:rgba(232,178,58,.08); }
+  #hp.plugged .plug { display:block; }
+  #hp .plug { display:none; position:absolute; left:26px; top:-14px; width:8px; height:24px; border-radius:2px 2px 3px 3px;
+              background:linear-gradient(90deg, #202022, #454548 45%, #1a1a1c); box-shadow:0 0 0 1px #0a0a0b; }
+  #hp .plug::before { content:""; position:absolute; left:3px; top:-60px; width:2px; height:60px; background:#151517; border-radius:1px; }
+  #hp .plug::after { content:""; position:absolute; left:1px; bottom:-6px; width:6px; height:8px; border-radius:0 0 3px 3px;
+                     background:linear-gradient(90deg, #8a7430, #d8b24a 45%, #7a6428); }
+  #hp:hover + #jack-hp, #hp.plugged + #jack-hp { box-shadow:0 0 6px rgba(232,178,58,.5); }
+  #jack-hp { pointer-events:none; }   /* the jack sits after #hp in the DOM (so the rule above can light it) and
+                                         paints over the hit area: clicks and hover fall through to #hp */
+  #vu { display:flex; gap:3px; align-items:flex-end; pointer-events:none; }
+  #vu .bar { position:relative; width:4px; height:22px; background:#0a0a0b; border:1px solid #2a2a2c; border-radius:1px; overflow:hidden; }
+  #vu .fill { position:absolute; left:0; right:0; bottom:0; height:0;
+              background:linear-gradient(to top, #62e06a 0 55%, #ffd23a 55% 82%, #ff4d3c 82%);
+              background-size:100% 20px; background-position:bottom; }
+  #vu .pk { position:absolute; left:0; right:0; height:1px; bottom:0; background:#e8e6df; opacity:0; }
+  #vu.lit .pk { opacity:.9; }
+  #vu.lit .bar { border-color:#3a3a3d; }
+  .knob.pot { cursor:ns-resize; }
+  .knob.pot:hover { box-shadow:0 0 0 1px #1a1a1b, 0 3px 6px rgba(0,0,0,.75), inset 0 1px 0 rgba(255,255,255,.12), 0 0 0 2px rgba(232,178,58,.35); }
+
+  /* ---- MONITOR drawer: the HEAD-PHONES monitor, the takes (GET /audio/status),
+          SOUND ON/OFF (GET /audio/enable) -- opened by the toolbar button or the jack ---- */
+  #mon { display:none; padding:6px 10px 8px; border-top:1px solid #232326; }
+  #mon.open { display:block; }
+  #mon .note { font-size:10px; color:var(--dim); margin-bottom:6px; max-width:1100px; }
+  #mon .note b { color:#bdbab2; }
+  #monrow { display:flex; gap:14px; align-items:flex-start; flex-wrap:wrap; font-size:10px; }
+  #monside { flex:0 1 440px; min-width:280px; display:flex; flex-direction:column; gap:6px; }
+  #monside button, #takes button { background:#2c2c2e; color:#d8d5cc; border:1px solid #47474a; border-radius:4px;
+                                   padding:3px 10px; font-size:10px; cursor:pointer; letter-spacing:.04em; }
+  #monside button:hover, #takes button:hover { background:#38383a; }
+  #monside button:disabled, #takes button:disabled { opacity:.45; cursor:default; }
+  #plugbtn.on { background:#7a5a18; border-color:#e8b23a; }
+  #soundbtn.armed { background:#b8261f !important; border-color:#d02b26 !important; color:#fff; }
+  #monstate { color:var(--dim); line-height:13px; min-height:26px; }   /* two lines reserved: the sound-off message
+                                                                          wraps, and the buttons below must not move */
+  #monstate.off { color:#f0c85a; }
+  #monread { color:#bdbab2; font-family:ui-monospace, Menlo, monospace; }
+  #recdot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#2b2b2b;
+            box-shadow:inset 0 0 0 1px #3a3a3a; vertical-align:-1px; margin-right:5px; }
+  #recdot.on { background:#ff4d3c; box-shadow:0 0 6px 1px rgba(255,77,60,.65); animation:recblink 1s steps(2) infinite; }
+  @keyframes recblink { to { opacity:.35; } }
+  #takes { flex:1 1 400px; min-width:0; max-height:190px; overflow:auto; background:#0d0d0e; border:1px solid #2a2a2d; border-radius:3px; }
+  .take { display:grid; grid-template-columns:70px 56px 1fr auto auto; gap:0 12px; align-items:center; padding:2px 8px;
+          border-bottom:1px solid #1a1a1c; font-size:10px; }
+  .take:last-child { border-bottom:0; }
+  .take.h { color:var(--dim); position:sticky; top:0; background:#131315; }
+  .take .n { font-family:ui-monospace, Menlo, monospace; color:#d8d5cc; white-space:nowrap; }
+  .take .s { text-align:right; color:#bdbab2; font-family:ui-monospace, Menlo, monospace; }
+  .take .st { color:#bdbab2; }
+  .take.rec .n, .take.rec .st { color:#f0c85a; }
+  .take a { color:#8fe39a; text-decoration:none; letter-spacing:.04em; }
+  .take a:hover { text-decoration:underline; }
+  .take button { padding:0 6px !important; font-size:9px !important; }
 
   /* labels: white 10px caps, function (shifted) labels red 9px */
   .lb { color:var(--txt); font-size:10px; letter-spacing:.02em; white-space:nowrap; text-transform:uppercase;
@@ -212,6 +274,7 @@
     <span id="fault"></span>
     <button id="mapbtn" onclick="toggleMap()">MAP KEYS</button>
     <button id="poolbtn" onclick="togglePool()" title="the card's AUDIO folder (also: click the COMPACT FLASH slot)">AUDIO POOL</button>
+    <button id="monbtn" onclick="toggleMon()" title="the HEAD-PHONES monitor: listen to the unit's main out, replay or save takes, sound on/off (also: click the HEAD-PHONES jack)">MONITOR</button>
     <button onclick="doRun(1000)">RUN 1s</button>
     <button onclick="doRun(5000)">RUN 5s</button>
     <button onclick="exportMap()">EXPORT MAP</button>
@@ -250,6 +313,25 @@
         <div id="poollog"></div>
         <div id="howto"></div>
       </div>
+    </div>
+  </div>
+  <div id="mon">
+    <div class="note">
+      <b>HEAD-PHONES &middot; MONITOR</b> &mdash; the unit's main out (DSP core 0, L/R, 16-bit 44.1 kHz), drained by the
+      server from the emulator into a ring of frames. Click the jack to plug the headphones in and listen; <b>VOLUME</b> is
+      the monitor's gain (nothing of it reaches the firmware &mdash; the unit's pot is analogue, after the DAC). The emulator
+      renders ~9x slower than real time while the sequencer plays, so listening is <i>behind</i> and comes in bursts (each
+      burst waits for 300 ms of sound); a <b>take</b> &mdash; PLAY to STOP, what the unit played &mdash; replays at real time.
+    </div>
+    <div id="monrow">
+      <div id="monside">
+        <div id="monstate">&hellip;</div>
+        <div><button id="plugbtn" onclick="monToggle()">PLUG IN</button> <span id="monread">unplugged</span></div>
+        <div>gain <b id="mongain">75 %</b> <span style="color:var(--dim)">(the VOLUME pot: wheel or drag turns it, double-click returns to 75 %)</span></div>
+        <div><span id="recdot"></span><span id="rectext">no take open</span></div>
+        <div><button id="soundbtn" onclick="soundToggle()">SOUND OFF</button> <span id="soundphase"></span></div>
+      </div>
+      <div id="takes"></div>
     </div>
   </div>
 </div>
@@ -343,8 +425,8 @@ const RULES = [
   [106, 678, 712, "Track Trigs", 390],
   [772, 1272, 712, "Sample/MIDI Trigs", 1000],
 ];
-// rear-edge jacks (decorative), at y 15: x, kind
-const JACKS = [[120, 1], [190, 2], [262, 2], [335, 2], [405, 2], [490, "din"], [568, "din"], [650, "din"],
+// rear-edge jacks (decorative, except HEAD-PHONES = the monitor and COMPACT FLASH = the pool), at y 15: x, kind, id
+const JACKS = [[120, 1, "hp"], [190, 2], [262, 2], [335, 2], [405, 2], [490, "din"], [568, "din"], [650, "din"],
                [840, "cf"], [1005, "usb"], [1165, 1], [1280, "sw"]];
 
 // ---------------- build ----------------
@@ -361,8 +443,8 @@ function label(text, x, y, cls = "") {
   d.style.left = x + "px"; d.style.top = y + "px";
   S.append(d); return d;
 }
-for (const [x, kind] of JACKS) {
-  if (kind === 1) el("jack", x, 15, 12, 12);
+for (const [x, kind, id] of JACKS) {
+  if (kind === 1) { const j = el("jack", x, 15, 12, 12); if (id) j.id = "jack-" + id; }
   else if (kind === 2) { el("jack", x - 9, 15, 12, 12); el("jack", x + 9, 15, 12, 12); }
   else if (kind === "din") el("jack", x, 15, 16, 16);
   else if (kind === "cf") continue;                       // drawn as #card below the labels (it is a control)
@@ -377,7 +459,7 @@ for (const [id, x, y, w, h, shape, col, glyph] of KEYS) {
 }
 for (const [id, x, y, col] of LEDS) { const d = el(`led ${col}`, x, y, 7, 7); d.id = "led-" + id; }
 for (const [id, x, y, r, live] of KNOBS) {
-  const k = el("knob" + (live ? " live" : ""), x, y, 2 * r - 8, 2 * r - 8);
+  const k = el("knob" + (live ? " live" : " pot"), x, y, 2 * r - 8, 2 * r - 8);   // pot = VOLUME, the monitor's gain (see MONITOR)
   k.dataset.id = id; k.dataset.pos = 0;    // live knobs: net detents sent, -64..+63, 0 = centre (not persisted)
   const cap = document.createElement("div"); cap.className = "cap"; k.append(cap);
 }
@@ -387,6 +469,20 @@ for (const [t, x, y, cls] of LABELS) label(t, x, y, cls);
   c.title = "COMPACT FLASH — click: the card's AUDIO pool (add samples; RE-INSERT CARD reboots the unit); drop audio files here to add them";
   for (const cls of ["cf", "slot"]) { const d = document.createElement("div"); d.className = cls; c.append(d); }
   c.addEventListener("click", () => togglePool());
+}
+{ // the HEAD-PHONES jack (JACKS "hp" at 120,15): a 60x62 hit area over jack + label = the monitor's plug,
+  // and the L/R level meter beside it (built here, after the labels, so they are on top)
+  const h = el("", 120, 34, 60, 62); h.id = "hp";
+  const plug = document.createElement("div"); plug.className = "plug"; h.append(plug);
+  h.addEventListener("click", () => monToggle());
+  h.after($("#jack-hp"));                                   // the jack right after #hp: the CSS sibling rule lights it
+                                                            // (it paints over #hp, so CSS gives it pointer-events:none)
+  const vu = el("", 161, 15, 15, 22); vu.id = "vu";
+  for (const ch of ["L", "R"]) {
+    const bar = document.createElement("div"); bar.className = "bar"; bar.title = ch;
+    for (const cls of ["fill", "pk"]) { const d = document.createElement("div"); d.className = cls; bar.append(d); }
+    vu.append(bar);
+  }
 }
 el("sw", 122, 462, 8, 8);   // "FUNCTION" legend: red labels are FUNC + key
 for (const [x1, x2, y, text, tx] of RULES) {
@@ -454,7 +550,7 @@ function refreshMapped() {
   });
   document.querySelectorAll(".knob").forEach(el => {
     const r = rowOfKnob(el);
-    el.title = !el.classList.contains("live") ? "volume (a pot on the unit; inert here)"
+    el.title = !el.classList.contains("live") ? potTitle()
              : r != null ? `${el.dataset.id}: encoder row ${hex(r)} — wheel/drag turns (-64..+63 from where the firmware sits), double-click returns to 0`
              : `${el.dataset.id}: unmapped — use MAP KEYS`;
   });
@@ -858,6 +954,379 @@ window.addEventListener("drop", e => e.preventDefault());
 // how to get a pool file into a slot on the unit (tools/panel/README.md, "Loading samples")
 $("#howto").innerHTML = HOWTO;
 
+// ---------------- MONITOR: the HEAD-PHONES jack, VOLUME, the takes ----------------
+// The server drains the emulator's DSP main output (core 0 L/R, 16-bit
+// 44.1 kHz) into a ring of ABSOLUTE frame numbers (GET /audio/status: end,
+// first; GET /audio/pcm?from=&max= the frames themselves, 204 = nothing new
+// yet). Plugging the headphones in (a click on the jack) creates/resumes
+// the AudioContext -- WKWebView and Chrome both want a gesture -- and streams
+// from=end onwards: every ~150 ms the next frames are fetched, turned into an
+// AudioBuffer and scheduled at a schedule cursor, back to back, never
+// overlapping. The emulator renders ~9x slower than real time while the
+// sequencer plays, so the cursor runs dry all the time; the policy is to
+// wait until >= 300 ms of audio is queued, then let it play out: bursts of
+// continuous sound, honest to the speed of the unit ("behind 3.2 s" =
+// emulated audio available minus played). More than 20 s behind (a
+// backgrounded tab throttles the timers, the unit does not wait) skips
+// ahead to end - 20 s and says so. VOLUME is the GainNode (0..100 %,
+// remembered in localStorage); nothing of it reaches the firmware -- the
+// unit's pot is analogue, after the DAC. The meter beside the jack reads two
+// AnalyserNodes after the gain. A take (PLAY to STOP, the server's
+// out/_panel_takes_<port>/take-NNN.wav) replays at real time through the
+// same GainNode (decodeAudioData of /audio.wav?take=N) or is saved by its
+// SAVE link (target=_blank: the app intercepts the audio/wav response with
+// a save panel, Chrome downloads it).
+const MON_RATE = 44100, MON_POLL_MS = 150, MON_MAX = 88200, MON_STARVE = Math.round(0.3 * MON_RATE),
+      MON_SKIP = 20 * MON_RATE, MON_LEAD = 0.05, VOL_DEFAULT = 75;
+const SOUND_OFF_MSG = "sound is off (DSP cores not running): turn it on in the drawer";
+const MON = {
+  ctx: null, gain: null, anL: null, anR: null,
+  on: false, gen: 0, from: -1, end: 0, cursor: 0, pend: [], pendFrames: 0, live: new Set(),
+  scheduled: 0, bursts: 0, dropped: 0, skipped: 0, skippedAt: 0, err: null,
+  sound: null, soundNote: null, phase: "", status: null, statusErr: null, statusTimer: 0, statusBusy: false,
+  replay: null, open: false, armTimer: 0,
+};
+
+// -- VOLUME: a real pot, 0..100 %, the monitor's gain --
+let vol = VOL_DEFAULT;
+try { const v = parseFloat(localStorage.getItem("otpanel.volume")); if (v >= 0 && v <= 100) vol = Math.round(v); } catch (e) {}
+const POT = document.querySelector(".knob.pot");
+function potTitle() {
+  return `VOLUME ${vol} % — the monitor's gain (the headphones): wheel or drag turns it 0..100 %, double-click returns to ${VOL_DEFAULT} %; nothing reaches the firmware (the unit's pot is analogue, after the DAC)`;
+}
+function drawPot() {
+  POT.querySelector(".cap").style.transform = `rotate(${-SWEEP / 2 + vol * SWEEP / 100}deg)`;
+  POT.title = potTitle();
+  if (MON.gain) MON.gain.gain.value = vol / 100;
+  $("#mongain").textContent = vol + " %";
+}
+function setVol(v, note = "") {
+  const nv = Math.max(0, Math.min(100, Math.round(v)));
+  if (nv === vol) { if (vol === 100 || vol === 0) hint(`VOLUME at its ${vol ? "end (100 %)" : "start (0 %)"}`); return; }
+  vol = nv; drawPot();
+  try { localStorage.setItem("otpanel.volume", String(vol)); } catch (e) {}
+  hint(`VOLUME ${vol} %${note} — the monitor's gain; nothing sent to the firmware`);
+}
+drawPot();
+let potDrag = null;
+document.addEventListener("mousedown", e => {
+  const el = e.target.closest(".knob.pot");
+  if (!el) return;
+  e.preventDefault();
+  if (mapMode) { hint("VOLUME is a pot, not an encoder — nothing to bind"); return; }
+  potDrag = {y: e.clientY};
+});
+document.addEventListener("mousemove", e => {
+  if (!potDrag) return;
+  const d = Math.trunc((potDrag.y - e.clientY) / 3);   // 1 % per 3 px of drag, up = louder
+  if (d) { potDrag.y -= d * 3; setVol(vol + d); }
+});
+document.addEventListener("mouseup", () => { potDrag = null; });
+let potAcc = 0;
+document.addEventListener("wheel", e => {
+  const el = e.target.closest(".knob.pot");
+  if (!el) return;
+  e.preventDefault();
+  if (mapMode) return;
+  const raw = e.deltaY || (e.shiftKey ? e.deltaX : 0);
+  potAcc += e.deltaMode === 1 ? raw * 20 : raw;
+  const d = Math.trunc(potAcc / 20);                    // 1 % per 20 px (a mouse notch = 5 %)
+  potAcc -= d * 20;
+  if (d) setVol(vol - d);                                // wheel up = louder
+}, {passive: false});
+document.addEventListener("dblclick", e => {
+  const el = e.target.closest(".knob.pot");
+  if (!el) return;
+  e.preventDefault();
+  if (mapMode) return;
+  if (vol === VOL_DEFAULT) hint(`VOLUME already at ${VOL_DEFAULT} %`); else setVol(VOL_DEFAULT, " (back to the default)");
+});
+
+// -- WebAudio --
+function monCtx() {
+  if (!MON.ctx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) throw new Error("no WebAudio in this browser");
+    let ctx;
+    try { ctx = new AC({sampleRate: MON_RATE}); } catch (e) { ctx = new AC(); }
+    const gain = ctx.createGain(); gain.gain.value = vol / 100;
+    const split = ctx.createChannelSplitter(2);
+    const anL = ctx.createAnalyser(), anR = ctx.createAnalyser();
+    anL.fftSize = anR.fftSize = 1024;
+    gain.connect(ctx.destination); gain.connect(split); split.connect(anL, 0); split.connect(anR, 1);
+    Object.assign(MON, {ctx, gain, anL, anR});
+  }
+  if (MON.ctx.state !== "running") MON.ctx.resume();     // inside the gesture that got us here
+  return MON.ctx;
+}
+function queuedFrames() {                                  // fetched, not yet played
+  const rem = MON.ctx ? Math.max(0, MON.cursor - MON.ctx.currentTime) * MON_RATE : 0;
+  return MON.pendFrames + Math.round(rem);
+}
+const playedAbs = () => MON.from - queuedFrames();         // the absolute frame at the headphones now
+const behindFrames = () => MON.end - playedAbs();          // available minus played
+function monPush(i16) {
+  const n = i16.length >> 1, ab = MON.ctx.createBuffer(2, n, MON_RATE);
+  const L = ab.getChannelData(0), R = ab.getChannelData(1);
+  for (let i = 0, j = 0; i < n; i++, j += 2) { L[i] = i16[j] / 32768; R[i] = i16[j + 1] / 32768; }
+  MON.pend.push(ab); MON.pendFrames += n;
+  monFlush();
+}
+function monFlush() {
+  const ctx = MON.ctx, now = ctx.currentTime;
+  const dry = MON.cursor <= now;                           // the scheduled audio has run out
+  if (dry && MON.pendFrames < MON_STARVE) return;          // starved: wait for 300 ms of audio
+  if (dry) { MON.cursor = now + MON_LEAD; MON.bursts++; }
+  for (const ab of MON.pend) {
+    const src = ctx.createBufferSource(); src.buffer = ab; src.connect(MON.gain);
+    src.start(MON.cursor); MON.cursor += ab.length / MON_RATE;   // gapless: the next starts where this ends
+    MON.live.add(src); src.onended = () => MON.live.delete(src);
+    MON.scheduled += ab.length;
+  }
+  MON.pend = []; MON.pendFrames = 0;
+}
+function monDrop() {                                       // stop and forget everything queued
+  for (const src of MON.live) { try { src.stop(); } catch (e) {} }
+  MON.live.clear(); MON.pend = []; MON.pendFrames = 0; MON.cursor = 0;
+}
+function monSkip() {
+  const target = MON.end - MON_SKIP;
+  MON.skipped = (target - playedAbs()) / MON_RATE; MON.skippedAt = Date.now();
+  monDrop(); MON.from = target;
+}
+async function audioStatus() {
+  const r = await fetch("/audio/status");
+  if (!r.ok) throw new Error(`HTTP ${r.status} (this panel_server.py has no /audio endpoints)`);
+  const st = await r.json();
+  MON.status = st;
+  if (!MON.on && typeof st.end === "number") MON.end = st.end;
+  return st;
+}
+async function monLoop(gen) {
+  while (MON.on && MON.gen === gen) {
+    try {
+      if (MON.from < 0) {                                  // first poll: start live, at the end of what exists
+        let st;
+        try { st = await audioStatus(); } catch (e) { monStop("monitor: " + e.message); return; }
+        if (MON.gen !== gen) return;
+        MON.from = MON.end = st.end || 0;
+        if (st.sound === false) { monStop(SOUND_OFF_MSG); return; }
+      } else if (behindFrames() > MON_SKIP + 2 * MON_RATE) monSkip();   // > 22 s behind: skip ahead to 20 s behind
+      // (checked BEFORE the fetch, with 2 s of hysteresis: a check after the fetch
+      // re-skipped on every poll when the source outran real time, 12 Sep 2026)
+      const r = await fetch(`/audio/pcm?from=${MON.from}&max=${MON_MAX}`);
+      if (MON.gen !== gen) return;
+      const end = parseInt(r.headers.get("X-Audio-End") || "", 10);
+      if (r.status === 204) {
+        if (!Number.isNaN(end)) { MON.end = end; if (end < MON.from) { monDrop(); MON.from = end; } }   // the child restarted
+      } else if (r.ok) {
+        const buf = await r.arrayBuffer();
+        if (MON.gen !== gen) return;
+        const at = parseInt(r.headers.get("X-Audio-From") || "", 10), n = Math.floor(buf.byteLength / 4);
+        if (!Number.isNaN(at)) { if (at > MON.from) MON.dropped += at - MON.from; MON.from = at + n; }   // the ring had moved past us
+        else MON.from += n;
+        if (!Number.isNaN(end)) MON.end = end;
+        if (n) monPush(new Int16Array(buf, 0, n * 2));
+      } else throw new Error(`HTTP ${r.status}`);
+      MON.err = null;
+    } catch (e) { MON.err = e.message; }
+    monRender();
+    await new Promise(res => setTimeout(res, MON_POLL_MS));
+  }
+}
+function monReadout() {
+  if (!MON.on) return "unplugged";
+  if (MON.err) return `monitor: ${MON.err}`;
+  if (MON.from < 0) return "connecting…";
+  const behind = (behindFrames() / MON_RATE).toFixed(1);
+  let s = MON.cursor > MON.ctx.currentTime ? `behind ${behind} s`
+        : `waiting for sound (${(MON.pendFrames / MON_RATE).toFixed(2)} of 0.30 s queued, behind ${behind} s)`;
+  if (Date.now() - MON.skippedAt < 6000) s += ` — skipped ahead ${MON.skipped.toFixed(1)} s`;
+  return s;
+}
+const monBusy = () => !!MON.phase && MON.phase !== "ready";   // booting, a re-insert, a sound reboot
+function monToggle() {
+  if (MON.on) { monStop("headphones unplugged"); return; }
+  if (monBusy()) { toggleMon(true); hint(`the unit is busy — ${MON.phase}`); return; }
+  if (MON.sound === false) { toggleMon(true); hint(SOUND_OFF_MSG); return; }
+  try { monCtx(); } catch (e) { hint("monitor: " + e.message); return; }
+  MON.on = true; MON.gen++; MON.from = -1; MON.err = null; MON.skippedAt = 0;
+  monDrop();
+  monLoop(MON.gen); meterLoop(); refreshAudioStatus();
+  hint("headphones plugged in — the unit's main out, behind and in bursts (the emulator is slower than real time); MONITOR shows how far");
+  monRender();
+}
+function monStop(why) {
+  MON.on = false; MON.gen++;
+  monDrop();
+  if (why) hint(why);
+  monRender();
+}
+
+// -- the level meter: peak of the last 1024 samples per channel, in dB over 60 dB, with a decaying peak hold --
+const VU = {raf: 0, pk: [0, 0], buf: null};
+function meterDraw(l, r, dark) {
+  const vu = $("#vu"); vu.classList.toggle("lit", !dark);
+  [l, r].forEach((v, i) => {
+    const db = v > 0 ? Math.max(0, 20 * Math.log10(v) + 60) / 60 : 0;
+    VU.pk[i] = dark ? 0 : Math.max(db, VU.pk[i] * 0.985);
+    const bar = vu.children[i];
+    bar.firstChild.style.height = (dark ? 0 : db * 100).toFixed(1) + "%";
+    bar.lastChild.style.bottom = (VU.pk[i] * 100).toFixed(1) + "%";
+  });
+}
+function meterLoop() {
+  if (VU.raf) return;
+  const tick = () => {
+    VU.raf = 0;
+    if (!MON.anL || !(MON.on || MON.replay)) { meterDraw(0, 0, true); return; }
+    if (!VU.buf) VU.buf = new Float32Array(MON.anL.fftSize);
+    const pk = an => { an.getFloatTimeDomainData(VU.buf); let m = 0; for (let i = 0; i < VU.buf.length; i++) { const a = Math.abs(VU.buf[i]); if (a > m) m = a; } return m; };
+    meterDraw(pk(MON.anL), pk(MON.anR), false);
+    VU.raf = requestAnimationFrame(tick);
+  };
+  VU.raf = requestAnimationFrame(tick);
+}
+
+// -- the drawer --
+function toggleMon(open) {
+  MON.open = open === undefined ? !MON.open : !!open;
+  $("#mon").classList.toggle("open", MON.open);
+  $("#monbtn").classList.toggle("on", MON.open);
+  if (MON.open) refreshAudioStatus();
+  monRender(); fit();
+}
+async function refreshAudioStatus() {                      // every second while the drawer is open or the headphones are in
+  if (MON.statusBusy) return;
+  MON.statusBusy = true; clearTimeout(MON.statusTimer);
+  try { await audioStatus(); MON.statusErr = null; } catch (e) { MON.statusErr = e.message; }
+  MON.statusBusy = false;
+  renderTakes(); monRender();
+  if (MON.open || MON.on) MON.statusTimer = setTimeout(refreshAudioStatus, 1000);
+}
+const pad3 = n => String(n).padStart(3, "0");
+function renderTakes() {
+  const st = MON.status, list = $("#takes"), busy = !!MON.phase && MON.phase !== "ready";
+  const takes = st ? [...(st.takes || [])] : [], cur = st && st.take;
+  list.innerHTML = "";
+  const row = (cls, cells) => {
+    const r = document.createElement("div"); r.className = "take " + cls;
+    for (const [c, v] of cells) { const s = document.createElement("span"); s.className = c; if (v instanceof Node) s.append(v); else s.textContent = v; r.append(s); }
+    list.append(r); return r;
+  };
+  row("h", [["n", "take"], ["s", "length"], ["st", "PLAY opens one, STOP closes it"], ["", ""], ["", ""]]);
+  for (const t of takes) {
+    const active = MON.replay && MON.replay.n === t.n;
+    const rp = document.createElement("button");
+    rp.textContent = active ? (MON.replay.loading ? "LOADING…" : "STOP") : "REPLAY";
+    rp.title = active ? "stop the replay" : `play take ${pad3(t.n)} at real time through the headphones (VOLUME applies)`;
+    rp.disabled = busy; rp.onclick = () => replayTake(t.n);
+    const a = document.createElement("a");
+    a.href = `/audio.wav?take=${t.n}`; a.target = "_blank"; a.textContent = "SAVE";
+    a.title = `octatrack-take-${pad3(t.n)}.wav — the app asks where to save it; a browser downloads it`;
+    row("", [["n", `take ${pad3(t.n)}`], ["s", `${(+t.seconds).toFixed(1)} s`],
+             ["st", active ? (MON.replay.loading ? "loading…" : "replaying at real time") : ""], ["", rp], ["", a]]);
+  }
+  if (cur) row("rec", [["n", `take ${pad3(cur.n)}`], ["s", `${(cur.frames / MON_RATE).toFixed(1)} s`], ["st", "recording (STOP closes it)"], ["", ""], ["", ""]]);
+  if (!takes.length && !cur) row("", [["n", st ? "(no takes yet)" : MON.statusErr ? `takes unavailable: ${MON.statusErr}` : "…"], ["s", ""], ["st", ""], ["", ""], ["", ""]]);
+}
+async function replayTake(n) {
+  if (MON.replay) { const was = MON.replay.n; stopReplay(); if (was === n) return; }
+  let ctx;
+  try { ctx = monCtx(); } catch (e) { hint("replay: " + e.message); return; }
+  MON.replay = {n, src: null, loading: true}; renderTakes();
+  try {
+    const r = await fetch(`/audio.wav?take=${n}`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.arrayBuffer();
+    const ab = await new Promise((res, rej) => { const p = ctx.decodeAudioData(data, res, rej); if (p && p.then) p.then(res, rej); });
+    if (!MON.replay || MON.replay.n !== n || !MON.replay.loading) return;   // stopped while loading
+    const src = ctx.createBufferSource(); src.buffer = ab; src.connect(MON.gain);
+    src.onended = () => { if (MON.replay && MON.replay.src === src) { MON.replay = null; renderTakes(); monRender(); } };
+    src.start();
+    MON.replay = {n, src, loading: false, seconds: ab.duration};
+    meterLoop(); renderTakes();
+    hint(`replaying take ${pad3(n)} (${ab.duration.toFixed(1)} s) at real time through the headphones`);
+  } catch (e) { MON.replay = null; renderTakes(); hint(`replay of take ${pad3(n)} failed: ${e.message}`); }
+}
+function stopReplay() {
+  const r = MON.replay; MON.replay = null;
+  if (r && r.src) { try { r.src.stop(); } catch (e) {} }
+  renderTakes();
+}
+// SOUND ON/OFF: two clicks like RE-INSERT CARD (the first arms for 5 s); the
+// server reboots the port child with/without --dsp (~1 min / ~40 s), /status
+// phase shows it and the controls stay disabled meanwhile
+function soundLabel() {
+  const b = $("#soundbtn");
+  if (!b.classList.contains("armed")) b.textContent = MON.sound === false ? "SOUND ON" : "SOUND OFF";
+  b.title = MON.sound === false ? "reboot the unit with the DSP cores (~1 min): sound, and a sequencer ~9x slower than real time while it plays (~3x slower than without the cores)"
+                                : "reboot the unit without the DSP cores (~40 s): no sound, a faster sequencer";
+}
+async function soundToggle() {
+  const b = $("#soundbtn"), on = MON.sound === false;      // the action: turn it on when it is off
+  if (!b.classList.contains("armed")) {
+    b.classList.add("armed"); b.textContent = `REBOOT THE UNIT (${on ? "~1 MIN" : "~40 S"})? CLICK AGAIN`;
+    clearTimeout(MON.armTimer);
+    MON.armTimer = setTimeout(() => { b.classList.remove("armed"); soundLabel(); }, 5000);
+    return;
+  }
+  clearTimeout(MON.armTimer); b.classList.remove("armed"); b.disabled = true; soundLabel();
+  let r;
+  try { r = await fetch(`/audio/enable?on=${on ? 1 : 0}`).then(x => x.json()); }
+  catch (e) { r = {ok: false, note: e.message}; }
+  if (r.ok) { MON.phase = r.phase || "rebooting"; hint(`sound ${on ? "on" : "off"}: ${MON.phase}`); }
+  else { hint(`sound ${on ? "on" : "off"} refused: ${r.note || r.error || "?"}`); b.disabled = false; }
+  monRender();
+}
+// the status poll feeds this: "sound" (and "sound_note") from /status, the phase while a reboot runs
+function monPhase(s, phase) {
+  const sound = "sound" in s ? !!s.sound : null;
+  const changed = sound !== MON.sound || phase !== MON.phase || (s.sound_note || null) !== MON.soundNote;
+  MON.sound = sound; MON.soundNote = s.sound_note || null; MON.phase = phase;
+  // the server says sound:false while a child boots (a re-insert, a sound reboot): only a
+  // ready unit without sound pulls the plug, a rebooting one keeps it (the stream resumes)
+  if (sound === false && MON.on && !monBusy()) monStop(SOUND_OFF_MSG);
+  if (changed) { monRender(); if (MON.open) renderTakes(); }
+}
+function monRender() {
+  const busy = monBusy();
+  const hp = $("#hp");
+  hp.classList.toggle("plugged", MON.on);
+  hp.title = "HEAD-PHONES — click: " + (MON.on ? `unplug (${monReadout()})` : "plug in and listen to the unit's main out (VOLUME is the gain; MONITOR has the takes)");
+  const st = $("#monstate");
+  st.classList.toggle("off", !busy && MON.sound === false);
+  st.textContent = busy ? `the unit is busy — ${MON.phase}`
+                 : MON.sound === false ? SOUND_OFF_MSG + (MON.soundNote ? ` — ${MON.soundNote}` : "")
+                 : MON.sound === null ? "sound: unknown (this panel_server.py reports no sound flag)"
+                 : "sound on — while it plays the unit runs ~9x slower than real time (~3x slower than without the DSP cores)";
+  $("#monread").textContent = monReadout();
+  const pb = $("#plugbtn");
+  pb.textContent = MON.on ? "UNPLUG" : "PLUG IN"; pb.classList.toggle("on", MON.on); pb.disabled = !MON.on && (busy || MON.sound === false);
+  const t = MON.status && MON.status.take;
+  $("#recdot").classList.toggle("on", !!(t && t.recording));
+  $("#rectext").textContent = t ? `recording take ${pad3(t.n)} — ${(t.frames / MON_RATE).toFixed(1)} s` : "no take open (PLAY opens one, STOP closes it)";
+  soundLabel();
+  $("#soundbtn").disabled = busy || MON.sound === null;
+  $("#soundphase").textContent = busy ? MON.phase : MON.statusErr ? `(${MON.statusErr})` : "";
+  $("#mongain").textContent = vol + " %";
+}
+// verification hook, not used by the page itself: window.__monitor.state()
+// (the agents' scripts read it; keep the field names)
+window.__monitor = {
+  get ctx() { return MON.ctx; },
+  get gain() { return MON.gain; },
+  state() {
+    return {on: MON.on, behind: MON.on && MON.from >= 0 ? behindFrames() / MON_RATE : null,
+            queued: queuedFrames() / MON_RATE, played: MON.on && MON.from >= 0 ? playedAbs() : null,
+            end: MON.end, from: MON.from, take: MON.status ? MON.status.take : null,
+            playing: !!(MON.ctx && MON.cursor > MON.ctx.currentTime), bursts: MON.bursts, scheduled: MON.scheduled,
+            dropped: MON.dropped, skipped: MON.skipped, ctxState: MON.ctx ? MON.ctx.state : null,
+            gain: MON.gain ? MON.gain.gain.value : vol / 100, volume: vol, sound: MON.sound, phase: MON.phase,
+            replay: MON.replay ? MON.replay.n : null, err: MON.err, readout: monReadout()};
+  },
+};
+
 // ---------------- LEDs (only when the map names them) ----------------
 // a map entry is [byte, bit] into the 0x10 bitmap blocks (bits: hex string)
 // or an LED id ("0x21" or 33), lit when its last value is > 0x20
@@ -894,6 +1363,7 @@ async function poll() {
     $("#note").classList.toggle("show", busy);
     $("#note span").textContent = busy ? `loading — ${phase}` : "";
     poolPhase(phase);
+    monPhase(s, phase);
     if (s.seq !== lastSeq) { lastSeq = s.seq; $("#screen").src = "/screen.png?" + s.seq; }
     if (Object.keys(mapLeds).length) applyLeds(await fetch("/leds").then(x => x.json()));
   } catch (e) {}

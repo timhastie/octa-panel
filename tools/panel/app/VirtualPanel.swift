@@ -32,6 +32,19 @@
 // the window (measured the same day: SIGTERM, SIGINT and cmd-Q ignored until
 // the sheet was answered), so quit() ends the sheet first and, should
 // terminate: still return, stops the server and exits itself.
+//
+// Audio (12 Sep 2026): with the server's sound on (its port child runs the
+// DSP cores, --dsp) the unit's main output is captured; the page monitors
+// it through WebAudio (so the web view is configured to play media without
+// a user gesture) and every PLAY..STOP is a take on the server
+// (/audio/status, /audio.wav?take=N). The Audio menu saves the latest take
+// (or the ring when there is no take) through a save panel + URLSession,
+// opens the takes folder, and switches the sound on/off (/audio/enable, a
+// reboot). The page's own SAVE links (target=_blank, an audio/wav reply)
+// are intercepted at the navigation-response stage and become the same
+// save flow, so the page never navigates away. VIRTUAL_PANEL_SAVE=<path>,
+// VIRTUAL_PANEL_SOUND=0|1, VIRTUAL_PANEL_SAVE_DIR=<dir> and
+// VIRTUAL_PANEL_NAV=open:|go:<path> drive it from scripts.
 import Cocoa
 import UniformTypeIdentifiers
 import WebKit
@@ -198,8 +211,9 @@ final class PanelServer {
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~/")
 
     /// GET <path>?<query>, JSON reply. ok = HTTP 200 carrying a JSON object;
-    /// `why` says what went wrong otherwise ("HTTP 404", the URL error).
-    /// Completion on the main thread.
+    /// `why` says what went wrong otherwise ("HTTP 404: no take 9" when the
+    /// error reply is JSON with an "error" -- that object is passed on too
+    /// -- else "HTTP 404", or the URL error). Completion on the main thread.
     func get(_ path: String, query: [(String, String)] = [], timeout: TimeInterval,
              _ done: @escaping (Bool, [String: Any]?, String) -> Void) {
         var s = "http://127.0.0.1:\(port)" + path
@@ -214,15 +228,64 @@ final class PanelServer {
             var st: [String: Any]? = nil
             var why = ""
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-            if let d = data, code == 200 {
+            if let d = data, code > 0 {
                 st = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any]
-                if st == nil { why = "not JSON: " + String(decoding: d.prefix(80), as: UTF8.self) }
+            }
+            let ok = code == 200 && st != nil
+            if ok {
+            } else if let e = err {
+                why = e.localizedDescription
+            } else if code == 200 {
+                why = "not JSON: " + String(decoding: (data ?? Data()).prefix(80), as: UTF8.self)
+            } else {
+                why = "HTTP \(code)" + ((st?["error"] as? String).map { ": " + $0 } ?? "")
+            }
+            DispatchQueue.main.async { done(ok, st, why) }
+        }.resume()
+    }
+
+    /// /audio.wav?take=N, or the ring between two absolute frames.
+    func audioURL(take: Int? = nil, from: Int? = nil, to: Int? = nil) -> URL {
+        var s = "http://127.0.0.1:\(port)/audio.wav"
+        if let n = take { s += "?take=\(n)" } else if let f = from, let t = to { s += "?from=\(f)&to=\(t)" }
+        return URL(string: s)!
+    }
+
+    /// GET `url` to the file `dest` (replaced if it exists; its folder made).
+    /// `done(ok, bytes, why, name)` on the main thread: ok = HTTP 200 and the
+    /// file in place, else `why` ("HTTP 404: no take 9" -- the server's JSON
+    /// error when it sends one -- or the URL / file error); `name` is what
+    /// the reply's Content-Disposition suggests (the URL's last component
+    /// when there is none). A download task, so a long take never sits in
+    /// memory twice.
+    func download(_ url: URL, to dest: URL, timeout: TimeInterval,
+                  _ done: @escaping (Bool, Int, String, String) -> Void) {
+        let req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout)
+        Self.session.downloadTask(with: req) { tmp, resp, err in
+            var ok = false, bytes = 0, why = ""
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            let name = resp?.suggestedFilename ?? url.lastPathComponent
+            if let t = tmp, code == 200 {
+                let fm = FileManager.default
+                do {
+                    try fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
+                    try fm.moveItem(at: t, to: dest)   // the temporary file is gone once this block returns
+                    try? fm.setAttributes([.posixPermissions: 0o644], ofItemAtPath: dest.path)   // the temp file is 0600
+                    bytes = ((try? fm.attributesOfItem(atPath: dest.path))?[.size] as? NSNumber)?.intValue ?? 0
+                    ok = true
+                } catch {
+                    why = "could not write \(dest.path): \(error.localizedDescription)"
+                }
             } else if let e = err {
                 why = e.localizedDescription
             } else {
                 why = "HTTP \(code)"
+                if let t = tmp, let d = try? Data(contentsOf: t),
+                   let j = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
+                   let e = j["error"] as? String { why += ": " + e }
             }
-            DispatchQueue.main.async { done(st != nil, st, why) }
+            DispatchQueue.main.async { done(ok, bytes, why, name) }
         }.resume()
     }
 }
@@ -267,8 +330,10 @@ final class PanelWebView: WKWebView {
 
 // MARK: - the app
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate,
+                         WKUIDelegate, NSMenuDelegate {
     static let projectKey = "projectDir"   // UserDefaults: the Open Project... choice
+    static let saveDirKey = "saveDir"      // UserDefaults: where the last recording was saved
 
     let repo: URL
     let server: PanelServer
@@ -287,6 +352,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     var adding = false                     // an add batch (ready wait, requests, alert, commit) is in flight
     var quitting = false                   // quit() has begun: sheet handlers and queued batches do nothing
     var shutDown = false                   // shutdown() ran (once, whichever path quits)
+    // audio (12 Sep 2026)
+    var soundItem: NSMenuItem!             // Audio > Sound: a checkbox that follows /status "sound"
+    var soundOn: Bool?                     // /status "sound" as last polled; nil = no answer / no such field
+    var soundNote = ""                     // /status "sound_note"
+    var phase = ""                         // /status "phase" as last polled
+    var statusPoll: Timer?                 // the 2 s /status poll behind the Sound checkbox
+    var statusProbing = false
+    var saveDir: URL?                      // VIRTUAL_PANEL_SAVE_DIR: saves land there, no save panel
+    var navHook = ""                       // VIRTUAL_PANEL_NAV: fired once the page has loaded
+    var navHookMarker = ""
+    var interceptedNavs = 0                // audio/wav navigations turned into the save flow
 
     init(repo: URL, port: Int) {
         self.repo = repo
@@ -321,6 +397,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             addSamples(urls, source: "VIRTUAL_PANEL_ADD", autoAnswer: then.isEmpty ? nil : then)
         }
         drainPendingAdds()   // a Dock-drop launch queued its files before the window existed
+        // Audio hooks, for scripts (menus need the Accessibility grant to drive):
+        // VIRTUAL_PANEL_SAVE_DIR=<dir> answers every save panel unattended (the
+        // file lands there under the suggested name); VIRTUAL_PANEL_SAVE=<path>
+        // saves the latest take there once the unit is ready and a take exists
+        // (VIRTUAL_PANEL_SAVE_WAIT=<s> bounds that wait, default 600);
+        // VIRTUAL_PANEL_SOUND=0|1 switches the sound once ready, no sheet;
+        // VIRTUAL_PANEL_NAV=open:<path>|go:<path> makes the page window.open()
+        // / navigate to <path> once loaded, to exercise the interception.
+        if let d = env["VIRTUAL_PANEL_SAVE_DIR"], !d.isEmpty {
+            saveDir = URL(fileURLWithPath: d, isDirectory: true)
+            Log.write("VIRTUAL_PANEL_SAVE_DIR: saves go to \(d) without the panel")
+        }
+        if let p = env["VIRTUAL_PANEL_SAVE"], !p.isEmpty {
+            let wait = Double(env["VIRTUAL_PANEL_SAVE_WAIT"] ?? "") ?? 600
+            Log.write("VIRTUAL_PANEL_SAVE: \(p) (waiting up to \(Int(wait)) s for a take once ready)")
+            saveHook(URL(fileURLWithPath: p), wait: wait)
+        }
+        if let s = env["VIRTUAL_PANEL_SOUND"], !s.isEmpty {
+            if s == "0" || s == "1" {
+                let on = s == "1"
+                Log.write("VIRTUAL_PANEL_SOUND: \(on ? "on" : "off") once ready")
+                whenReady(deadline: Date().addingTimeInterval(900), what: "VIRTUAL_PANEL_SOUND") { [weak self] ok in
+                    guard let self = self, !self.quitting else { return }
+                    if ok { self.setSound(on, source: "VIRTUAL_PANEL_SOUND", quiet: true) }
+                    else { Log.write("VIRTUAL_PANEL_SOUND: the unit is not ready, nothing switched") }
+                }
+            } else {
+                Log.write("VIRTUAL_PANEL_SOUND=\(s): neither 0 nor 1, ignored")
+            }
+        }
+        if let n = env["VIRTUAL_PANEL_NAV"], !n.isEmpty {
+            navHook = n
+            Log.write("VIRTUAL_PANEL_NAV: \(n), fired once the page has loaded")
+        }
+        startStatusPoll()
     }
 
     /// Files handed to the app by Finder: dropped on the Dock icon, or opened
@@ -349,6 +460,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         guard !shutDown else { return }
         shutDown = true
         stopPolling()
+        statusPoll?.invalidate()
+        statusPoll = nil
         server.stop()
         Log.write("quit")
     }
@@ -408,11 +521,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         // there is one, overrides the centered position.
         window.center()
         _ = window.setFrameAutosaveName("VirtualPanelWindow")
-        let pw = PanelWebView(frame: rect, configuration: WKWebViewConfiguration())
+        // The page's monitor plays the unit's main output through WebAudio;
+        // its AudioContext is created on the headphones click, and WebKit
+        // must not demand a further gesture for playback. (Inline playback
+        // is macOS's only mode: allowsInlineMediaPlayback is an iOS setting.)
+        let cfg = WKWebViewConfiguration()
+        cfg.mediaTypesRequiringUserActionForPlayback = []
+        let pw = PanelWebView(frame: rect, configuration: cfg)
         pw.onDropFiles = { [weak self] urls in self?.addSamples(urls, source: "window drop") }
         web = pw
         web.autoresizingMask = [.width, .height]
         web.navigationDelegate = self
+        web.uiDelegate = self   // target=_blank / window.open (the page's SAVE links), JS alert/confirm
         web.underPageBackgroundColor = NSColor(srgbRed: 0.086, green: 0.086, blue: 0.090, alpha: 1)  // panel.html's body
         window.contentView = web
         window.makeKeyAndOrderFront(nil)
@@ -449,6 +569,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         editItem.submenu = edit
+
+        // Audio: the unit's main output as the server captures it. Items are
+        // enabled by hand (autoenablesItems off): Sound follows /status.
+        let audioItem = NSMenuItem(); main.addItem(audioItem)
+        let audio = NSMenu(title: "Audio")
+        audio.autoenablesItems = false
+        audio.delegate = self   // menuWillOpen: a fresh /status before the checkbox is seen
+        let save = audio.addItem(withTitle: "Save Main Out Recording...", action: #selector(saveMainOut(_:)), keyEquivalent: "S")
+        save.keyEquivalentModifierMask = [.command, .shift]
+        save.target = self
+        audio.addItem(withTitle: "Show Takes Folder", action: #selector(showTakesFolder(_:)), keyEquivalent: "").target = self
+        audio.addItem(.separator())
+        soundItem = audio.addItem(withTitle: "Sound (DSP audio, slower sequencer)", action: #selector(toggleSound(_:)), keyEquivalent: "")
+        soundItem.target = self
+        soundItem.isEnabled = false
+        soundItem.toolTip = "The port child runs the DSP cores (--dsp): the main output is captured for the page's monitor and the takes; while it plays the unit runs ~9x slower than real time (~3x slower than without the cores). Switching reboots the unit."
+        audioItem.submenu = audio
 
         let winItem = NSMenuItem(); main.addItem(winItem)
         let win = NSMenu(title: "Window")
@@ -847,10 +984,361 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         }
     }
 
+    // MARK: audio
+
+    /// /status every 2 s (a local GET that the server answers without an
+    /// emulator action), so the Sound checkbox follows the server: on/off
+    /// from "sound", enabled only at phase ready (a switch is a reboot, and
+    /// the server refuses one while it boots). Started at launch: before the
+    /// server answers the probe fails within milliseconds and the item stays
+    /// disabled. Changes are logged.
+    func startStatusPoll() {
+        statusPoll?.invalidate()
+        statusPoll = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in self?.pollStatusOnce() }
+        pollStatusOnce()
+    }
+
+    func pollStatusOnce() {
+        guard !statusProbing, !quitting else { return }
+        statusProbing = true
+        server.probe(timeout: 1.5) { [weak self] ok, st in
+            guard let self = self else { return }
+            self.statusProbing = false
+            self.noteStatus(ok ? st : nil)
+        }
+    }
+
+    func noteStatus(_ st: [String: Any]?) {
+        let sound = st?["sound"] as? Bool
+        let ph = st.map { $0["phase"] as? String ?? "?" } ?? "no answer"
+        soundNote = st?["sound_note"] as? String ?? ""
+        if sound != soundOn || ph != phase {
+            Log.write("status: phase \(ph), sound \(sound.map { $0 ? "on" : "off" } ?? "unknown")"
+                      + (soundNote.isEmpty ? "" : " (\(soundNote))"))
+        }
+        soundOn = sound
+        phase = ph
+        updateSoundItem()
+    }
+
+    func updateSoundItem() {
+        guard let item = soundItem else { return }
+        let state: NSControl.StateValue = soundOn == true ? .on : .off
+        let enabled = soundOn != nil && phase == "ready" && !quitting
+        if state != item.state || enabled != item.isEnabled {
+            Log.write("Sound checkbox: \(state == .on ? "checked" : "unchecked"), \(enabled ? "enabled" : "disabled")")
+        }
+        item.state = state
+        item.isEnabled = enabled
+    }
+
+    /// The Audio menu is about to open: refresh the checkbox first.
+    func menuWillOpen(_ menu: NSMenu) { pollStatusOnce() }
+
+    static func takeName(_ n: Int) -> String { String(format: "octatrack-take-%03d.wav", n) }
+
+    /// /audio/status -> the latest take (highest n) and whether it is the
+    /// one still recording.
+    static func latestTake(_ r: [String: Any]) -> (n: Int, recording: Bool)? {
+        let takes = (r["takes"] as? [[String: Any]]) ?? []
+        guard let n = takes.compactMap({ $0["n"] as? Int }).max() else { return nil }
+        let cur = r["take"] as? [String: Any]
+        return (n, cur?["n"] as? Int == n && (cur?["recording"] as? Bool ?? false))
+    }
+
+    /// What Save Main Out Recording... saves, from /audio/status: the latest
+    /// take, else the ring (the last 180 s of the main output) when it holds
+    /// anything, else nil with the reason.
+    func recording(in r: [String: Any]) -> (url: URL, name: String, what: String)? {
+        if let t = Self.latestTake(r) {
+            return (server.audioURL(take: t.n), Self.takeName(t.n), "take \(t.n)" + (t.recording ? " (still recording)" : ""))
+        }
+        let first = r["first"] as? Int ?? 0, end = r["end"] as? Int ?? 0
+        if end > first {
+            return (server.audioURL(from: first, to: end), "octatrack-main-out.wav", "the ring, frames \(first)..\(end)")
+        }
+        return nil
+    }
+
+    func nothingToSave(_ r: [String: Any]) -> String {
+        if r["sound"] as? Bool == false {
+            return "Sound is off (\(r["note"] as? String ?? "DSP cores not running")): Audio > Sound turns it on (the unit reboots, ~1 min)."
+        }
+        return "Nothing has been captured yet. Press PLAY on the panel: the unit's main output is recorded until STOP, and that is the take."
+    }
+
+    /// GET /audio/status, then the latest take (or the ring) through the save
+    /// flow; a sheet says why when there is nothing, or the server has no
+    /// audio endpoints (HTTP 404).
+    @objc func saveMainOut(_ sender: Any?) {
+        server.get("/audio/status", timeout: 10) { [weak self] ok, r, why in
+            guard let self = self else { return }
+            guard ok, let r = r else {
+                Log.write("save (menu): /audio/status: \(why)")
+                self.sheet("The recording is not available",
+                           "GET /audio/status on port \(self.server.port): \(why)"
+                           + (why.hasPrefix("HTTP 404") ? "\n\nThis server has no audio endpoints (an older panel_server.py?)." : ""))
+                return
+            }
+            guard let rec = self.recording(in: r) else {
+                Log.write("save (menu): nothing to save")
+                self.sheet("Nothing to save", self.nothingToSave(r))
+                return
+            }
+            Log.write("save (menu): \(rec.what)")
+            self.saveRecording(rec.url, suggested: rec.name, source: "menu")
+        }
+    }
+
+    /// The save flow, whatever asked for it (the menu, a SAVE link in the
+    /// page, VIRTUAL_PANEL_SAVE): a save panel as a sheet with the suggested
+    /// name (the contract's take name, or the reply's Content-Disposition
+    /// for an intercepted link), remembering the folder, then the download
+    /// to the chosen file. VIRTUAL_PANEL_SAVE_DIR skips the panel.
+    func saveRecording(_ url: URL, suggested: String, source: String) {
+        guard !quitting else { return }
+        Log.write("save (\(source)): \(url.absoluteString) as \(suggested)")
+        if let dir = saveDir {
+            download(url, to: dir.appendingPathComponent(suggested), source: source)
+            return
+        }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = suggested
+        panel.allowedContentTypes = [.wav]
+        panel.canCreateDirectories = true
+        panel.isExtensionHidden = false
+        panel.prompt = "Save"
+        panel.message = "The unit's main output as the server captured it (16-bit stereo 44.1 kHz WAV)"
+        if let d = UserDefaults.standard.string(forKey: Self.saveDirKey), FileManager.default.fileExists(atPath: d) {
+            panel.directoryURL = URL(fileURLWithPath: d, isDirectory: true)
+        }
+        panel.beginSheetModal(for: window) { [weak self] resp in
+            guard let self = self, !self.quitting else { return }
+            guard resp == .OK, let dest = panel.url else { Log.write("save (\(source)): cancelled"); return }
+            UserDefaults.standard.set(dest.deletingLastPathComponent().path, forKey: Self.saveDirKey)
+            self.download(url, to: dest, source: source)
+        }
+    }
+
+    /// GET url -> dest; logged, a failure also in a sheet (the server's own
+    /// error for a missing take: "HTTP 404: no take 9").
+    func download(_ url: URL, to dest: URL, source: String, _ done: ((Bool) -> Void)? = nil) {
+        server.download(url, to: dest, timeout: 300) { [weak self] ok, bytes, why, name in
+            guard let self = self else { return }
+            if ok {
+                Log.write("saved (\(source)): \(dest.path) \(bytes) B (the server named it \(name))")
+            } else {
+                Log.write("save failed (\(source)): \(url.absoluteString) -> \(dest.path): \(why)")
+                self.sheet("The recording could not be saved", url.absoluteString + "\n\n" + why)
+            }
+            done?(ok)
+        }
+    }
+
+    /// Audio > Show Takes Folder: the folder of the takes /audio/status lists
+    /// (out/_panel_takes_<port>/ in the repo), in Finder.
+    @objc func showTakesFolder(_ sender: Any?) {
+        server.get("/audio/status", timeout: 10) { [weak self] ok, r, why in
+            guard let self = self else { return }
+            let conventional = self.repo.appendingPathComponent("out/_panel_takes_\(self.server.port)")
+            var dir: URL? = nil
+            if ok, let r = r {
+                let files = ((r["takes"] as? [[String: Any]]) ?? []).compactMap { $0["file"] as? String }
+                if let f = files.last ?? (r["take"] as? [String: Any])?["file"] as? String {
+                    dir = URL(fileURLWithPath: f).deletingLastPathComponent()
+                }
+            }
+            if dir == nil, FileManager.default.fileExists(atPath: conventional.path) { dir = conventional }
+            guard let d = dir else {
+                let e = ok ? "No take yet: press PLAY on the panel, STOP closes the take."
+                           : "GET /audio/status on port \(self.server.port): \(why)"
+                Log.write("show takes: \(e)")
+                self.sheet("No takes folder yet", e + "\n\nTakes are written to \(conventional.path).")
+                return
+            }
+            Log.write("show takes: \(d.path)")
+            NSWorkspace.shared.open(d)
+        }
+    }
+
+    /// Audio > Sound: the checkbox as it is now flipped, after a sheet that
+    /// says the unit reboots.
+    @objc func toggleSound(_ sender: Any?) {
+        guard let cur = soundOn else { return }
+        let on = !cur
+        sheet(on ? "Switch sound on?" : "Switch sound off?",
+              on ? "The unit reboots with the DSP cores running (~1 min). Its main output is then captured: the page's headphones monitor it and every PLAY..STOP is a take. While it plays the unit runs ~9x slower than real time (~3x slower than without the cores)."
+                 : "The unit reboots without the DSP cores (~40 s): faster, but silent. The takes so far are kept.",
+              buttons: [on ? "Switch On" : "Switch Off", "Cancel"]) { [weak self] b in
+            guard b == 0 else { Log.write("sound (menu): cancelled"); return }
+            self?.setSound(on, source: "menu")
+        }
+    }
+
+    /// GET /audio/enable?on=1|0: the server reboots its port child with or
+    /// without --dsp; /status "phase" shows it and the poll re-enables the
+    /// checkbox at ready. ok:false (already so, busy, route A) is logged and,
+    /// unless `quiet` (the hook), shown.
+    func setSound(_ on: Bool, source: String, quiet: Bool = false) {
+        Log.write("sound (\(source)): GET /audio/enable?on=\(on ? 1 : 0)")
+        soundItem.isEnabled = false
+        server.get("/audio/enable", query: [("on", on ? "1" : "0")], timeout: 30) { [weak self] ok, r, why in
+            guard let self = self else { return }
+            if ok, let r = r, r["ok"] as? Bool == true {
+                Log.write("sound (\(source)): \(r["phase"] as? String ?? "ok")")
+            } else {
+                let e = (r?["note"] as? String) ?? (r?["error"] as? String) ?? why
+                Log.write("sound (\(source)): refused: \(e)")
+                if !quiet { self.sheet("Sound was not switched", e) }
+            }
+            self.statusProbing = false   // a poll in flight would drop this fresh one
+            self.pollStatusOnce()
+        }
+    }
+
+    /// VIRTUAL_PANEL_SAVE=<path>: once ready, poll /audio/status every second
+    /// until a take exists and none is recording (logged as that changes),
+    /// then save the latest take to <path> without a panel; at the deadline
+    /// save what there is (the latest take, else the ring), or nothing.
+    func saveHook(_ dest: URL, wait: TimeInterval) {
+        whenReady(deadline: Date().addingTimeInterval(900), what: "VIRTUAL_PANEL_SAVE") { [weak self] ok in
+            guard let self = self, !self.quitting else { return }
+            guard ok else { Log.write("VIRTUAL_PANEL_SAVE: the unit is not ready, nothing saved"); return }
+            self.waitForTake(deadline: Date().addingTimeInterval(wait), seen: "") { r in
+                guard let r = r, let rec = self.recording(in: r) else {
+                    Log.write("VIRTUAL_PANEL_SAVE: nothing to save")
+                    return
+                }
+                Log.write("VIRTUAL_PANEL_SAVE: saving \(rec.what)")
+                self.download(rec.url, to: dest, source: "VIRTUAL_PANEL_SAVE")
+            }
+        }
+    }
+
+    func waitForTake(deadline: Date, seen: String, _ done: @escaping ([String: Any]?) -> Void) {
+        server.get("/audio/status", timeout: 5) { [weak self] ok, r, why in
+            guard let self = self, !self.quitting else { return }
+            let take = ok ? r.flatMap(Self.latestTake) : nil
+            let state = !ok ? "no /audio/status: \(why)"
+                            : take.map { "take \($0.n)\($0.recording ? ", recording" : "")" } ?? "no take yet"
+            if state != seen { Log.write("VIRTUAL_PANEL_SAVE: waiting for a take (now: \(state))") }
+            if let t = take, !t.recording { done(r); return }
+            if Date() > deadline {
+                Log.write("VIRTUAL_PANEL_SAVE: deadline (\(state)), saving what there is")
+                done(ok ? r : nil)
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                self.waitForTake(deadline: deadline, seen: state, done)
+            }
+        }
+    }
+
+    /// VIRTUAL_PANEL_NAV=open:<path> | go:<path> (a bare value is open:):
+    /// once the page has loaded, window.open(<path>) / location.href =
+    /// <path> from inside it -- what a SAVE link (target=_blank) or a script
+    /// does -- with a marker set on the page first; 4 s later the marker,
+    /// location.href and the title are read back and logged: "page kept"
+    /// when the interception left the page in place.
+    func fireNavHook() {
+        let spec = navHook
+        navHook = ""
+        let go = spec.hasPrefix("go:")
+        let path = go ? String(spec.dropFirst(3)) : (spec.hasPrefix("open:") ? String(spec.dropFirst(5)) : spec)
+        navHookMarker = "vp-\(getpid())-\(Int(Date().timeIntervalSince1970))"
+        let js = "window.__vpNavMarker = '\(navHookMarker)'; "
+               + (go ? "location.href = '\(path)';" : "window.open('\(path)');") + " 'fired'"
+        Log.write("VIRTUAL_PANEL_NAV: \(go ? "location.href =" : "window.open") \(path)")
+        web.evaluateJavaScript(js) { r, e in
+            Log.write("VIRTUAL_PANEL_NAV: js -> \(r.map { "\($0)" } ?? "nil")\(e.map { ", error: \($0.localizedDescription)" } ?? "")")
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in
+            guard let self = self, !self.quitting else { return }
+            self.web.evaluateJavaScript("[String(window.__vpNavMarker), location.href, document.title].join(' | ')") { r, e in
+                let s = (r as? String) ?? "error: \(e?.localizedDescription ?? "?")"
+                let kept = s.hasPrefix(self.navHookMarker + " | ")
+                Log.write("VIRTUAL_PANEL_NAV: \(kept ? "page kept" : "PAGE NAVIGATED AWAY") (\(s)); intercepted \(self.interceptedNavs)")
+            }
+        }
+    }
+
     // MARK: web view
 
     func webView(_ w: WKWebView, didFinish nav: WKNavigation!) {
-        if let u = w.url, u.scheme == "http" { Log.write("loaded \(u)") }
+        if let u = w.url, u.scheme == "http" {
+            Log.write("loaded \(u)")
+            if !navHook.isEmpty { fireNavHook() }
+        }
+    }
+
+    /// A navigation whose reply is audio/wav -- the page's SAVE links
+    /// (/audio.wav?take=N, target=_blank, brought here by createWebViewWith
+    /// below) or a script's location change -- is cancelled and becomes the
+    /// save flow, the name from the reply's Content-Disposition; the page
+    /// stays (WebKit reports the cancelled load as WebKitErrorDomain 102,
+    /// ignored in didFailProvisionalNavigation). A /audio.wav reply that is
+    /// not audio (the 404 JSON for a missing take) is cancelled too and its
+    /// error shown, instead of the JSON replacing the panel.
+    func webView(_ w: WKWebView, decidePolicyFor r: WKNavigationResponse,
+                 decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+        let mime = (r.response.mimeType ?? "").lowercased()
+        let u = r.response.url
+        let isWav = ["audio/wav", "audio/x-wav", "audio/wave", "audio/vnd.wave"].contains(mime)
+        if isWav, let u = u {
+            interceptedNavs += 1
+            decisionHandler(.cancel)
+            Log.write("intercepted an audio/wav navigation: \(u.absoluteString)")
+            saveRecording(u, suggested: r.response.suggestedFilename ?? "octatrack-main-out.wav", source: "page link")
+            return
+        }
+        if let u = u, u.path == "/audio.wav" {
+            interceptedNavs += 1
+            decisionHandler(.cancel)
+            let code = (r.response as? HTTPURLResponse)?.statusCode ?? 0
+            Log.write("intercepted a /audio.wav navigation that is not audio (\(mime), HTTP \(code)): \(u.absoluteString)")
+            server.get(u.path + (u.query.map { "?" + $0 } ?? ""), timeout: 10) { [weak self] _, j, why in
+                let e = (j?["error"] as? String) ?? why
+                Log.write("recording not available: \(e)")
+                self?.sheet("The recording is not available", u.absoluteString + "\n\n" + e)
+            }
+            return
+        }
+        decisionHandler(.allow)
+    }
+
+    /// target=_blank links and window.open() land here; without a UI
+    /// delegate WebKit drops them. There is one window, so the request is
+    /// loaded in it: an audio/wav reply is intercepted above (the page
+    /// stays), anything else replaces the page as a plain link would.
+    func webView(_ w: WKWebView, createWebViewWith cfg: WKWebViewConfiguration, for a: WKNavigationAction,
+                 windowFeatures: WKWindowFeatures) -> WKWebView? {
+        if a.targetFrame == nil, let u = a.request.url {
+            Log.write("new-window navigation loaded in the panel's view: \(u.absoluteString)")
+            w.load(a.request)
+        }
+        return nil
+    }
+
+    /// JS alert()/confirm() as sheets (WebKit shows nothing and answers false
+    /// without these). quit() ends an open one as Cancel; the handler is
+    /// always called, WebKit insists.
+    func webView(_ w: WKWebView, runJavaScriptAlertPanelWithMessage msg: String, initiatedByFrame f: WKFrameInfo,
+                 completionHandler: @escaping () -> Void) {
+        guard !quitting else { completionHandler(); return }
+        let a = NSAlert()
+        a.messageText = msg
+        a.addButton(withTitle: "OK")
+        a.beginSheetModal(for: window) { _ in completionHandler() }
+    }
+
+    func webView(_ w: WKWebView, runJavaScriptConfirmPanelWithMessage msg: String, initiatedByFrame f: WKFrameInfo,
+                 completionHandler: @escaping (Bool) -> Void) {
+        guard !quitting else { completionHandler(false); return }
+        let a = NSAlert()
+        a.messageText = msg
+        a.addButton(withTitle: "OK")
+        a.addButton(withTitle: "Cancel")
+        a.beginSheetModal(for: window) { r in completionHandler(r == .alertFirstButtonReturn) }
     }
 
     /// The server went away between /status and the page (or was killed):
@@ -858,10 +1346,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     /// purpose: an attached server may be the user's own being restarted
     /// (the Open Project alert tells them to), and a second bind on the port
     /// would fail; Reload is the explicit "replace it". -999 is our own
-    /// loadHTMLString cancelling an in-flight load, not a failure.
+    /// loadHTMLString cancelling an in-flight load, not a failure; and
+    /// WebKitErrorDomain 102 (frame load interrupted by policy change) is a
+    /// navigation the response policy above cancelled -- an intercepted
+    /// save -- after which the page is still there.
     func webView(_ w: WKWebView, didFailProvisionalNavigation nav: WKNavigation!, withError e: Error) {
-        if (e as NSError).code == NSURLErrorCancelled { return }
-        Log.write("navigation failed: \(e.localizedDescription)")
+        let ns = e as NSError
+        if ns.code == NSURLErrorCancelled { return }
+        if ns.domain == "WebKitErrorDomain" && ns.code == 102 {
+            Log.write("navigation interrupted by the response policy (an intercepted save); the page stays: \(w.url?.absoluteString ?? "?")")
+            return
+        }
+        Log.write("navigation failed: \(ns.domain) \(ns.code): \(e.localizedDescription)")
         panelShown = false
         showPlaceholder("the server stopped answering (\(e.localizedDescription)); waiting for it"
                         + (server.running ? "" : " -- File > Reload starts a fresh one"))

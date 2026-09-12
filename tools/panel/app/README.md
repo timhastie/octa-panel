@@ -120,6 +120,63 @@ open "out/Virtual Panel.app"
   showing it -- unset, empty or any other value shows the alert (another
   value is logged: `VIRTUAL_PANEL_ADD_THEN=x: neither commit nor later`).
   For scripts and the verification below.
+- **Audio > Save Main Out Recording...** (cmd-shift-S): `GET
+  /audio/status`, then the latest take (`/audio.wav?take=<n>`, suggested
+  name `octatrack-take-NNN.wav`) -- or, with no take yet, the ring
+  (`/audio.wav?from=<first>&to=<end>`, the last 180 s of the main output,
+  `octatrack-main-out.wav`) when it holds anything -- through a save
+  panel (a sheet on the window; the folder is remembered, UserDefaults
+  `saveDir`) and a URLSession download task to the chosen file (replaced
+  if it exists, mode 0644). A take still recording is saved as it is (the
+  server keeps its header valid at every moment). Sheets say why when
+  there is nothing: sound off (with the server's note), nothing captured
+  yet, or a server without the audio endpoints (HTTP 404). A failed
+  download is a sheet with the server's own error (`HTTP 404: no take 9`).
+- **Audio > Show Takes Folder**: the folder of the takes `/audio/status`
+  lists (`out/_panel_takes_<port>/`), in Finder; with no take yet, that
+  folder if it exists, else a sheet.
+- **Audio > Sound (DSP audio, slower sequencer)**: a checkbox that follows
+  `/status` `sound` (polled every 2 s from launch, and once more when the
+  menu opens); enabled only at phase `ready`, since a switch is a reboot
+  the server refuses while it boots. Toggling asks first ("the unit
+  reboots, ~1 min on / ~40 s off"), then `GET /audio/enable?on=1|0`; the
+  checkbox stays disabled through the reboot and follows `/status` at
+  `ready`. A refusal (already so, busy, route A) is a sheet with the
+  server's `note`.
+- **The page's own SAVE links** (`/audio.wav?take=N`, `target=_blank`): a
+  `target=_blank` link or `window.open()` reaches the app's `WKUIDelegate`
+  (`createWebViewWith`; without one WebKit drops them silently) and is
+  loaded in the one web view; a reply of MIME `audio/wav` is cancelled at
+  the navigation-response stage (`decidePolicyFor navigationResponse`) and
+  becomes the same save flow, the name from its `Content-Disposition` --
+  the page stays where it was (WebKit reports the cancelled load as
+  `WebKitErrorDomain` 102, frame load interrupted by policy change, which
+  `didFailProvisionalNavigation` ignores instead of showing the
+  placeholder). A `/audio.wav` reply that is not audio (the 404 JSON of a
+  missing take) is cancelled too and shown as a sheet, so the JSON never
+  replaces the panel. The server serves the file twice this way: WebKit's
+  own load, cancelled at the headers, then the download.
+- The web view is configured with `mediaTypesRequiringUserActionForPlayback
+  = []` so the page's WebAudio monitor keeps running after its own
+  headphones click (inline playback is macOS's only mode --
+  `allowsInlineMediaPlayback` is an iOS setting). With the UI delegate in
+  place, JS `alert()`/`confirm()` are sheets now (they showed nothing and
+  answered false before); quit() ends them like any sheet.
+- Hooks, in the style of `VIRTUAL_PANEL_ADD`: `VIRTUAL_PANEL_SAVE=<path>`
+  saves the latest take to `<path>` (no panel) once `/status` is `ready`
+  and `/audio/status` lists a take that is not recording -- polled every
+  second, the state logged as it changes (`waiting for a take (now: no
+  take yet)`, `(now: take 1, recording)`, `(now: take 1)`);
+  `VIRTUAL_PANEL_SAVE_WAIT=<s>` (default 600) bounds the wait, at the
+  deadline the latest take as it is, else the ring, else nothing.
+  `VIRTUAL_PANEL_SOUND=0|1` switches the sound once ready, no sheet (a
+  refusal is logged: `refused: sound is already on`).
+  `VIRTUAL_PANEL_SAVE_DIR=<dir>` answers every save panel unattended (the
+  file lands there under the suggested name). `VIRTUAL_PANEL_NAV=open:<p>`
+  / `go:<p>` makes the page `window.open(<p>)` / set `location.href`
+  once it has loaded and logs 4 s later whether the page was kept (a
+  marker set before, `location.href`, the title): `VIRTUAL_PANEL_NAV: page
+  kept (...)` or `PAGE NAVIGATED AWAY`.
 - Window: Minimize, Zoom. Edit: the clipboard for the key-map drawer.
 
 Measured 12 Sep 2026 (port 8588, the OTLIVE fixture, launched from a shell
@@ -146,6 +203,47 @@ snare.wav`), a folder and a missing path ("not a file" from the server)
 measured the same boot (+41 s) and re-insert (39.4 s, the server's `card
 re-inserted with 41 files` line; `/status` `restarts` counts watchdog
 respawns, not re-inserts).
+
+Audio, measured 12 Sep 2026 (a re-identified copy of the app,
+`out/_agents/monitor-app/VPMon.app`, bundle id
+`io.octabam.virtual-panel.monitor`; scripts, logs and the saved files under
+`out/_agents/monitor-app/`, `run1..5.sh` / `.out`). Against the real
+server on port 8591, spawned by the app with the OTLIVE fixture (sound on,
+the server's default): `/status` `ready` at +63 s (`sound: true`, the
+checkbox logged `checked, enabled` the same second); PLAY through
+`/tap?row=0x25&bit=0&n=1` opened take 1 (`recording: true`), STOP
+(`/tap?row=0x24&bit=7&n=1`) 13 s of wall later closed it at 60,638 frames
+= 1.375 s of emulated audio (about 106 emulated ms per wall second while
+the sequencer plays with the DSP cores, the ~9x of the port's O14k
+numbers); `VIRTUAL_PANEL_SAVE` logged `waiting for a take (now: no take
+yet)`, `(now: take 1, recording)`, `(now: take 1)` and saved
+`octatrack-take-001.wav`, 242,596 bytes, `cmp`-identical to `curl
+/audio.wav?take=1`, whose first non-zero sample is frame 81 (1.8 ms, the
+fixture's step-1 trig as O14k measured it). A second instance launched on
+the same port attached to that server, and its `VIRTUAL_PANEL_NAV=open:
+/audio.wav?take=1` went `window.open` -> `createWebViewWith` -> the
+navigation-response intercept (`intercepted an audio/wav navigation`,
+then `navigation interrupted by the response policy ...; the page stays`)
+-> the save, again byte-identical, with `page kept (<marker> |
+http://127.0.0.1:8591/ | Virtual Panel)` 4 s later; its
+`VIRTUAL_PANEL_SOUND=0` sent `/audio/enable?on=0` (`switching sound off
+(reboot, ~40 s)`), the checkbox went `checked, disabled` for the reboot
+and `unchecked, enabled` when `/status` read `ready` / `sound: false`
+40.6 s later (the server's own line). SIGTERM to the attached instance:
+gone in 26 ms, the server still answering; SIGTERM to the owner: gone in
+95 ms, `server pid ... stopped (signal 15)`, no `panel_server.py --port
+8591`, no `ot_emu` on `_panel_card_8591.img`, port free. Against the
+contract stub (`stub_audio_server.py`, ports 8590-8592): the `go:`
+variant (`location.href`) is intercepted the same way; a missing take
+(`/audio.wav?take=9`, the 404 JSON) is cancelled before it can replace the
+page and shown as a sheet, the page kept; `VIRTUAL_PANEL_SOUND=1` with
+sound already on is refused and logged, nothing switched; a take that
+appears 5 s after `ready` and reads `recording` for 4 s more is saved
+only once it closes; the ring (`/audio.wav` without `take=`) is saved
+under the `Content-Disposition` name `octatrack-main-out.wav`; SIGTERM
+with the save panel's sheet up quit in 333 ms (`quit: ending the open
+sheet`), with the "not available" sheet up in 296 ms. Build: 0 compiler
+warnings, `codesign -vv` valid on the copy and on `out/Virtual Panel.app`.
 
 Window: 1440x860 to start, centered on the first launch, 960x560 minimum,
 size and position remembered (`NSWindow Frame VirtualPanelWindow` in the

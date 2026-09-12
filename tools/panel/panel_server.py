@@ -34,6 +34,13 @@ Samples (12 Sep 2026): the card's AUDIO folder is a per-port pool
 and /samples/remove change it, /samples/commit rebuilds the card and
 reboots the unit on it (there is no hot-plug: Panel.commit_card).
 
+Sound (12 Sep 2026): with `--sound on` (the default) the port child runs
+--dsp and the server drains core 0's main L/R over the pipe (O14k) into
+AudioRing (the last 180 s, absolute frame numbers) and, from PLAY to STOP,
+into out/_panel_takes_<port>/take-NNN.wav -- /audio/status, /audio/pcm,
+/audio.wav, /audio/enable (README "Hearing the unit"). Playing costs ~3x
+the wall time of a child without the cores.
+
 Then open http://localhost:8563/. Unmapped keys: the MAP drawer lists every
 table entry; click one, watch the screen, name it. The mapping lives in the
 browser (localStorage) and exports as JSON -- send a completed map back as
@@ -42,6 +49,7 @@ a PR to key_map.json.
 import argparse
 import collections
 import filecmp
+import io
 import json
 import os
 import pathlib
@@ -216,6 +224,11 @@ class PortProc:
         status              status sample= ms= frames= frame= idle= wall=
         quit                ok, exit 0
         (failure)           err <message>, keeps serving
+      and with --dsp (O14k, 12 Sep 2026; `err audio needs --dsp` without it):
+        audio start [main|cue|all]   ok        (core 0's ESAI frames into a 60 s ring)
+        audio read [<maxframes>]     audio <frames> <hex>   (LE int16 stereo, released on read, never blocks)
+        audio status                 audio status on= mode= captured= pending= rate=44100 dropped= cap=
+        audio stop                   ok
 
     A reader thread queues stdout lines so a wait can time out; lines that
     are not the expected reply (the port's own report before `ready`, any
@@ -241,7 +254,16 @@ class PortProc:
         threading.Thread(target=self._reader, daemon=True, name="port-stdout").start()
 
     def _reader(self):
-        for raw in iter(self.proc.stdout.readline, b""):
+        # A buffered view of the pipe for the line reads: the raw FileIO a
+        # bufsize=0 Popen hands out reads ONE BYTE PER SYSCALL in readline(),
+        # which cost an 8.9 KB `audio read` reply (a 25 ms pump's frames)
+        # 2.2 ms wall and a 350 KB one 90 ms (measured 12 Sep 2026); the
+        # short `tx`/`ok` replies never showed it. Only this thread reads
+        # stdout, so the buffer hides nothing, and a line is delivered as
+        # soon as its newline arrives (BufferedReader.readline returns on
+        # the read() that carries it, it does not wait to fill the buffer).
+        f = io.BufferedReader(self.proc.stdout, buffer_size=1 << 16)
+        for raw in iter(f.readline, b""):
             self.lines.put(raw.decode("ascii", "replace").rstrip("\r\n"))
         self.lines.put(None)            # EOF: the child exited
 
@@ -337,6 +359,141 @@ class SpeedMeter:
             ms = sum(s[1] for s in self.samples)
             wall = sum(s[2] for s in self.samples)
         return round(ms / wall, 1) if wall > 1e-3 else None
+
+
+# -- the DSP main output: the child's audio ring drained into the server ------
+#
+# With sound on the port child runs --dsp and streams core 0's main L/R over
+# the pipe (O14k: `audio start main`, `audio read`, 16-bit, 44100 Hz, a 60 s
+# ring in the child that overwrites its oldest frames when nobody reads).
+# Panel._drain_audio pulls everything pending into AudioRing (the last
+# AUDIO_RING_S seconds, absolute frame numbers) on every pump, after every
+# action and between run_ms slices, and into a take file while frame mode
+# is on: PLAY opens take-NNN.wav, STOP closes it -- what the unit played
+# between the two keys, as it would come out of MAIN OUT. 12 Sep 2026.
+
+AUDIO_RATE = 44100
+AUDIO_RING_S = 180           # the server-side ring: 180 s x 44100 x 4 B = 31.8 MB, allocated on the first frame
+AUDIO_READ_MAX = 441000      # frames per `audio read` (10 s = 3.5 MB of hex on one line); looped while full
+SOUND_ON_NOTE = "sound on -- while it plays the unit runs ~9x slower than real time (~3x slower than without the DSP cores)"
+SOUND_OFF_NOTE = "sound off: the port child runs without the DSP cores"
+
+
+def wav_header(frames, channels=2, rate=AUDIO_RATE, width=2):
+    """The 44-byte RIFF/WAVE header for `frames` frames of PCM."""
+    data = frames * channels * width
+    return (b"RIFF" + struct.pack("<I", 36 + data) + b"WAVE"
+            + b"fmt " + struct.pack("<IHHIIHH", 16, 1, channels, rate, rate * channels * width,
+                                    channels * width, width * 8)
+            + b"data" + struct.pack("<I", data))
+
+
+def pcm_peak(data):
+    """(peak L, peak R), 0..32767, of little-endian 16-bit stereo bytes.
+    memoryview.cast iterates in C (this Mac is little-endian, as is every
+    host the port builds on); no per-sample Python loop."""
+    n = len(data) // 4 * 4
+    if not n:
+        return (0, 0)
+    mv = memoryview(data)[:n].cast("h")
+    l, r = mv[0::2], mv[1::2]
+    return (min(32767, max(max(l), -min(l))), min(32767, max(max(r), -min(r))))
+
+
+class AudioRing:
+    """The last AUDIO_RING_S seconds of the main output, 16-bit stereo,
+    addressed by ABSOLUTE frame number since the server's capture started:
+    `end` counts every frame ever appended (across child respawns: the
+    child's own ring restarts, this one does not), `first` is the oldest
+    frame still held. A circular bytearray (4 bytes a frame) allocated on
+    the first append; read() copies at most two slices under the lock and
+    nothing per sample -- /audio/pcm serves from it on an HTTP thread
+    without touching the emu thread."""
+
+    def __init__(self, seconds=AUDIO_RING_S):
+        self.cap = int(seconds * AUDIO_RATE)
+        self.buf = None
+        self.end = 0
+        self.lock = threading.Lock()
+
+    @property
+    def first(self):
+        return max(0, self.end - self.cap)
+
+    def append(self, data):
+        total = len(data) // 4
+        if total <= 0:
+            return
+        with self.lock:
+            if self.buf is None:
+                self.buf = bytearray(self.cap * 4)
+            skip = max(0, total - self.cap)         # more than the ring holds: keep the newest
+            n = total - skip
+            pos = ((self.end + skip) % self.cap) * 4
+            room = self.cap * 4 - pos
+            k = n * 4
+            if k <= room:
+                self.buf[pos:pos + k] = data[skip * 4:skip * 4 + k]
+            else:
+                self.buf[pos:] = data[skip * 4:skip * 4 + room]
+                self.buf[:k - room] = data[skip * 4 + room:skip * 4 + k]
+            self.end += total
+
+    def read(self, start, max_frames):
+        """(from, bytes, end): up to max_frames frames from max(start, first);
+        empty bytes when start >= end."""
+        with self.lock:
+            end = self.end
+            start = max(int(start), self.first)
+            n = min(int(max_frames), end - start)
+            if n <= 0 or self.buf is None:
+                return start, b"", end
+            pos = (start % self.cap) * 4
+            room = self.cap * 4 - pos
+            k = n * 4
+            if k <= room:
+                out = bytes(self.buf[pos:pos + k])
+            else:
+                out = bytes(self.buf[pos:]) + bytes(self.buf[:k - room])
+            return start, out, end
+
+
+class TakeWriter:
+    """One take file, out/_panel_takes_<port>/take-NNN.wav: 16-bit stereo
+    44.1 kHz, the RIFF/data sizes re-patched after every append so the file
+    is a valid WAV at every moment (a reader that lands mid-take gets what
+    is there so far)."""
+
+    def __init__(self, path, n, start):
+        self.path, self.n, self.start = pathlib.Path(path), n, start    # start: the ring frame it opened at
+        self.frames = 0
+        self.f = open(self.path, "wb")
+        self.f.write(wav_header(0))
+        self.f.flush()
+
+    def _patch(self):
+        self.f.seek(4); self.f.write(struct.pack("<I", 36 + self.frames * 4))
+        self.f.seek(40); self.f.write(struct.pack("<I", self.frames * 4))
+        self.f.flush()
+
+    def append(self, data):
+        if not data:
+            return
+        self.f.seek(0, 2)
+        self.f.write(data)
+        self.frames += len(data) // 4
+        self._patch()
+
+    def close(self):
+        try:
+            self._patch()
+        finally:
+            self.f.close()
+
+    def info(self, recording=False):
+        return {"n": self.n, "file": str(self.path), "frames": self.frames,
+                "seconds": round(self.frames / AUDIO_RATE, 3), "recording": recording,
+                "start": self.start}
 
 
 class PortRx:
@@ -786,8 +943,34 @@ class Panel:
     def __init__(self, image, card, pump_ms=25.0, project=None, internal_clock=True,
                  play_pump_ms=10.0, backend="routea", port_bin=PORT_BIN, port_args=(),
                  card_file=None, backend_note="", auto=False, pool=None, card_builder=None,
-                 staged_audio=None):
+                 staged_audio=None, sound=False, takes_dir=None):
         self.image = image
+        # Sound (12 Sep 2026): with `sound` the port child is spawned with
+        # --dsp and its main output is drained here (see AudioRing above,
+        # _audio_start, _drain_audio). sound_wanted is what the NEXT child
+        # boots with (/audio/enable flips it and reboots); sound is what the
+        # current one delivers; audio_on says its capture is running.
+        self.sound_wanted = bool(sound) and backend == "port"
+        self.sound = False
+        if backend != "port":
+            self.sound_note = "no sound under route A (the DSP cores are the port's)" if sound else SOUND_OFF_NOTE
+        else:
+            self.sound_note = SOUND_ON_NOTE if sound else SOUND_OFF_NOTE
+        self.sound_busy = False           # an /audio/enable reboot is in progress
+        self.audio_on = False             # the current child accepted `audio start main`
+        self.audio_note = None            # what went wrong with the capture, if anything
+        self.ring = AudioRing()
+        self.audio_captured = 0           # frames drained from every child so far
+        self.audio_dropped = 0            # frames the children overwrote unread (their counters, summed)
+        self._dropped_base = 0            # audio_dropped when the current child started
+        self._dropped_at = 0.0            # wall time of the last `audio status` poll (one per second)
+        self.audio_peak = (0, 0)          # |peak| L/R of the last non-empty read
+        self.drain = {"reads": 0, "frames": 0, "wall_ms": 0.0, "max_ms": 0.0}   # the drain's own cost
+        self.takes_dir = pathlib.Path(takes_dir) if takes_dir else None
+        self.take = None                  # TakeWriter while a take is open (PLAY .. STOP)
+        self.takes = []                   # closed takes, oldest first, as /audio/status lists them
+        self.take_lock = threading.Lock()
+        self.take_seq = self._scan_takes()
         self.card = card                  # the FAT16 card image, bytes (route A takes it as is)
         self.card_file = card_file        # ... and the port reads it from this file
         self.pool = pool                  # SamplePool the card's AUDIO was built from
@@ -977,7 +1160,10 @@ class Panel:
             argv += ["--mount", "--set", set_name, "--project", name]
             if self.internal_clock:
                 argv.append("--internal-clock")
-        return argv + self.port_args
+        argv += self.port_args
+        if self.sound_wanted and "--dsp" not in argv:
+            argv.append("--dsp")        # the DSP cores: sound, ~9x slower than real time while playing (~3x the wall time of no cores)
+        return argv
 
     def _boot_port(self, phase=None):
         """Spawn the child, wait for `ready`, close the clock dialog. `phase`
@@ -991,6 +1177,7 @@ class Panel:
             rt = PortRt(proc, meter=self.meter)
             self.rt = rt
             self.booted = True
+            self._audio_start(rt)       # the ring lives in the child: start it on every fresh one
             if self.project:
                 rep = "\n".join(proc.log)
                 posted = re.search(r"LOAD PROJECT posted: (\w+)", rep)
@@ -1019,14 +1206,34 @@ class Panel:
             try:
                 self._boot_port()
             except PortDied as e:
-                if not self.auto or self.booted:
+                if self.booted:
                     raise
+                if self.sound_wanted:
+                    # The --dsp child did not come up (a binary built without
+                    # the cores, a DSP boot that faults): once more without
+                    # them -- the panel works, the sound does not, and
+                    # /status says why (backend_note, sound_note).
+                    self.sound_wanted = False
+                    self.audio_note = self.sound_note = f"sound off: the --dsp child did not boot ({e})"
+                    self.backend_note = ((self.backend_note + "; ") if self.backend_note else "") + \
+                        f"the --dsp child did not boot ({e}); booted without the DSP cores (no sound)"
+                    print(f"panel: {self.backend_note}")
+                    try:
+                        self._boot_port()
+                    except PortDied as e2:
+                        e = e2
+                    else:
+                        self.phase = "ready"
+                        return
+                if not self.auto:
+                    raise e
                 # The default choice did not come up (a binary without
                 # --interactive exits 2 with its usage; a build that links
                 # but faults at boot): route A instead, and say so.
                 self.backend_note = f"port did not boot ({e}); running route A"
                 print(f"panel: {self.backend_note}")
                 self.backend = "routea"
+                self.sound_note = "no sound under route A (the DSP cores are the port's)"
                 self.play_pump_ms = min(self.play_pump_ms, 10.0)
                 self._boot_routea()
         else:
@@ -1049,6 +1256,8 @@ class Panel:
         clock dialog is closed; /status "booted" is false meanwhile (it
         read true through a re-insert with the screen blank, 12 Sep 2026).
         True when the port is up again."""
+        self._close_take(None)          # a take open across a reboot ends here (the child's ring is gone)
+        self.audio_on = False
         if self.proc is not None:
             self.proc.kill()
         self.booted = False
@@ -1093,6 +1302,8 @@ class Panel:
             return False, "no sample pool"
         if self.card_busy:
             return False, "a re-insert is already in progress"
+        if self.sound_busy:
+            return False, "a sound switch (reboot) is in progress"
         if not self.booted:
             return False, f"the unit is still booting ({self.phase})"
         self.card_busy = True
@@ -1172,6 +1383,7 @@ class Panel:
                     self.busy_since = time.perf_counter()
                     try:
                         act()
+                        self._drain_audio(self.rt)   # what the action's own runs rendered
                     finally:
                         self.busy_since = None
                 rt = self.rt        # after the actions: a card re-insert replaces it
@@ -1208,7 +1420,9 @@ class Panel:
                     pump = self.pump_ms
                 rt.run(ms=pump)
                 self._poll(rt)
-                self.busy_since = None
+                burst = time.perf_counter() - t    # the run + tx alone decide the idle sleep below,
+                self._drain_audio(rt)              # so the drain (one more round trip, /audio/status
+                self.busy_since = None             # "drain" measures it) changes no pump cadence
                 self.ran_ms = rt.sample / er.SAMPLE_HZ * 1000.0
                 if isinstance(rt, PortRt) and rt.stop_reason not in ("time", "gate", None, "?") \
                         and not (self.fault or "").startswith("port: run stopped"):
@@ -1216,7 +1430,7 @@ class Panel:
                 self._snapshot(self._uc())
                 self._parse_leds(rt)
                 # idle bursts return instantly; don't spin the host
-                if time.perf_counter() - t < 0.01:
+                if burst < 0.01:
                     time.sleep(0.03)
             except PortDied as e:
                 self.busy_since = None
@@ -1325,10 +1539,201 @@ class Panel:
         if not rt.frame:
             rt.frame = True
             rt.next_frame = rt.sample + er.FRAME_PERIOD
+            self._open_take(rt)         # sound on: a take file from this PLAY to the next STOP
         return [rt.uc.mem_read(rt.pattern_base() + 84 + 2330 * t, 1)[0] for t in range(8)]
 
     def _after_stop(self, rt):
         rt.frame = False
+        self._close_take(rt)
+
+    # -- sound: the child's audio ring, the server's ring, the takes ----------
+
+    def _scan_takes(self):
+        """Takes already in takes_dir (an earlier server on this port): list
+        them and number on from the highest."""
+        top = 0
+        if self.takes_dir is not None and self.takes_dir.is_dir():
+            for f in sorted(self.takes_dir.glob("take-*.wav")):
+                m = re.fullmatch(r"take-(\d+)\.wav", f.name)
+                if not m:
+                    continue
+                n = int(m.group(1))
+                frames = max(0, f.stat().st_size - 44) // 4
+                self.takes.append({"n": n, "file": str(f), "frames": frames,
+                                   "seconds": round(frames / AUDIO_RATE, 3), "recording": False})
+                top = max(top, n)
+        return top + 1
+
+    def _audio_start(self, rt):
+        """`audio start main` on a fresh child -- at the first boot and after
+        every respawn, card re-insert and sound switch (the child's ring
+        restarts from zero; the server's AudioRing keeps counting, so the
+        absolute frame numbers keep increasing across it). Sets sound /
+        audio_on / sound_note; a child that refuses (no --dsp) leaves the
+        panel working without sound and says so."""
+        self.audio_on = False
+        self._dropped_base = self.audio_dropped
+        self._dropped_at = 0.0
+        if not isinstance(rt, PortRt) or not self.sound_wanted:
+            self.sound = False
+            self.sound_note = self.audio_note or SOUND_OFF_NOTE
+            return
+        try:
+            rt.proc.command("audio start main", "ok")
+        except PortError as e:
+            self.sound = False
+            self.audio_note = self.sound_note = f"sound off: the child refused `audio start main` ({e})"
+            return
+        self.audio_on = True
+        self.sound = True
+        self.audio_note = None
+        self.sound_note = SOUND_ON_NOTE
+
+    def _drain_audio(self, rt):
+        """Everything the child captured since the previous drain, into the
+        ring and the open take. `audio read` answers what is there and
+        never blocks (O14k: 0.2 ms wall for a 100 ms slice, 8.8 KB of hex
+        for a 25 ms pump); read in AUDIO_READ_MAX pieces while a piece
+        comes back full. The child's `dropped` counter (frames it overwrote
+        before a read) is polled once a wall second, not per pump. Always
+        on the emu thread, like every pipe command. Returns frames drained."""
+        if not self.audio_on or not isinstance(rt, PortRt):
+            return 0
+        got = 0
+        t0 = time.perf_counter()
+        while True:
+            rep = rt.proc.command(f"audio read {AUDIO_READ_MAX}", "audio")
+            head, _, hexs = rep[6:].partition(" ")          # "audio <frames> <hex>"
+            n = int(head)
+            if n:
+                data = bytes.fromhex(hexs.strip())
+                if len(data) != n * 4:
+                    raise PortError(f"audio read: {n} frames announced, {len(data)} bytes of PCM")
+                self.ring.append(data)
+                self.audio_captured += n
+                self.audio_peak = pcm_peak(data)
+                if self.take is not None:
+                    with self.take_lock:
+                        self.take.append(data)
+                got += n
+            if n < AUDIO_READ_MAX:
+                break
+        if t0 - self._dropped_at > 1.0:
+            st = rt.proc.command("audio status", "audio")
+            f = dict(kv.split("=", 1) for kv in st.split()[2:] if "=" in kv)
+            self.audio_dropped = self._dropped_base + int(f.get("dropped", 0))
+            self._dropped_at = t0
+        dt = (time.perf_counter() - t0) * 1000.0
+        d = self.drain
+        d["reads"] += 1; d["frames"] += got; d["wall_ms"] += dt
+        if dt > d["max_ms"]:
+            d["max_ms"] = dt
+        return got
+
+    def _open_take(self, rt):
+        """PLAY: a new take-NNN.wav gets every frame drained from here on.
+        What the child holds now was rendered BEFORE the key: drained into
+        the ring first, so the file starts at the PLAY press."""
+        if self.takes_dir is None or not self.audio_on or self.take is not None:
+            return
+        self._drain_audio(rt)
+        self.takes_dir.mkdir(parents=True, exist_ok=True)
+        n, self.take_seq = self.take_seq, self.take_seq + 1
+        with self.take_lock:
+            self.take = TakeWriter(self.takes_dir / f"take-{n:03d}.wav", n, self.ring.end)
+
+    def _close_take(self, rt):
+        """STOP (rt given: the frames up to the key are drained into it
+        first) or a reboot (rt None: the child is gone). The take joins the
+        list; None when no take was open."""
+        if self.take is None:
+            return None
+        try:
+            if rt is not None:
+                self._drain_audio(rt)
+        finally:
+            with self.take_lock:
+                t, self.take = self.take, None
+                t.close()
+                info = t.info()
+                self.takes.append(info)
+        return info
+
+    def take_file(self, n):
+        """(info, path) of take n -- the open one included -- or (None, None)."""
+        with self.take_lock:
+            if self.take is not None and self.take.n == n:
+                return self.take.info(recording=True), self.take.path
+            for t in self.takes:
+                if t["n"] == n:
+                    return dict(t), pathlib.Path(t["file"])
+        return None, None
+
+    def audio_status(self):
+        with self.take_lock:
+            take = self.take.info(recording=True) if self.take is not None else None
+        takes = list(self.takes) + ([take] if take else [])
+        return {"sound": self.sound, "on": self.audio_on, "rate": AUDIO_RATE,
+                "captured": self.audio_captured, "end": self.ring.end, "first": self.ring.first,
+                "cap": self.ring.cap, "dropped": self.audio_dropped, "peak": list(self.audio_peak),
+                "take": take, "takes": takes, "note": self.audio_note or self.sound_note,
+                # additions beyond the contract: the reboot state the page disables its controls on,
+                # where the files land, and what the drain itself costs the pump
+                "busy": self.sound_busy or self.card_busy, "phase": self.phase,
+                "takes_dir": str(self.takes_dir) if self.takes_dir else None,
+                "drain": dict(self.drain)}
+
+    SOUND_ON_PHASE = "switching sound on (reboot, ~1 min)"
+    SOUND_OFF_PHASE = "switching sound off (reboot, ~40 s)"
+
+    def set_sound(self, on):
+        """/audio/enable: reboot the port child with (on) or without --dsp,
+        the card re-insert's own mechanics (_reboot_port: a fresh child on
+        the same card image, the clock dialog closed, phase shown, booted
+        false meanwhile). Takes and the ring survive; the child's ring
+        restarts and the server keeps numbering on. Refused while a
+        re-insert or another switch runs, while booting, when already in
+        that state, and under route A."""
+        on = bool(on)
+        if self.backend != "port":
+            return False, "no sound under route A (the DSP cores are the port's)"
+        if self.card_busy:
+            return False, "the card is being re-inserted (reboot in progress)"
+        if self.sound_busy:
+            return False, "a sound switch is already in progress"
+        if not self.booted:
+            return False, f"the unit is still booting ({self.phase})"
+        if on == self.sound_wanted:
+            return False, f"sound is already {'on' if on else 'off'}"
+        self.sound_busy = True
+        phase = self.SOUND_ON_PHASE if on else self.SOUND_OFF_PHASE
+        self.phase = phase
+
+        def act():
+            self.busy_since = None          # a boot, not an action the watchdog may time
+            t0 = time.perf_counter()
+            self.sound_wanted = on
+            self.audio_note = None
+            try:
+                ok = self._reboot_port(phase)
+                if not ok and on:
+                    # the --dsp child did not come up three times: back without the cores
+                    why = self.fault
+                    self.sound_wanted = False
+                    self.audio_note = f"sound off: the --dsp child did not boot ({why})"
+                    ok = self._reboot_port(self.SOUND_OFF_PHASE)
+                if ok:
+                    self.fault = None
+                    print(f"panel: sound {'on' if self.sound else 'off'} after a reboot of"
+                          f" {time.perf_counter() - t0:.1f} s ({self.sound_note})")
+            except Exception as e:
+                self.fault = f"sound switch: {type(e).__name__}: {e}"
+                alive = self.proc is not None and self.proc.alive()
+                self.phase = "ready" if alive else "failed"
+            finally:
+                self.sound_busy = False
+        self.actions.put(act)
+        return True, phase
 
     def transport(self, what):
         """PLAY / REC / STOP through the firmware's own key handlers
@@ -1482,6 +1887,7 @@ class Panel:
             left = (end - rt.sample) / er.SAMPLE_HZ * 1000.0
             rt.run(ms=min(left, slice_ms))
             self.ran_ms = rt.sample / er.SAMPLE_HZ * 1000.0
+            self._drain_audio(rt)       # the ring and the take keep up slice by slice
             if self.abort:
                 why = "watchdog"; break
             if time.perf_counter() - t0 > wall:
@@ -1679,6 +2085,104 @@ class Handler(BaseHTTPRequestHandler):
             r["pending"] = p.pending()[0]
         self._json(r)
 
+    # The main output (AudioRing, the takes; sound on = the child runs --dsp).
+    # /audio/status and /audio/pcm read the ring on this thread under its own
+    # lock -- no emu-thread action, so they answer while the pump runs;
+    # /audio/enable queues the reboot. Every answer here is JSON or audio:
+    # bad numbers are 400, a missing take 404, never a traceback.
+    def _audio(self, path, args):
+        p = self.panel
+
+        def num(k, default):
+            v = args.get(k)
+            if v in (None, ""):
+                return int(default)
+            return int(v, 0) if v.lower().startswith(("0x", "0o", "0b")) else int(v)
+
+        def send_wav(data, name, extra=()):
+            body = wav_header(len(data) // 4) + data
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/wav")
+            self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            for k, v in extra:
+                self.send_header(k, str(v))
+            self.end_headers()
+            self.wfile.write(body)
+
+        try:
+            if path == "/audio/status":
+                self._json(p.audio_status())
+            elif path == "/audio/pcm":
+                # raw LE int16 stereo frames from the ring: from=<absolute frame>
+                # (clamped up to the oldest still held; X-Audio-From says where the
+                # body really starts), max= frames (default 2 s, at most 10 s)
+                start = max(0, num("from", 0))
+                mx = max(1, min(num("max", 88200), 441000))
+                frm, data, end = p.ring.read(start, mx)
+                if not data:
+                    self.send_response(204)
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("X-Audio-End", str(end))
+                    self.send_header("X-Audio-Rate", str(AUDIO_RATE))
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("X-Audio-From", str(frm))
+                self.send_header("X-Audio-Frames", str(len(data) // 4))
+                self.send_header("X-Audio-End", str(end))
+                self.send_header("X-Audio-Rate", str(AUDIO_RATE))
+                self.end_headers()
+                self.wfile.write(data)
+            elif path == "/audio.wav":
+                if args.get("take") not in (None, ""):
+                    n = num("take", 0)
+                    info, file = p.take_file(n)
+                    if info is None:
+                        self._json({"ok": False, "error": f"no take {n}", "takes": [t["n"] for t in p.takes]}, 404)
+                        return
+                    with p.take_lock:               # not mid-append of the open take
+                        raw = file.read_bytes() if file.exists() else b""
+                    if len(raw) < 44 or raw[:4] != b"RIFF":
+                        self._json({"ok": False, "error": f"take {n}: {file} is not a WAV"}, 404)
+                        return
+                    data = raw[44:len(raw) // 4 * 4]  # the header is rebuilt from what is there now
+                    send_wav(data, f"octatrack-take-{n:03d}.wav",
+                             [("X-Audio-Take", n), ("X-Audio-Frames", len(data) // 4),
+                              ("X-Audio-Recording", int(bool(info.get("recording"))))])
+                else:
+                    # the ring: from=..&to=.. absolute frames, default everything held
+                    first, end = p.ring.first, p.ring.end
+                    frm = max(num("from", first), first)
+                    to = min(num("to", end), end)
+                    if to <= frm:
+                        self._json({"ok": False, "error": "nothing captured in that range",
+                                    "first": first, "end": end, "sound": p.sound}, 404)
+                        return
+                    frm, data, end = p.ring.read(frm, to - frm)
+                    send_wav(data, "octatrack-main-out.wav",
+                             [("X-Audio-From", frm), ("X-Audio-Frames", len(data) // 4), ("X-Audio-End", end)])
+            elif path == "/audio/enable":
+                v = args.get("on", "1").lower()
+                if v not in ("1", "0", "on", "off", "true", "false"):
+                    self._json({"ok": False, "error": f"on={v!r}: want 1|0"}, 400)
+                    return
+                ok, res = p.set_sound(v in ("1", "on", "true"))
+                if ok:
+                    self._json({"ok": True, "phase": res, "sound": p.sound})
+                else:
+                    self._json({"ok": False, "note": res, "phase": p.phase, "sound": p.sound,
+                                "busy": p.sound_busy or p.card_busy})
+            else:
+                self._json({"ok": False, "error": "no such audio endpoint",
+                            "endpoints": ["/audio/status", "/audio/pcm", "/audio.wav", "/audio/enable"]}, 404)
+        except ValueError as e:
+            self._json({"ok": False, "error": f"bad number: {e}"}, 400)
+
     def do_POST(self):
         path, _, q = self.path.partition("?")
         args = dict(kv.split("=", 1) for kv in q.split("&") if "=" in kv)
@@ -1715,9 +2219,13 @@ class Handler(BaseHTTPRequestHandler):
                             "speed": p.meter.value,
                             "restarts": p.restarts,
                             "card_busy": p.card_busy,       # a /samples/commit re-insert in progress
-                            "clock": p.clock_note})         # what the boot-time YES found
+                            "clock": p.clock_note,          # what the boot-time YES found
+                            "sound": p.sound,               # the child runs --dsp and its main out is captured
+                            "sound_note": p.sound_note})
         elif path.startswith("/samples"):
             self._samples(path, args)
+        elif path.startswith("/audio"):
+            self._audio(path, args)
         elif path == "/peek":
             # read-only memory, either backend (Unicorn / the port's peek): what a
             # record holds right now, e.g. the popup slot 0x460d175c
@@ -1827,6 +2335,11 @@ def main():
     ap.add_argument("--audio", action="append", default=[], metavar="DIR",
                     help="seed the sample pool with every WAV/AIFF in DIR (converted when the unit "
                          "would not read it), in addition to the project's sibling AUDIO; repeatable")
+    ap.add_argument("--sound", choices=("on", "off"), default="on",
+                    help="on (default): the port child runs --dsp and its main output is captured "
+                         "(/audio/status, /audio/pcm, /audio.wav, takes on PLAY..STOP; boot ~1 min, the "
+                         "sequencer ~9x slower than real time while it plays, ~3x slower than without the cores); off: no DSP cores, no sound. "
+                         "--port-arg=--dsp is the same as on; --sound off wins over it")
     a = ap.parse_args()
 
     # Default to the STOCK image: out/mainos_bus.bin is whatever the last
@@ -1896,16 +2409,27 @@ def main():
         # attach, one file per server port so two panels do not share it.
         card_file = ROOT / "out" / f"_panel_card_{a.port}.img"
         card_file.write_bytes(card)
+    # Sound: --dsp is --sound's flag now. A script's --port-arg=--dsp still
+    # boots the cores (and gets the capture with them); an explicit --sound
+    # off drops it, and says so.
+    sound = a.sound == "on"
+    port_args = [x for x in a.port_arg if x != "--dsp"]
+    if len(port_args) != len(a.port_arg) and not sound:
+        print("panel: --sound off: --port-arg=--dsp dropped (the child runs without the DSP cores)")
+    takes_dir = ROOT / "out" / f"_panel_takes_{a.port}"
     Handler.panel = Panel(image, card, project=project, internal_clock=not a.midi_clock,
-                          backend=backend, port_bin=a.port_bin, port_args=a.port_arg,
+                          backend=backend, port_bin=a.port_bin, port_args=port_args,
                           card_file=card_file, backend_note=note, auto=a.backend == "auto",
                           play_pump_ms=25.0 if backend == "port" else 10.0,
-                          pool=pool, card_builder=builder, staged_audio=staged_audio)
+                          pool=pool, card_builder=builder, staged_audio=staged_audio,
+                          sound=sound, takes_dir=takes_dir)
     Handler.html = (pathlib.Path(__file__).parent / "panel.html").read_bytes()
-    print(f"panel: http://localhost:{a.port}/   image={image}   backend={backend}")
+    print(f"panel: http://localhost:{a.port}/   image={image}   backend={backend}"
+          f"   sound={'on' if Handler.panel.sound_wanted else 'off'} (takes in {takes_dir})")
     try:
         srv.serve_forever()
     finally:
+        Handler.panel._close_take(None)     # a take open at exit stays a valid WAV
         if Handler.panel.proc is not None:
             Handler.panel.proc.quit()
 
