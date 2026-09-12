@@ -129,8 +129,8 @@ namespace ot
 		// DSP's own instruction counter, the ESAI frame counters and the ESAI /
 		// HDI08 status registers -- what to read when a core stops making
 		// progress and the question is when it stopped.
-		void setTrace(uint64_t _every) { m_traceEvery = _every; }
-		void setTraceFrom(uint64_t _executed) { m_traceFrom = _executed; }	// O9b: a window, so the cap holds the END of a run
+		void setTrace(uint64_t _every) { m_traceEvery = _every; refreshInstrumented(); }
+		void setTraceFrom(uint64_t _executed) { m_traceFrom = _executed; refreshInstrumented(); }	// O9b: a window, so the cap holds the END of a run
 		// The idle fast-forward: a core found in a poll loop (the last PCs in
 		// a window of three words, outside any hardware DO loop) is advanced
 		// to its next peripheral event instead of executing the polls. What it
@@ -214,13 +214,13 @@ namespace ot
 		const std::vector<WatchHit>& writeWatchHits() const { return m_watchHits; }
 		// A PC watch on one core: registers at every arrival (last 24), the DSP side of route A's --watch-pc (O9b).
 		struct PcWatchHit { uint64_t executed; uint32_t a1, a0, b1, b0, x0, x1, y0, y1, r0, r4, r6, n4, sp, r2, m2, r1, n1, r7; };
-		void setPcWatch(const int _core, const uint32_t _pc, const uint64_t _from = 0) { m_pcWatchCore = _core; m_pcWatchPc = _pc; m_pcWatchFrom = _from; m_pcWatchOn = true; }
+		void setPcWatch(const int _core, const uint32_t _pc, const uint64_t _from = 0) { m_pcWatchCore = _core; m_pcWatchPc = _pc; m_pcWatchFrom = _from; m_pcWatchOn = true; refreshInstrumented(); }
 		// O12 cycle meter: instructions executed between two PCs on one core, per
 		// arrival pair (the dispatcher's head to its exit = one frame's DSP work,
 		// in the same unit as dsp_host's meter). Spins outside the pair (the host
 		// wait, the bank wait) are not counted, which is what "busy" failed to do.
 		struct Stopwatch { int core = -1; uint32_t start = 0, stop = 0; uint64_t t0 = 0; bool armed = false; uint64_t n = 0, sum = 0, max = 0, min = ~0ull; std::vector<uint32_t> last; };
-		void setStopwatch(const int _core, const uint32_t _start, const uint32_t _stop) { m_sw.core = _core; m_sw.start = _start; m_sw.stop = _stop; }
+		void setStopwatch(const int _core, const uint32_t _start, const uint32_t _stop) { m_sw.core = _core; m_sw.start = _start; m_sw.stop = _stop; refreshInstrumented(); }
 		const Stopwatch& stopwatch() const { return m_sw; }
 		const std::vector<PcWatchHit>& pcWatchHits() const { return m_pcWatchHits; }
 		const std::vector<std::string>& writeMap() const { return m_writeMap; }
@@ -230,6 +230,11 @@ namespace ot
 		static double g_quantum;		// O12: --dsp-quantum N (default 64); huge = each core runs its whole due span in turn
 		void runDue();
 		bool stepCore(int _i, double _limit);
+		// O16b: the pair's own counters -- runDue calls and passes, stepCore
+		// wrapper calls, interpreter steps and idle steps per core. Free to
+		// keep (one add each); printed on stderr at exit with OT_DSP_STATS=1.
+		struct Stats { uint64_t runDue = 0, passes = 0, stepCalls = 0, interp[2] = {0, 0}, idleSteps[2] = {0, 0}; };
+		const Stats& stats() const { return m_stats; }
 		// Run ONE core until `_ready` or `_budget` instructions (the read-back
 		// needs the DSP to produce each word). Returns whether it became ready.
 		bool runCoreUntil(int _core, const std::function<bool()>& _ready, uint64_t _budget);
@@ -237,6 +242,19 @@ namespace ot
 	private:
 		struct Core;
 		Core& cur() { return *m_cores[m_sel & 1]; }
+		// O16b: the per-instruction body (stepCore minus its runnable checks)
+		// and its cold parts. `m_instrumented` is the one flag the hot path
+		// tests for the stopwatch, the PC watch and the trace; the PC ring
+		// and the TIMER0 capture are always on (the fault report and the
+		// batch report print them).
+		bool stepBody(Core& c, int i, double _limit);
+		bool faultPc(Core& c, uint32_t _pc, double _limit) __attribute__((noinline));
+		void timerCapture(Core& c) __attribute__((noinline));
+		void instrumentBefore(Core& c, int i, uint32_t pc) __attribute__((noinline));
+		void traceLine(Core& c, int i, uint32_t pc) __attribute__((noinline));
+		void refreshInstrumented() { m_instrumented = m_traceEvery != 0 || m_pcWatchOn || m_sw.core == 0 || m_sw.core == 1; }
+		bool m_instrumented = false;
+		Stats m_stats;
 		void note(const char* _kind, uint32_t _val);
 		void icrWrite(uint32_t _v);
 		void cvrWrite(uint32_t _v);

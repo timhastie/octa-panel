@@ -1,6 +1,7 @@
 #include "dsp.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <cstring>
 #include <array>
@@ -328,7 +329,27 @@ namespace ot
 		}
 	}
 
-	DspPair::~DspPair() = default;
+	DspPair::~DspPair()
+	{
+		// O16b: the pair's own counters, opt-in (OT_DSP_STATS=1), on stderr at
+		// exit -- what `dspstat` reported in the speed-dsp prototype, without
+		// a command. Nothing on stdout, nothing without the variable.
+		if(const char* e = std::getenv("OT_DSP_STATS"); e && *e && *e != '0')
+		{
+			std::fprintf(stderr, "dspstat runDue=%llu passes=%llu stepCore=%llu",
+				static_cast<unsigned long long>(m_stats.runDue), static_cast<unsigned long long>(m_stats.passes),
+				static_cast<unsigned long long>(m_stats.stepCalls));
+			for(int i = 0; i < 2; ++i)
+			{
+				const Core& c = *m_cores[i];
+				std::fprintf(stderr, " | core %d exec=%llu skip=%llu interp=%llu idlesteps=%llu surplus=%llu zerodelta=%llu",
+					i, static_cast<unsigned long long>(c.executed), static_cast<unsigned long long>(c.idleSkipped),
+					static_cast<unsigned long long>(m_stats.interp[i]), static_cast<unsigned long long>(m_stats.idleSteps[i]),
+					static_cast<unsigned long long>(c.surplus), static_cast<unsigned long long>(c.zeroDelta));
+			}
+			std::fputc('\n', stderr);
+		}
+	}
 
 	void DspPair::setVerbose(const bool _on)
 	{
@@ -717,7 +738,7 @@ namespace ot
 	bool DspPair::stepCore(const int _i, const double _limit)
 	{
 		Core& c = *m_cores[_i];
-		const int i = _i;
+		++m_stats.stepCalls;
 		if(!c.boot->finished())
 		{
 			// Held in the bootstrap ROM until its last word lands; the
@@ -733,143 +754,203 @@ namespace ot
 		}
 		if(static_cast<double>(c.executed) >= _limit)
 			return false;
+		return stepBody(c, _i, _limit);
+	}
 
-			const auto pc = c.dsp->getPC().toWord();
-			c.pcRing[c.pcRingPos++ % c.pcRing.size()] = pc;
-			if(pc >= g_pSize)
-			{
-				c.faulted = true;
-				char msg[96];
-				std::snprintf(msg, sizeof msg, "PC %#x is outside P memory (%#x words)", pc, g_pSize);
-				c.why = msg;
-				c.executed = static_cast<uint64_t>(_limit);
-				return false;
-			}
-			// The idle fast-forward (dsp.h): eight instructions in a row
-			// inside a three-word window, no hardware loop open.
-			// O9: the budget counts the DSP's OWN instruction counter, the
-			// one its ESAI clock reads -- a `rep` advances it once per
-			// iteration where this loop makes ONE interpreter call, so
-			// counting calls ran the ESAI 0.27% fast against the frame
-			// clock (17 ESAI frames in a host frame, 17 of 399 -- O8b's
-			// residual). The delta is taken across the idle step too.
-			const auto before = c.dsp->getInstructionCounter();
-			uint64_t skipped = 0;
-			if(pc < c.lastPcLo || pc > c.lastPcHi)
-			{
-				c.lastPcLo = pc;
-				c.lastPcHi = pc + 2;
-				c.windowRun = 0;
-			}
-			else if(++c.windowRun >= 8 && m_idleSkip && !(c.dsp->regs().sr.var & 0x8000)
-				&& !c.dsp->hasPendingInterrupts())
-			{
-				// Skip to the next peripheral event (or the due count), then
-				// FALL THROUGH and execute the poll once, so it can see what
-				// changed. ⚠️ `continue` here left the poll never executed
-				// and the uploader waiting for an echo forever (measured
-				// 8 Sep 2026: "unrecognised spin at 40001b82").
-				const auto room = static_cast<uint64_t>(_limit - static_cast<double>(c.executed));
-				skipped = c.dsp->idleStep(room ? room : 1);
-				c.idleSkipped += skipped;
-			}
-			// O9b: the bank id is the ONE host-port word the frame handler
-			// reads with no ready check: payload A's `movep r3,x:<<M_HOTX`
-			// at P:0x73, right after the bank wait, once per ring half.
-			// (Keying on "port non-empty outside a pull" instead fired on
-			// every command echo too: 5-6 ESAI frames per host frame.)
-			const bool bankWrite = i == 0 && pc == g_bankIdPc && m_hostWordHook;
-			// O9b: nobody in either payload writes a timer register, yet core 1
-			// took TIMER0 Compare (vector 0x54 -- payload B's `move x0,y:(r4)+`)
-			// 230,027 times. Catch the first enable with the PCs before it.
-			if(!c.timerEnabledAt && (c.px->getTimers().readTCSR(0) & 1))
-			{
-				c.timerEnabledAt = c.executed;
-				c.timerTcsr = c.px->getTimers().readTCSR(0);
-				for(int k = 0; k < 8; ++k)
-				{
-					c.timerPcs[k] = c.pcRing[(c.pcRingPos + 64 - 1 - static_cast<uint64_t>(k)) % 64];
-					c.timerR[k] = c.dsp->regs().r[k].var & 0xffffff;
-					c.timerM[k] = c.dsp->regs().m[k].var & 0xffffff;
-				}
-			}
-			if(m_sw.core == i)
-			{
-				if(pc == m_sw.start) { m_sw.t0 = c.executed; m_sw.armed = true; }
-				else if(pc == m_sw.stop && m_sw.armed)
-				{
-					const uint64_t d = c.executed - m_sw.t0;
-					m_sw.armed = false; ++m_sw.n; m_sw.sum += d; if(d > m_sw.max) m_sw.max = d; if(d < m_sw.min) m_sw.min = d;
-					if(m_sw.last.size() < 4096) m_sw.last.push_back(static_cast<uint32_t>(d));
-				}
-			}
-			if(m_pcWatchOn && i == m_pcWatchCore && pc == m_pcWatchPc && c.executed >= m_pcWatchFrom && !(m_pcWatchFrom && m_pcWatchHits.size() >= 24))
-			{
-				const auto& r = c.dsp->regs();
-				if(m_pcWatchHits.size() >= 24)
-					m_pcWatchHits.erase(m_pcWatchHits.begin());
-				m_pcWatchHits.push_back({c.executed,
-					static_cast<uint32_t>((r.a.var >> 24) & 0xffffff), static_cast<uint32_t>(r.a.var & 0xffffff),
-					static_cast<uint32_t>((r.b.var >> 24) & 0xffffff), static_cast<uint32_t>(r.b.var & 0xffffff),
-					static_cast<uint32_t>(r.x.var & 0xffffff), static_cast<uint32_t>((r.x.var >> 24) & 0xffffff),
-					static_cast<uint32_t>(r.y.var & 0xffffff), static_cast<uint32_t>((r.y.var >> 24) & 0xffffff),
-					static_cast<uint32_t>(r.r[0].var & 0xffffff), static_cast<uint32_t>(r.r[4].var & 0xffffff),
-					static_cast<uint32_t>(r.r[6].var & 0xffffff), static_cast<uint32_t>(r.n[4].var & 0xffffff),
-					static_cast<uint32_t>(r.sp.var & 0xff), static_cast<uint32_t>(r.r[2].var & 0xffffff), static_cast<uint32_t>(r.m[2].var & 0xffffff),
-					static_cast<uint32_t>(r.r[1].var & 0xffffff), static_cast<uint32_t>(r.n[1].var & 0xffffff),
-					static_cast<uint32_t>(r.r[7].var & 0xffffff)});
-			}
-			c.dsp->execInterpreter();
+	// O16b: the per-instruction body, split from the checks above so that
+	// runDue can loop on it with the limit test inline (the call that only
+	// returned false is gone), and with everything that is not needed on every
+	// instruction -- the fault message, the TIMER0 capture, the stopwatch, the
+	// PC watch, the trace line -- in cold helpers behind one `m_instrumented`
+	// flag. The order of side effects is stepCore's of O9b-O15: PC ring, fault
+	// check, idle window, bank flag, timer capture, stopwatch, PC watch, the
+	// instruction, the loop end, the counters, the bank hook, the trace.
+	bool DspPair::stepBody(Core& c, const int i, const double _limit)
+	{
+		const auto pc = c.dsp->getPC().toWord();
+		c.pcRing[c.pcRingPos++ % c.pcRing.size()] = pc;
+		if(pc >= g_pSize)
+			return faultPc(c, pc, _limit);
+		// The idle fast-forward (dsp.h): eight instructions in a row
+		// inside a three-word window, no hardware loop open.
+		// O9: the budget counts the DSP's OWN instruction counter, the
+		// one its ESAI clock reads -- a `rep` advances it once per
+		// iteration where this loop makes ONE interpreter call, so
+		// counting calls ran the ESAI 0.27% fast against the frame
+		// clock (17 ESAI frames in a host frame, 17 of 399 -- O8b's
+		// residual). The delta is taken across the idle step too.
+		const auto before = c.dsp->getInstructionCounter();
+		uint64_t skipped = 0;
+		if(pc < c.lastPcLo || pc > c.lastPcHi)
+		{
+			c.lastPcLo = pc;
+			c.lastPcHi = pc + 2;
+			c.windowRun = 0;
+		}
+		else if(++c.windowRun >= 8 && m_idleSkip && !(c.dsp->regs().sr.var & 0x8000)
+			&& !c.dsp->hasPendingInterrupts())
+		{
+			// Skip to the next peripheral event (or the due count), then
+			// FALL THROUGH and execute the poll once, so it can see what
+			// changed. ⚠️ `continue` here left the poll never executed
+			// and the uploader waiting for an echo forever (measured
+			// 8 Sep 2026: "unrecognised spin at 40001b82").
+			const auto room = static_cast<uint64_t>(_limit - static_cast<double>(c.executed));
+			skipped = c.dsp->idleStep(room ? room : 1);
+			c.idleSkipped += skipped;
+			++m_stats.idleSteps[i];
+		}
+		// O9b: the bank id is the ONE host-port word the frame handler
+		// reads with no ready check: payload A's `movep r3,x:<<M_HOTX`
+		// at P:0x73, right after the bank wait, once per ring half.
+		// (Keying on "port non-empty outside a pull" instead fired on
+		// every command echo too: 5-6 ESAI frames per host frame.)
+		const bool bankWrite = i == 0 && pc == g_bankIdPc && m_hostWordHook;
+		// O9b: nobody in either payload writes a timer register, yet core 1
+		// took TIMER0 Compare (vector 0x54 -- payload B's `move x0,y:(r4)+`)
+		// 230,027 times. Catch the first enable with the PCs before it.
+		// (readTCSR is an inline load; the capture itself is the cold part.)
+		if(!c.timerEnabledAt && (c.px->getTimers().readTCSR(0) & 1))
+			timerCapture(c);
+		if(m_instrumented)
+			instrumentBefore(c, i, pc);
+		++m_stats.interp[i];
+		c.dsp->execInterpreter();
+		// doLoopEnd's first test is SR_LF (0x008000): with no hardware DO loop
+		// open it returns false at once, so the call is made only then.
+		if(c.dsp->regs().sr.var & 0x8000)
 			c.dsp->doLoopEnd();
-			const auto d = c.dsp->getInstructionCounter() - before;
-			c.executed += d ? d : 1;
-			if(d > skipped + 1) c.surplus += d - skipped - 1;
-			if(!d) ++c.zeroDelta;
-			if(bankWrite)
+		const auto d = c.dsp->getInstructionCounter() - before;
+		c.executed += d ? d : 1;
+		if(d > skipped + 1) c.surplus += d - skipped - 1;
+		if(!d) ++c.zeroDelta;
+		if(bankWrite)
+		{
+			c.bankWriteAt = c.executed;
+			{ const int sel = m_sel; m_sel = i; note("bank", c.hdi().txData().size()); m_sel = sel; }
+			if(m_hostWordHook(0))
+				m_hostWordFired = true;
+		}
+		if(m_instrumented && m_traceEvery && c.executed >= c.nextTrace && c.executed >= m_traceFrom && m_trace.size() < 100000)
+			traceLine(c, i, pc);
+		return true;
+	}
+
+	// -- the cold parts of the step (O16b) -----------------------------------
+
+	bool DspPair::faultPc(Core& c, const uint32_t _pc, const double _limit)
+	{
+		c.faulted = true;
+		char msg[96];
+		std::snprintf(msg, sizeof msg, "PC %#x is outside P memory (%#x words)", _pc, g_pSize);
+		c.why = msg;
+		c.executed = static_cast<uint64_t>(_limit);
+		return false;
+	}
+
+	void DspPair::timerCapture(Core& c)
+	{
+		c.timerEnabledAt = c.executed;
+		c.timerTcsr = c.px->getTimers().readTCSR(0);
+		for(int k = 0; k < 8; ++k)
+		{
+			c.timerPcs[k] = c.pcRing[(c.pcRingPos + 64 - 1 - static_cast<uint64_t>(k)) % 64];
+			c.timerR[k] = c.dsp->regs().r[k].var & 0xffffff;
+			c.timerM[k] = c.dsp->regs().m[k].var & 0xffffff;
+		}
+	}
+
+	// The stopwatch and the PC watch, in that order, before the instruction.
+	void DspPair::instrumentBefore(Core& c, const int i, const uint32_t pc)
+	{
+		if(m_sw.core == i)
+		{
+			if(pc == m_sw.start) { m_sw.t0 = c.executed; m_sw.armed = true; }
+			else if(pc == m_sw.stop && m_sw.armed)
 			{
-				c.bankWriteAt = c.executed;
-				{ const int sel = m_sel; m_sel = i; note("bank", c.hdi().txData().size()); m_sel = sel; }
-				if(m_hostWordHook(0))
-					m_hostWordFired = true;
+				const uint64_t d = c.executed - m_sw.t0;
+				m_sw.armed = false; ++m_sw.n; m_sw.sum += d; if(d > m_sw.max) m_sw.max = d; if(d < m_sw.min) m_sw.min = d;
+				if(m_sw.last.size() < 4096) m_sw.last.push_back(static_cast<uint32_t>(d));
 			}
-			if(m_traceEvery && c.executed >= c.nextTrace && c.executed >= m_traceFrom && m_trace.size() < 100000)
-			{
-				char line[256];
-				std::snprintf(line, sizeof line,
-					"core %d exec %llu dspctr %llu pc %06x sr %06x sp %02x mode %d pending %d periph-target %llu esai in %llu out %llu SAISR %06x RCR %06x TCR %06x HSR %06x HCR %06x DCR2 %06x DCO2 %06x DSR2 %06x DSR3 %06x DDR3 %06x DCO3 %06x DCR3 %06x DDR0 %06x DCO0 %06x DCR0 %06x DSR1 %06x DCO1 %06x DCR1 %06x",
-					i, static_cast<unsigned long long>(c.executed),
-					static_cast<unsigned long long>(c.dsp->getInstructionCounter()), pc,
-					c.dsp->regs().sr.var & 0xffffff, c.dsp->regs().sp.var & 0xff,
-					static_cast<int>(c.dsp->getProcessingMode()), c.dsp->hasPendingInterrupts() ? 1 : 0,
-					static_cast<unsigned long long>(c.px->getTargetClock()),
-					static_cast<unsigned long long>(c.rxFrames), static_cast<unsigned long long>(c.txFrames),
-					c.px->read(0xffffb3, dsp56k::Nop), c.px->read(0xffffb7, dsp56k::Nop), c.px->read(0xffffb5, dsp56k::Nop),
-					c.hdi().readStatusRegister(), c.hdi().readControlRegister(),
-					c.px->read(0xffffe4, dsp56k::Nop), c.px->read(0xffffe5, dsp56k::Nop),
-					c.px->read(0xffffe7, dsp56k::Nop), c.px->read(0xffffe3, dsp56k::Nop),
-					c.px->read(0xffffe2, dsp56k::Nop), c.px->read(0xffffe1, dsp56k::Nop), c.px->read(0xffffe0, dsp56k::Nop),
-					c.px->read(0xffffee, dsp56k::Nop), c.px->read(0xffffed, dsp56k::Nop), c.px->read(0xffffec, dsp56k::Nop),
-					c.px->read(0xffffeb, dsp56k::Nop), c.px->read(0xffffe9, dsp56k::Nop), c.px->read(0xffffe8, dsp56k::Nop));
-				m_trace.emplace_back(line);
-				c.nextTrace = (c.executed / m_traceEvery + 1) * m_traceEvery;
-			}
-				return true;
+		}
+		if(m_pcWatchOn && i == m_pcWatchCore && pc == m_pcWatchPc && c.executed >= m_pcWatchFrom && !(m_pcWatchFrom && m_pcWatchHits.size() >= 24))
+		{
+			const auto& r = c.dsp->regs();
+			if(m_pcWatchHits.size() >= 24)
+				m_pcWatchHits.erase(m_pcWatchHits.begin());
+			m_pcWatchHits.push_back({c.executed,
+				static_cast<uint32_t>((r.a.var >> 24) & 0xffffff), static_cast<uint32_t>(r.a.var & 0xffffff),
+				static_cast<uint32_t>((r.b.var >> 24) & 0xffffff), static_cast<uint32_t>(r.b.var & 0xffffff),
+				static_cast<uint32_t>(r.x.var & 0xffffff), static_cast<uint32_t>((r.x.var >> 24) & 0xffffff),
+				static_cast<uint32_t>(r.y.var & 0xffffff), static_cast<uint32_t>((r.y.var >> 24) & 0xffffff),
+				static_cast<uint32_t>(r.r[0].var & 0xffffff), static_cast<uint32_t>(r.r[4].var & 0xffffff),
+				static_cast<uint32_t>(r.r[6].var & 0xffffff), static_cast<uint32_t>(r.n[4].var & 0xffffff),
+				static_cast<uint32_t>(r.sp.var & 0xff), static_cast<uint32_t>(r.r[2].var & 0xffffff), static_cast<uint32_t>(r.m[2].var & 0xffffff),
+				static_cast<uint32_t>(r.r[1].var & 0xffffff), static_cast<uint32_t>(r.n[1].var & 0xffffff),
+				static_cast<uint32_t>(r.r[7].var & 0xffffff)});
+		}
+	}
+
+	void DspPair::traceLine(Core& c, const int i, const uint32_t pc)
+	{
+		char line[256];
+		std::snprintf(line, sizeof line,
+			"core %d exec %llu dspctr %llu pc %06x sr %06x sp %02x mode %d pending %d periph-target %llu esai in %llu out %llu SAISR %06x RCR %06x TCR %06x HSR %06x HCR %06x DCR2 %06x DCO2 %06x DSR2 %06x DSR3 %06x DDR3 %06x DCO3 %06x DCR3 %06x DDR0 %06x DCO0 %06x DCR0 %06x DSR1 %06x DCO1 %06x DCR1 %06x",
+			i, static_cast<unsigned long long>(c.executed),
+			static_cast<unsigned long long>(c.dsp->getInstructionCounter()), pc,
+			c.dsp->regs().sr.var & 0xffffff, c.dsp->regs().sp.var & 0xff,
+			static_cast<int>(c.dsp->getProcessingMode()), c.dsp->hasPendingInterrupts() ? 1 : 0,
+			static_cast<unsigned long long>(c.px->getTargetClock()),
+			static_cast<unsigned long long>(c.rxFrames), static_cast<unsigned long long>(c.txFrames),
+			c.px->read(0xffffb3, dsp56k::Nop), c.px->read(0xffffb7, dsp56k::Nop), c.px->read(0xffffb5, dsp56k::Nop),
+			c.hdi().readStatusRegister(), c.hdi().readControlRegister(),
+			c.px->read(0xffffe4, dsp56k::Nop), c.px->read(0xffffe5, dsp56k::Nop),
+			c.px->read(0xffffe7, dsp56k::Nop), c.px->read(0xffffe3, dsp56k::Nop),
+			c.px->read(0xffffe2, dsp56k::Nop), c.px->read(0xffffe1, dsp56k::Nop), c.px->read(0xffffe0, dsp56k::Nop),
+			c.px->read(0xffffee, dsp56k::Nop), c.px->read(0xffffed, dsp56k::Nop), c.px->read(0xffffec, dsp56k::Nop),
+			c.px->read(0xffffeb, dsp56k::Nop), c.px->read(0xffffe9, dsp56k::Nop), c.px->read(0xffffe8, dsp56k::Nop));
+		m_trace.emplace_back(line);
+		c.nextTrace = (c.executed / m_traceEvery + 1) * m_traceEvery;
 	}
 
 	void DspPair::runDue()
 	{
 		// Round-robin in quanta of g_quantum instructions until both cores
-		// are at the due count.
-		bool ran = true;
-		while(ran)
+		// are at the due count. O16b: the same passes in the same order --
+		// core 0 to its quantum, core 1 to its, again until a pass runs
+		// nothing -- without the calls that could not run anything: a core
+		// already at the due count is skipped on a compare (stepCore would
+		// have returned false at once; only a FAULTED core has a side effect
+		// there, its `executed = limit`, so that call is kept), and a live
+		// core is stepped through stepBody with the limit test inline.
+		const double due = m_due;
+		++m_stats.runDue;
+		for(;;)
 		{
-			ran = false;
+			bool ran = false;
+			++m_stats.passes;
 			for(int i = 0; i < 2; ++i)
 			{
-				const double lim = std::min(m_due, static_cast<double>(m_cores[i]->executed) + g_quantum);
-				while(stepCore(i, lim))
+				Core& c = *m_cores[i];
+				if(!c.faulted && static_cast<double>(c.executed) >= due)
+					continue;
+				const double lim = std::min(due, static_cast<double>(c.executed) + g_quantum);
+				if(c.faulted || !c.boot->finished())
+				{
+					// One call, returns false: the held / faulted core's executed := limit.
+					while(stepCore(i, lim))
+						ran = true;
+					continue;
+				}
+				while(static_cast<double>(c.executed) < lim)
+				{
+					if(!stepBody(c, i, lim))	// false only on a fault, which set executed := limit
+						break;
 					ran = true;
+				}
 			}
+			if(!ran)
+				break;
 		}
 	}
 

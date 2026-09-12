@@ -4441,3 +4441,144 @@ tolerance (a first version fired on every shift inside digital silence).
   the Phase B steps that add threads must prove those separately (a
   `-fsanitize=thread` Debug build through `drive.py`, a measured quit/EOF/
   SIGTERM).
+
+## Milestone O16b — the DSP step, exact: the pair's per-instruction wrapper trimmed without moving a single interpreted instruction ✅ (12 Sep 2026, branch `panel-ui`)
+
+Phase B's step B1 (proposal E1 of `out/_agents/speed-plan/REPORTS.md`,
+prototyped as `out/_agents/speed-dsp/build1`): the part of the pair's cost
+that is NOT the interpreter's work, taken out where it can be taken out
+without changing the order or count of interpreted instructions, the ESAI
+clock, a host-port event or a hook. Held to the STRICT gate (0 tolerance,
+both references) because it changes no schedule. `dsp.cpp`, `dsp.h` only.
+
+### What the wrapper cost, measured before the change
+
+With `tickInstructions(1)` per ColdFire instruction, `m_due` grows by 1.043
+per call and `runDue`'s quantum (64) is never reached in the RTOS phase:
+each tick was one `runDue` and ~6 `stepCore` calls of which 2 executed an
+instruction and 4 returned `false` on their first test (core at the due
+count) -- and every one of those calls paid the prologue of a function that
+also held a 256-byte trace line, a 24-hit PC-watch record, the TIMER0
+capture and the fault message. On the O14k render command cut to 300 frames
+(6.45 emulated s from the boot: `OT_DSP_STATS=1`, `stat-build.err`):
+799.4 M `runDue` calls made 1,231.4 M passes and 859.0 M interpreter steps
+(435.1 M core 0, 423.8 M core 1) -- i.e. the shipped code made 3.32 G
+`stepCore` calls for 0.86 G instructions (one returning `false` per core
+per pass, 2,462.8 M, plus one per instruction). **831.8 M of the 859.0 M steps
+(96.8 %) are idle steps**: a poll executed after an `idleStep` whose room
+was 1 or 2 instructions (core 0 95.3 %, core 1 98.4 %). Under the exact
+schedule that is the shape of the work: the fast-forward advances by the
+room the due count gives it, and that room is what the ColdFire's tick is.
+
+### What changed (`dsp.cpp`, `dsp.h`)
+
+- **`runDue` skips a core that is already at the due count** on a compare
+  (`!c.faulted && executed >= due`): `stepCore` would have returned `false`
+  at once with no side effect. A FAULTED core keeps its call, because that
+  call has one (`executed := limit`; O8's fault path); a core still in the
+  bootstrap ROM is skipped only when at the due count, where its
+  `max(executed, limit)` is a no-op. Same passes, same order (core 0 to its
+  quantum, core 1 to its, again until a pass runs nothing).
+- **The per-instruction body is `stepBody`** (stepCore minus its three
+  runnable checks), and `runDue` loops on it with the limit test inline:
+  `while(executed < lim) stepBody()`. The calls that only returned `false`
+  are gone; the count of bodies executed is the count of instructions
+  interpreted before (the `interp` counters, below, match the O9b
+  `executed` arithmetic call for call). `stepCore` itself is unchanged for
+  `runCoreUntil` (the read-back pull) and now delegates to `stepBody`.
+- **The cold parts are out of the body** as `noinline` helpers, in the same
+  places in the same order: `faultPc` (the message, `executed := limit`),
+  `timerCapture` (the TIMER0 first-enable record: the batch report prints
+  it, so the `readTCSR(0) & 1` test -- an inline load -- stays on every
+  instruction; only the capture moved), `instrumentBefore` (the stopwatch,
+  then the PC watch) and `traceLine`, the last two behind ONE flag
+  `m_instrumented` = trace armed or PC watch armed or stopwatch on core
+  0/1, refreshed by the setters. The PC ring stays on every instruction
+  (the fault report's "last PCs", the write watch's `last[4]` and the
+  timer capture read it).
+- **`doLoopEnd` is called only with SR_LF set** (`regs().sr & 0x8000`):
+  its own first test is `sr_test_noCache(SR_LF)` and it returns `false`
+  without touching a register otherwise, so the gate is exact.
+- **Counters** (`DspPair::Stats`: `runDue` calls, passes, `stepCore`
+  wrapper calls, interpreter steps and idle steps per core; one add each,
+  always on) and an opt-in dump on stderr at exit: `OT_DSP_STATS=1`. No
+  new command, nothing on stdout, nothing without the variable.
+- NOT changed: the double `m_due` arithmetic (the prototype's integer
+  version moved the idle horizon: `idle=` 63749 → 63755), `room`
+  (`limit - executed`, the same limit), the idle-window detection, the
+  bank-word hook, `tickInstructions`/`tickSamples`, `runCoreUntil`, every
+  hook and every report line.
+
+### Measured (12 Sep 2026, the same M5 Mac, macOS 26.5, with another agent's Python at ~99 % of a core throughout; logs under `out/_agents/speed-b1/`)
+
+**The strict gate (0 tolerance, `tools/emu/ot_emu/oracle/oracle.sh`, no
+tolerance flag, `--build-dir` for the ctest half; reports under
+`out/_oracle/reports/`):**
+
+| check | result | report |
+|---|---|---|
+| B1 (`build/ot_emu`, plain LTO, sha `372b19b0a8b8`) vs `ref-1e76ac5`, strict | **28 PASS, 0 FAIL** (ctest 7/7), 50 s | `20260912-133355-b1-vs-1e76ac5` |
+| the same vs `ref-73c2815`, strict | **28 PASS, 0 FAIL**, 3 s (the candidate's runs cached) | `20260912-133445-b1-vs-73c2815` |
+| `idle=` in the four `status` replies (stripped by the oracle; the prototype's integer due arithmetic had moved it) | 42022 / 42023 / 54842 / 66357 on both sides (`out/_oracle/runs/{3c7d2111891c,372b19b0a8b8}/{inter,interdsp}/wall.txt`) | – |
+| the render command cut to 300 frames, HEAD build vs B1 (`stat-*.log`, `stat-*_core0.wav`) | WAV byte-identical (284,261 frames), log identical bar the output path | – |
+| B1 vs itself (the oracle's determinism rerun into `runs/<sha>-b/`) | **27 PASS, 0 FAIL**, 44 s (no `--build-dir`: no ctest row); `20260912-134318-b1-determinism` | – |
+| B1's PGO build (`build-pgo`, `pgo.sh --dest/--gen/--prof` under `speed-b1/`) vs `ref-73c2815`, strict, no ctest | **27 PASS, 0 FAIL**, 41 s; `20260912-135047-b1-pgo-vs-73c2815` | – |
+
+
+**Speed (`out/_agents/speed/bench.py`: boot on the OTLIVE card, PLAY,
+4 emulated s in 16 x `run 250`; emulated ms per wall s, wall of the 16 runs
+in brackets; HEAD and B1 alternated round by round so both saw the same
+load; HEAD = `git archive HEAD tools/emu/ot_emu` built in `build-head/` with
+the default configure = Release + LTO, B1 = `build/` the same way):**
+
+| round | HEAD `--dsp` | B1 `--dsp` | HEAD no `--dsp` | B1 no `--dsp` |
+|---|---|---|---|---|
+| r1 | 151 (26.53 s) | **170** (23.55 s) | 1432 | 1362 |
+| r2 | 153 (26.08 s) | **170** (23.58 s) | 1451 | 1483 |
+| r3 | 152 (26.30 s) | **168** (23.77 s) | 1388 | 1380 |
+| mean | 152.0 | **169.3 (+11.4 %)**; wall 26.30 → 23.63 s (−10.2 %) | 1424 | 1408 (noise: the pair is not constructed without `--dsp`) |
+| boot to `ready`, `--dsp` | 23.5 / 22.7 / 22.9 s | **19.2 / 19.3 / 19.2 s (−16 %)** | – | – |
+| PGO, alternated: `ref-73c2815` (= HEAD's `pgo.sh` binary) vs B1 through `pgo.sh --dest/--gen/--prof` under `speed-b1/` (its own training runs) | `ref-73c2815` 173 (23.17 s) / 172 (23.20 s) / 174 (22.98 s) / 174 (22.92 s), mean 173.2 | B1 `build-pgo` **178** (22.49 s) / **179** (22.30 s), mean **178.5 (+3.0 %)**; wall 23.07 → 22.39 s | – | – |
+
+The 300-frame render above, run while the oracle's eight jobs loaded the
+machine: 26.83 → 22.23 s of wall (−17 %; the boot and the idle-heavy
+pre-roll are where the wrapper was the largest share).
+
+
+**Where the time went (bench.py's 10 s `sample` mid-play, round 2,
+`b1_build-head_dsp_r2.sample.txt` / `b1_build_dsp_r2.sample.txt`,
+`out/_agents/speed-dsp/agg.py`; self time as a share of the same 10 wall
+seconds, which on B1 cover 11 % more emulated time):** HEAD `stepCore`
+35.9 % + `runDue` 1.2 % = **37.1 %**; B1 `stepBody` 23.7 % + `runDue` 7.8 %
+= **31.5 %** — the wrapper's self samples fell 2,881 → 2,441 (−15 %) while
+the interpreter's own rose as a share (`op_Parallel` 3.9 → 4.5 %,
+`alu_multiply` 3.6 → 3.7 %, `op_Mac_S1S2` 1.3 → 1.9 %), which is the work
+that was waiting behind it. Inclusive, `runDue` is 67.7 % on both. What is
+left in `stepBody`'s self time is the interpreter's dispatch inlined into
+it (`m_interruptFunc`, `fetchPC`, the `execOp` member call), the idle path
+(`idleStep`, 96.8 % of the steps) and the four compares per tick — all per
+instruction whatever wraps them.
+
+
+### What it does not do
+
+- The `--dsp-trace` line keeps its 256-byte buffer (`traceLine`; clang
+  warns the format can reach 311): the truncation is O9b's and the trace
+  output must not change here.
+- It does not touch the interleave, so it does not touch the ceiling: the
+  pair still executes every idle poll the exact schedule gives it, 831.8 M
+  idle steps for 27 M of real work on the render fixture. That is E2/E3's
+  ground (the lazy batch / the thread), under the Phase B audio tolerance.
+- The gain is what the wrapper had to give under exactness, not the
+  investigation's 10-15 % estimate: **+11.4 % on the plain-LTO build,
+  +3.0 % on the PGO build** (the operator's binary, `out/emu/ot_emu` via
+  `pgo.sh`), because PGO had already inlined `stepCore` into `runDue` and
+  made the returning-false calls cheap; the architect's +2.6 % on the
+  prototype was that figure. The interpreter's own dispatch
+  (`m_interruptFunc`, `fetchPC`, `execOp`) and the ESAI clock are per
+  instruction whatever wraps them.
+- `OT_DSP_STATS` prints at destruction: a run that ends through
+  `std::exit` or a signal prints nothing. Batch and `--interactive quit`
+  both destroy the pair.
+- No thread, no new flag, no CLI change: batch mode and every script that
+  drives `ot_emu` see the same bytes (the 28 checks, twice).
