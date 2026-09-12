@@ -76,12 +76,25 @@ against the same text): `run <ms>`, `key <row> <mask>`, `knob <row>
 back per command. The child boots and loads the project itself
 (`--card --mount --set --project`, the card image being `stage_project`'s
 own bytes written to `out/_panel_card_<port>.img`); the server then sends
-the same YES and pumps `run 25` + `tx` into `panel_link`. Measured 12 Sep
-2026 on the OTLIVE fixture: MIXER, T3, knob A (PTCH on the PLAYBACK page)
-and PLAY all work through the matrix; playing, the bar indicator under the
-BPM advances every 501 ms emulated = 1.45 s wall (350 emulated ms per wall
-s, ~2.9× slower than real time; idle reads ~100 000 because idle time is
-skipped); STOP takes the frame clock off and the speed goes back to idle.
+the same YES and **the child paces itself** (`pace on`, O15f in
+`COLDFIRE_PORT.md`, 12 Sep 2026): while its stdin is empty it advances
+emulated time in 10 ms slices so that it tracks its own wall clock —
+sleeping inside `poll()` on stdin when ahead (a command wakes it at
+once), flat out when the core is slower than real time, re-anchoring past
+250 ms of lag — and the server's emu thread only serves the clicks and,
+every 20 ms, drains `tx` and audio, reads `pacestatus` and renders. So
+the unit runs at **1.00x real time** whenever the core can (idle always,
+and playing without the DSP cores on the M5: 999.7 emulated ms per wall
+s over 30 s of play, `rt` 0.998–1.003), and at the core's own rate when
+it cannot (playing with the cores: ~0.15x). Measured 12 Sep 2026 on the
+OTLIVE fixture: MIXER, T3, knob A (PTCH on the PLAYBACK page) and PLAY
+all work through the matrix; a page click reaches the firmware within
+one slice (`/key` round trip 4 ms idle); STOP takes the frame clock off.
+Before O15f the server pumped `run 25` + a 30 ms sleep (0.69x idle
+without the cores, 1.02x in bursts of 0.85–2.0x with them) and slowed
+that pump for 0.5 s after a track key so a page double-click could land
+(`SLOW_PUMP_MS`, gone: the double-tap window is a wall-time property
+now, see "Loading samples"). Route A keeps the pump.
 A child that answers nothing for 20 s (`ACTION_LIMIT`) is killed by the
 watchdog and respawned — boot, load and YES again, `restarts` counts it in
 `/status` — as is one that exits. `--port-bin` names another binary (a
@@ -114,7 +127,7 @@ beside it), is a good PR — it is pure discovery, no firmware bytes.
 |---|---|
 | `GET /screen.png` | current LCD as a 128×64 PNG |
 | `GET /screen.txt` | the same frame as 64 lines of 128 `#` (dark) / `.` — for agents that grep |
-| `GET /status` | `{booted, seq, ran_ms, fault, image, phase, backend, backend_note, speed, restarts, card_busy}` — `seq` bumps on any screen change; `speed` is emulated ms per wall s over the last 5 s of runs; `card_busy` while a `/samples/commit` reboots (`booted` is false through any reboot, respawn or re-insert) |
+| `GET /status` | `{booted, seq, ran_ms, fault, image, phase, backend, backend_note, speed, rt, pace, restarts, card_busy}` — `seq` bumps on any screen change; **`rt`** is x real time by the wall clock (emulated ms per wall s over the last second / 1000: 1.0 = the unit's own clock; null under route A and before the pacer is up); `speed` is the older meter, emulated ms per wall second *inside the emulation* over the last 5 s — idle slices are instant, so it reads high (thousands) idle and only approaches `rt × 1000` while playing; kept for scripts; `pace` is the child's last `pacestatus` (`on, rate, ratio, lag_ms, slices, reanchors, slept_s, busy_s, stop`); `card_busy` while a `/samples/commit` reboots (`booted` is false through any reboot, respawn or re-insert) |
 | `GET /key?row=0x26&bit=0&down=1` | one matrix key edge |
 | `GET /tap?row=0x22&bit=0&n=2&hold=50&gap=150` | `n` presses of one key inside one action (the double-tap chords, see "Loading samples") |
 | `GET /knob?row=0x30&delta=2` | one encoder report (rows 0x30–0x36, signed delta) |
@@ -173,7 +186,7 @@ shots `r*` `s*` `t*` `u*`; re-run after the fixes in
 
 | step | keys | screen |
 |---|---|---|
-| open the slot list of a track | the **track key twice** — a double-click on T1–T8 in the page, or `/tap?row=0x22&bit=<t-1>&n=2` (one action, 200 ms press to press) from a script. Two `/key` taps land because the server slows its idle pump for 0.5 s after a track key is released (`SLOW_PUMP_MS`): taps 0.15 and 0.30 s of wall apart opened it, 0.45 s did not (12 Sep 2026); before that, taps 0.2 s apart reached the firmware 375 emulated ms press to press and missed | `<< MACHINE:STATIC` (or `FLEX`, the track's machine — the OTLIVE fixture boots with T5 current, T1–T4 STATIC, T5 FLEX), `SLOT / BPM / SIZE`, the track's slot highlighted |
+| open the slot list of a track | the **track key twice** — a double-click on T1–T8 in the page, or `/tap?row=0x22&bit=<t-1>&n=2` (one action, 200 ms press to press) from a script. Two `/key` taps land by wall time now that the child is paced (O15f): 0.15 s of wall apart = 150–154 emulated ms press to press, the list opens; 0.30 s = 290–304 ms, it does not (12 Sep 2026, with and without the DSP cores) — the unit's own window, between 191 and 242 emulated ms. Before that the server slowed its idle pump for 0.5 s after a track key (`SLOW_PUMP_MS`, gone) so 0.45 s of wall reached the firmware as 191 ms | `<< MACHINE:STATIC` (or `FLEX`, the track's machine — the OTLIVE fixture boots with T5 current, T1–T4 STATIC, T5 FLEX), `SLOT / BPM / SIZE`, the track's slot highlighted |
 | pick a slot | DOWN `0x24.0` / UP `0x26.3` | |
 | open the file browser on it | RIGHT `0x24.1` (YES `0x26.1` does the same) | `LOAD FILE TO STATIC 5`, folder `OTLIVE>AUDIO`, the files in name order, the cursor where it was last; the footer reads the highlighted file's header (`44.1k 16b 2Ch`) |
 | find the file | DOWN / UP (no wrap; the list is in name order, `extra-1` … `extra-32` numerically, and starts at the top after a boot: 35 taps from `extra-1.wav` to the first file after `fourth-0.wav`) | `clap.aiff`, `sine48k24.wav`, `Upload Sine 48k.wav` were all listed with their 0.33 MB; an unconverted extensible WAV reads `44.1k 16b 2Ch` (16-bit) / `44.1k 24b 2Ch` (24-bit) in the footer |
@@ -196,12 +209,24 @@ With the port backend the server starts the child with `--dsp` by default
 render, and core 0's **main L/R** — the words the ESAI puts out to the
 DAC, 16-bit (the 24-bit word's top two bytes), 44100 Hz — comes over the
 `--interactive` pipe (`audio start main` / `audio read`, O14k in
-`COLDFIRE_PORT.md`). Cue and core 1 are not captured. What `--dsp` costs:
-boot + fixture load ~50–60 s instead of ~40, and while the sequencer plays
-the emulator runs ~9x slower than real time (100–110 emulated ms per wall
-s, measured 12 Sep 2026, against ~350 without the cores); idle, the child
-still renders (silence) but skips its idle time, ~2000–2700 emulated ms
-per wall s.
+`COLDFIRE_PORT.md`). Cue and core 1 are not captured.
+
+**Priority matters more than you would think** (O15f, 12 Sep 2026): a
+server started as a zsh background job (`… &`) runs at nice 5 (`BG_NICE`
+is on by default) — harmless on an idle machine, slower whenever anything
+else wants the CPU; `/status nice` reports it and the server warns at
+start. The darwin *background* class (`taskpolicy -b`, what a
+background-QoS or napped app hands its children: efficiency cores) is
+3.5–3.7x slower; the server spawns the child with a `preexec_fn` that
+leaves that class (`setpriority(PRIO_DARWIN_PROCESS, 0, 0)`), measured
+back at full speed under `taskpolicy -b`. What `--dsp` costs
+(12 Sep 2026, after the O15a–e speed work and O15f pacing): boot +
+fixture load ~25 s instead of ~6, and while the sequencer plays the unit
+runs at the cores' rate, ~0.15x real time (`/status rt`; 151 emulated ms
+per wall s on the M5 against 1.00x without the cores, whose core alone
+would do ~1.4x); idle it is paced to 1.00x like everything else, at ~30 %
+of a core (the cores render silence through every idle slice; ~4 %
+without them).
 
 The server drains the child's ring after every pump (25 ms of firmware)
 and every action into a ring of its own — the last **180 s**, addressed
@@ -234,11 +259,12 @@ with 0 frames at the PLAY key and the first sound is at frame 81 (1.8 ms
 after it, the pattern's saved trig on step 1); a take of 2.65 emulated s
 took 25.8 s of wall.
 
-**The honest playback note.** Nothing here paces the unit to wall time:
-while it plays, the child renders ~9x slower than real time, so anyone
-*listening* live is behind, and in bursts — the page's MONITOR plays
-what has arrived and waits when it runs dry; a replayed take plays at
-real time. Two more things the fixture taught: `/audio/status peak` at
+**The honest playback note.** The pacer (O15f) holds the unit at 1.00x
+only when the core keeps up; with the DSP cores it plays at ~0.15x real
+time (the toolbar badge beside the phase shows the live figure, green at
+>= 0.97x, yellow below), so anyone *listening* live is behind, and in
+bursts — the page's MONITOR plays what has arrived and waits when it
+runs dry; a replayed take plays at real time. Two more things the fixture taught: `/audio/status peak` at
 32767 means the DSP itself is clipping (the fixture's slots 1 and 2 loop
 `first-0`/`second-0` at GAIN 75/72 from step 1 — the spike's `tree2`
 copy, `out/_agents/audio/tree2`, has them at 48 with looping off, which

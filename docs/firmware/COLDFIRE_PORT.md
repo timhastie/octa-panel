@@ -4038,3 +4038,291 @@ batch under `OT_BURST=0` byte-identical to both.
   business, not this step's.
 - Nothing paces anything (plan step 7); the plan's step 5 (`m68k_execute
   (N)` with an instruction hook) stays in reserve.
+
+## Milestone O15f — real-time pacing: the child tracks its wall clock, 1.00x whenever the core keeps up, opt-in, bit for bit ✅ (12 Sep 2026, branch `panel-ui`)
+
+Step 6 of this run of the speed plan (the architect's step 7); `main.cpp`
+(`serveInteractive` only), `tools/panel/panel_server.py`,
+`tools/panel/panel.html`, `tools/panel/README.md`; no change to the run
+loop, the batch, the vendored cores or any existing command. O15a–e made
+the ColdFire side faster than the unit (1.4x real time playing without
+the DSP cores on the M5) but nothing held it *at* the unit's rate: the
+panel server pumped `run 25` and slept 30 ms, which macOS stretched to
+33.9, so idle the firmware's clocks ran at 0.69x without the cores and,
+with them, at 1.02x in bursts of 0.85–2.0x (the 10 ms `run 25` skipped
+the sleep on 58 % of pumps); playing, at whatever the core did. The
+double-tap chord (a track key twice opens its sample slot list; the
+firmware measures the gap in ITS time, window between 191 and 242
+emulated ms) only landed from the page because the server slowed its
+pump for 0.5 s after a track key (`SLOW_PUMP_MS`), compressing 0.45 s of
+wall into 191 emulated ms. The pacing investigation
+(`out/_agents/speed-pacing/`, `REPORTS.md` "pacing") measured all of that
+and prototyped both a server-side and a child-side pacer; this milestone
+lands the child-side one the plan prefers, with the commands interleaved.
+
+### What changed (`main.cpp`: three commands and one argument, all opt-in)
+
+- **`pace on [rate]` / `pace off`.** While `pace` is on and no command
+  line is pending on stdin, `serveInteractive` free-runs: it takes an
+  anchor (wall time, emulated ms) at `pace on` and before every step
+  compares the lead = emulated − (anchor + wall elapsed × rate). A slice
+  (10 ms) or more ahead, it sleeps the excess, capped at one slice,
+  **inside `poll()` on stdin** so a command wakes it at once (the first
+  cut of the prototype used `sleep_for` and every command waited up to a
+  slice: 13.7 ms median key round trip against 0.09). Otherwise it runs
+  `_rtos.run(10, false)` — the ordinary run loop, idle skip and bursts
+  included, so idle a slice is a handful of idle skips and playing it
+  costs what the core costs; a core faster than real time builds a lead
+  and sleeps it off, a slower one never leads and runs flat out. More
+  than 250 ms behind (a slower core, a long command) it re-anchors and
+  counts it, so the lag never turns into a catch-up burst later. A
+  pending line is served between slices, one reply per command, exactly
+  as unpaced; a `run` from the client advances on top of the pacer (the
+  pacer then waits for the wall clock). A slice that stops on
+  fault/illegal ends the free run; `pacestatus stop=` says so and the
+  next `run` answers as it always did. `pace on` re-anchors; `rate` is
+  emulated seconds per wall second (0.5 = half speed; 1.0 default).
+- **A 1 ms grace after every reply.** A client sends its commands in
+  rounds (the panel's `tx`, `audio read`, `pacestatus`, ~100 µs apart),
+  and a slice begun in that gap made every command of the round wait for
+  a slice — four slices, 231 ms, per page click while playing with the
+  cores. After a reply the loop polls stdin for 1 ms before the next
+  slice, so a round goes through in one; at 1.0x the millisecond comes
+  out of the sleep, flat out it is under 1 % (a round per 200 ms).
+- **`pacestatus`** → `on= rate= ratio= lag= slices= reanchors= slept=
+  busy= stop= ms=`: `ratio` is emulated ms per wall s over the last
+  closed window of at least a second (commands served inside it included)
+  / 1000 — the honest "x real time"; `lag` how far emulated time is
+  behind its wall target now (0 when ahead); `slept` wall seconds inside
+  `poll()`, `busy` inside slices (also added to `status wall=`); `stop`
+  the last slice's Stop word; `ms` the emulated clock. Pending stdin is
+  detected through iostream's buffer, stdio's (`stdin->_r`: `cin` is
+  synced with stdio, whose FILE may hold a line `poll()` cannot see) and
+  `poll()`.
+- **`run <ms> wall <seconds>`.** The plain run, also ended when the wall
+  budget is spent: `Rtos::runUntil` with `Changes::OnEvent`, whose
+  condition is asked at every burst end and exact step, and the
+  condition reads the clock once per 4096 instructions
+  (`Machine::instructions()`; bursts average ~70 instructions, so a
+  `steady_clock` read per call would have cost ~5 %). Where the run ends
+  moves no firmware event (timers, frames and the panel UART advance by
+  sample count); `stop=wall` when the budget ended it, else the usual
+  word. `run <ms>` alone is the untouched path (`_rtos.run(ms, false)`),
+  and every old input — `run`, `run 10 20` — gets the old reply
+  byte-for-byte; only a `run <ms> wall ...` attempt (a four-word line
+  whose third word is `wall`) has the new usage text -- `run 10 x 1` is an
+  old input and keeps `err usage: run <ms>`.
+
+### What changed (`panel_server.py`, `panel.html`)
+
+- **`Panel._loop_paced`** replaces the pump for the port backend: after
+  the boot the loop sends `pace on 1` and from then on only serves
+  actions (a blocking `actions.get(timeout=0.02)`, so a click is served
+  the moment it arrives) and, every 20 ms when none is queued, `tx`, the
+  audio drain, `pacestatus` (which sets `rt.sample`, `ran_ms`, the
+  meters) and the render. A fresh child (respawn, card re-insert, sound
+  switch) is armed again when the loop sees a new `rt`; a child without
+  `pace` (an older `--port-bin`) makes `pace on` answer `err` and the
+  loop falls back to the old pump, with the reason in `backend_note`.
+  Route A keeps the pump loop, unchanged. `SLOW_PUMP_MS`/`slow_until`
+  are ignored under the pacer (the route A pump still uses them).
+- **An ordinary key edge does no `run` of its own** under the paced
+  child (`_key_act(run_ms=None)`): the pacer's next slice delivers it
+  within 10 ms of emulated time anyway, and the old 50 ms run cost the
+  click 50 emulated ms at the core's rate (40 ms of wall playing without
+  the cores, ~330 with them). PLAY down and STOP down keep their 50 ms so
+  the frame-mode switch and the take open/close still sit around a
+  processed key; `tap()` (hold/gap inside one action) and `transport()`
+  (down + up as one action) pass their runs explicitly, as before.
+- **`run_ms`** (the page's RUN 1s/5s, `/run`) passes the remaining wall
+  budget to each slice as `run <ms> wall <s>`, so a slice, not just the
+  loop, is bounded in wall time; `stop=wall` ends it like the budget did.
+- **`/status`** gains `rt` (x real time by the wall clock: emulated ms
+  per wall s over the last second of `pacestatus` readings / 1000 — the
+  `RtMeter`; null under route A and before the pacer is up) and `pace`
+  (the last `pacestatus`, as numbers). `speed` is kept with its old
+  meaning — emulated ms per wall second *inside* the emulation, fed from
+  the child's `busy` deltas — and still reads high idle (thousands: idle
+  slices are instant); scripts that want the honest figure read `rt`.
+  The sound note no longer claims "~9x slower".
+- **The page** shows `rt` as a tiny badge beside the phase (`1.00x`,
+  green at ≥ 0.97, yellow below, hidden while it is unknown), from the
+  same 350 ms status poll.
+
+### Measured (12 Sep 2026, the same M5 Mac, macOS 26.5, AppleClang 21.0.0; logs under `out/_agents/impl-6-pacing/`)
+
+Nothing else running (`pgrep -x ot_emu` empty before each series), every
+run started at nice 0 (see the QoS paragraph: a zsh `&` job is not). The
+candidate is `build/ot_emu` (sha `261ffec46498…`), this tree at the
+default configure; the reference `out/emu/ot_emu.ref-1e76ac5`.
+
+**The child alone** (`pace_child.py`: the OTLIVE card, `--rtc 1000000000`,
+YES on the dialog, then `pace on`; `pacestatus` once a wall second):
+
+| | no `--dsp` | `--dsp` |
+|---|---|---|
+| boot + load to `ready` | 5.8 s | 24.1 s |
+| idle, 20 s: emulated ms per wall s | **1000.5** (per second 990–1012; `ratio` 0.988–1.012) | **1000.2** (992–1007; 0.991–1.009) |
+| … slices / re-anchors / slept / busy | 1613 / 0 / 19.18 s / 0.89 s | 1617 / 0 / 13.74 s / 6.41 s |
+| … child CPU | 3.8 % | 29.7 % |
+| `key` down + `key` up round trip, idle | 0.24 ms median, 4.99 max | 2.64 ms, 8.31 max |
+| the same with a `run 50` after each, idle | 7.08 ms | 33.4 ms |
+| playing (frame on, PLAY), 20 s | **999.6** (994–1004; `ratio` 0.999–1.002, `lag` 0) | **151.0** flat out (137–164; 0.137–0.164; `lag` 57–284 ms, 70 re-anchors) |
+| … child CPU | 69.1 % | 100 % |
+| key round trip, playing | 2.3 ms median, 13.6 max | 103.1 ms, 146.5 max (before the grace poll) |
+| `run 250` vs `run 250 wall 100` (never hit), 8 pairs interleaved, playing | 177.0 vs 171.9 ms (−2.9 %: noise) | 1651.8 vs 1647.6 ms (−0.3 %) |
+| `run 250 wall 0.05` / `wall 0.02`, playing | 50.1 ms wall, 75.6 emulated ms, `stop=wall` / 20.1 ms, 30.9 | 50.6 ms, 8.44 / 20.4 ms, 3.34 |
+
+Idle, the pacer holds the unit's clock to ±1 % second by second with and
+without the cores (the acceptance: 1.00 ± 0.01) at 4 % of a core without
+them; playing without the cores it holds 1.00x too, because the O15a–e
+core is 1.4x real time and the pacer sleeps the difference (busy 16.7 of
+20 s); with the cores it is flat out at the core's own rate (bench.py on
+the same binary: 150–152) and says so. The wall predicate costs nothing
+measurable and a budget that is hit ends the run within 0.1–0.6 ms of it.
+The error paths answer `err usage` for `pace`, `pace maybe`, `pace on 0`,
+`pace on 1 2`, `pacestatus x`, `run 10 wall`, `run 10 wall -1`, `run 10
+wall x`; `run 10 x 1` gets the old `err usage: run <ms>` (the new text is keyed
+on the third word being `wall`, not on the word count; the verifier's
+`child_cmds.py` diff of every old input -- `run`, `run 10 20`, `run 10 x 1`,
+`run abc`, `run -1`, `status`, `tx`, `frame`, `key`, `quit x` -- against the
+reference is empty apart from the bare word `pace`, a new command;
+`out/_agents/impl-6-pacing-fix1/cmds_{cand,ref}.log`).
+
+**The panel server end to end** (`srv_measure.py`: `panel_server.py
+--port 8590/8591 --port-bin build/ot_emu`, the OTLIVE project, then
+`/status` once a wall second, 30 `/key` edges (MIXER), PLAY, STOP,
+`/run?ms=1000`, and the double tap by wall time; `srv_nodsp3` /
+`srv_dsp2`, the final code):
+
+| | `--sound off` | `--sound on` (`--dsp`) |
+|---|---|---|
+| boot to `phase ready` | 6.1 s | 24.2 s |
+| idle, 20 s: `ran_ms` per wall s | **1000.3** (964–1017); `/status rt` 0.991–1.008, median 0.999 | **1000.2** (978–1029); `rt` 0.992–1.008, median 1.000 |
+| … CPU child / server | 3.8 % / 0.5 % | 29.5 % / 0.4 % |
+| `/key` round trip, idle | **1.7 ms** median, p90 1.9, max 1.9 | **1.0 ms**, p90 3.5, max 3.8 |
+| playing, 30 s | **1000.2** (981–1019); `rt` 0.997–1.004, median 1.000; lag 0 | **149.5** (130–161); `rt` 0.133–0.161, median 0.148; lag ≤ 319 ms, 98 re-anchors |
+| … CPU child | 74.4 % | 97.8 % |
+| `/key` round trip, playing | **2.0 ms** median, p90 8.3, max 11.2 | **35.7 ms** median, p90 44.1, max 79.4 |
+| `/run?ms=1000`, idle | 1004 ms in 0.02 s | 1004 ms in 0.28 s |
+| two page clicks on T1, 0.15 s of wall apart (2 trials) | OPEN, 150 / 150 emulated ms press to press | OPEN, 150 / 150 |
+| … 0.30 s apart | miss, 300 / 311 | miss, 290 / 300 |
+| the take from PLAY to STOP | — | take-003.wav, 6.3 s, `dropped` 0 |
+
+Against the pump it replaces (the pacing report's measurements on the
+same fixture: idle 686 emulated ms per wall s without the cores, 1025 in
+bursts of 0.85–2.0x with them; `/key` 29.7 ms idle, 327 ms playing;
+double taps landing only through `SLOW_PUMP`): idle is now 1.000x either
+way, a click waits ~1–2 ms idle and about the slice in progress playing
+(2 ms at 1.0x, 36 ms with the cores at 0.15x, where a slice is ~65 ms of
+wall), and the double-tap window is the unit's own — 0.15 s of wall
+lands, 0.30 s does not, cores or no cores. Two intermediate runs are in
+the log dir for the record: `srv_nodsp` (the key's 50 ms run still in
+place: `/key` 40.2 ms median playing, 4.2 idle) and `srv_dsp` (before
+the grace poll: 230.7 ms median playing — four slices — with the same
+rates and the same double-tap result); `srv_nodsp2`/`srv_dsp` also ran
+at nice 5 by accident (a zsh `&` chain) with rates indistinguishable
+from the nice 0 runs.
+
+**Ratio to the reference, same session** (`bench.py`, the fixed `run
+250` protocol, pacing never on): no `--dsp` **1414 vs 221** emulated ms
+per wall s (6.4x; `ready` 5.4 vs 38.8 s), `--dsp` **150 vs 100** (1.5x;
+`ready` 23.5 vs 57.4 s) — the O15a–e rates; this step adds nothing to the
+fixed-run path and takes nothing from it (1423, 1341, 1414 across the
+session's three no-`--dsp` runs of the candidate).
+
+**The QoS question** (the speed-mem report's "backgrounded runs of a
+byte-identical binary differed by 1.5x"). Explained and measured: a job
+started with `&` in zsh runs at nice 5 (`BG_NICE`, on by default), which
+on an idle machine costs nothing (1357 vs 1341/1423 without the cores,
+151 vs 151/152 with) and under contention gives way — the 1.5x was
+another emulator on the machine. The class that does matter is the
+darwin background policy (`taskpolicy -b`: efficiency cores, throttled
+I/O — what a background-QoS or napped app and its children get):
+**385** emulated ms per wall s without the cores (boot 21.4 s) and **43**
+with them (boot 90.9 s), 3.7x / 3.5x slower. A process may leave that
+class itself — `setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_NORMAL)`
+in the child before `exec` (`bench.py` variant `OT_DARWIN_NORMAL=1` under
+`taskpolicy -b`): **1469**, boot 5.5 s — so `PortProc` now spawns the
+child with exactly that `preexec_fn` (a no-op when nothing is inherited;
+niceness cannot be lowered without privilege, so `/status` reports it as
+`nice` and the server prints a warning at start when it is > 0). The
+app-bundle half (`open -a` on a re-identified copy of `Virtual
+Panel.app`, bundle id `io.octabam.virtual-panel.qos-test`, port from
+`VIRTUAL_PANEL_PORT`, `projectDir` in its own defaults) could not be
+measured: the copy blocked in `Log.open` → `open()` on
+`out/panel_app.log` (`app_stuck.sample.txt`) — macOS's consent prompt for
+`~/Downloads`, which the new identifier triggers and only the user can
+answer; the launched app itself ran at nice 0, priority 46. The
+terminal-launched control on the same code path (`qos_terminal`, the
+pre-O15f binary through the fallback pump): 179.5 emulated ms per wall s
+playing with the cores.
+
+**The gate: 28 PASS, 0 FAIL** (`out/_agents/speed-oracle/reports/
+20260912-120131-impl6-pacing.txt`, copy `oracle1.txt`, 52 s wall): boot
+logs identical, `serial_a` 5731 / 9257 bytes identical, goldens 12,757 /
+26,367 bytes identical, `run3_core0.wav` 7,936,292 bytes identical, the
+UART A stream 18,297 / 18,309 bytes identical step by step, 109 peeks
+identical, 47 run stamps with max |dsample| = 0 and |dframes| = 0,
+`interdsp.pcm` 497,788 bytes identical, ctest 7 / 7 in `build`. Under
+the battery the candidate's jobs took `stock` 0.55 s (reference 2.33),
+`card` 6.07 s (44.08), `render` 31.6 s (74.2), `inter` boot 6.12 s +
+2.96 s of `run` (43.6 + 19.3), `interdsp` 23.5 s + 27.5 s (63.2 + 41.6)
+-- the O15e figures: the oracle never says `pace on` or `wall`, and the
+paths it drives did not change.
+
+**Verified (12 Sep 2026, the verifier's own build of the same tree, sha
+`089bd73fb869…`, byte-identical to the fixed binary; logs under
+`out/_agents/impl-6-pacing-verify1/`).** Oracle `--fresh`, both sides
+rerun: 28 PASS / 0 FAIL, 106 s wall; ctest 7 / 7. The old inputs answer
+byte-for-byte as the reference (`child_cmds.py`: only the bare word
+`pace`, a new command, differs). Same-session `bench.py`: **1473 vs 224**
+without the cores (6.6x; `ready` 5.4 vs 38.9 s), **155 vs 101** with
+(1.5x; 22.6 vs 56.9 s). The server end to end (`srv_verify.py`, ports
+8590/8591, the OTLIVE fixture, nice 0): idle 60 s **1000.2** emulated ms
+per wall s both with and without the cores (per second 979–1029 /
+976–1029; `/status rt` 0.990–1.014 / 0.991–1.009, median 0.999 / 1.000;
+0 re-anchors), child CPU 4.7 % / 30.5 %; playing 30 s **1000.2** without
+the cores (`rt` 0.996–1.003, lag 0) and **150.7** with them (`rt`
+0.136–0.164, median 0.150, 89 re-anchors, lag ≤ 279 ms), i.e. what
+`bench.py` measured on the same binary; `/key` round trip 1.66 / 0.98 ms
+idle, 1.72 / 24.2 ms playing; double taps 0.15 s of wall apart OPEN (150,
+163 / 150, 150 emulated ms press to press), 0.30 s miss (300, 300 / 315,
+300), twice each, `/tap n=2` opens; the take from PLAY to STOP recorded
+(take-005.wav, 8.74 s, `dropped` 0), `/audio/pcm` streamed +7553 frames
+per wall s while playing with the cores. **The LEDs in wall time**
+(`led_chase.py`: `/leds` polled ~250 times a second for 20 s of play,
+sound off): the running light enters trig row 1 (trigs 5–8) once per
+16-step sweep every **2000.2 ms** (10 crossings, stdev 15.7, min 1971.6,
+max 2021.3) = **125.01 ms per 16th** at the fixture's 120 BPM, and the id
+`0x48` LED blinks every **250.0 ms** (79 intervals, stdev 13.2) — the
+unit's tempo, on the wall clock; with the cores the same blink comes
+every 1646 ms (18 intervals) = 0.152x, as `rt` says. QoS reproduced:
+`taskpolicy -b` 381 emulated ms per wall s (boot 21.3 s) vs 1520 with
+the child's `setpriority` (boot 5.4 s); the server itself started under
+`taskpolicy -b` booted in 6.0 s and paced at 1.000x (its `preexec_fn`
+takes the child out of the class; the server process stays in it, so
+its own polling is slower — 11 `/leds` a second against ~250). `nice 5`
+on the idle machine: 1475.
+
+### What it does not do
+
+- It does not make the cores faster: with `--dsp` the pacer is a
+  reporter (0.15x, re-anchoring every ~0.3 s of wall) until the DSP work
+  in the plan lands; the "honest playback note" in the README stands.
+- Idle with `--dsp` costs ~30 % of a core: the cores render silence
+  through every idle slice (the DSP idle fast-forward the pacing report
+  hands to the core team, proposal E, is not done).
+- Nothing in the batch, the fixed `run`, the run loop or the vendored
+  cores changed: the oracle's 28 checks drive fixed runs and are
+  byte-identical; the pacer is off unless a client says `pace on`.
+- The app-bundle half of the QoS question could not be measured (see
+  Measured): a re-identified copy of the bundle hits a TCC consent
+  prompt for `~/Downloads` that only the user can answer.
+- A `run <ms> wall <s>` that ends on the budget is still one `run`: the
+  frames it advanced are what it advanced, and a script that relies on
+  `run` advancing exactly `<ms>` must not pass `wall`.
+- The `hits` record line is formatted into a 160-byte buffer and can be
+  cut short when every register is 8 hex digits (up to 215 bytes); a
+  pre-existing limit, left as it is because changing it would change an
+  existing command's output.

@@ -23,6 +23,10 @@
   #phase.ready { background:#1d3a22; color:#8fe39a; }
   #phase.busy { background:#3a3016; color:#f0c85a; }
   #phase.failed { background:#3f1a18; color:#ff8a80; }
+  /* x real time (/status rt, the port paced to its wall clock): green at >= 0.97, yellow below, hidden when unknown */
+  #rt { font-family:ui-monospace, Menlo, monospace; font-size:10px; padding:1px 5px; border-radius:9px; background:#2a2a2c; color:#f0c85a; }
+  #rt.ok { background:#1d3a22; color:#8fe39a; }
+  #rt:empty { display:none; }
   #fault { color:#ff8a80; font-size:10px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:30vw; }
   #bar button { background:#2c2c2e; color:#d8d5cc; border:1px solid #47474a; border-radius:4px;
                 padding:2px 9px; font-size:10px; cursor:pointer; letter-spacing:.04em; }
@@ -271,6 +275,7 @@
     <span class="brand">VIRTUAL PANEL</span>
     <span class="img" id="imginfo"></span>
     <span id="phase">…</span>
+    <span id="rt" title="x real time: emulated ms per wall s over the last second / 1000 (the unit's own clock = 1.00x)"></span>
     <span id="fault"></span>
     <button id="mapbtn" onclick="toggleMap()">MAP KEYS</button>
     <button id="poolbtn" onclick="togglePool()" title="the card's AUDIO folder (also: click the COMPACT FLASH slot)">AUDIO POOL</button>
@@ -1357,6 +1362,10 @@ async function poll() {
     const ph = $("#phase");
     ph.textContent = phase;
     ph.className = phase === "ready" ? "ready" : phase === "failed" ? "failed" : "busy";
+    // x real time, live (null under route A / while booting: the badge hides)
+    const rt = $("#rt");
+    rt.textContent = typeof s.rt === "number" && phase === "ready" ? s.rt.toFixed(2) + "x" : "";
+    rt.classList.toggle("ok", typeof s.rt === "number" && s.rt >= 0.97);
     if (s.fault !== lastFault) { lastFault = s.fault; $("#fault").textContent = s.fault ? "⚠ " + s.fault : ""; $("#fault").title = s.fault || ""; }
     const busy = phase !== "ready";
     $("#screen").classList.toggle("dim", busy);

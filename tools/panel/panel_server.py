@@ -205,6 +205,39 @@ class PortError(Exception):
     """The port answered `err <message>` (bad address, bad command)."""
 
 
+# macOS scheduling classes and the child (O15f, 12 Sep 2026). Measured with
+# bench.py on one binary, nothing else running: nice 5 (what zsh gives a job
+# started with `&`: BG_NICE is on by default -- the "backgrounded runs 1.5x
+# slower" of the speed-mem report) costs nothing on an idle machine (1357 vs
+# 1341-1423 emulated ms per wall s) and only shows under contention; the
+# DARWIN BACKGROUND class (`taskpolicy -b`, what a napped or background-QoS
+# app and its children get: efficiency cores, throttled I/O) is 3.7x slower
+# without the DSP cores (385 vs 1423; boot 21.4 vs 5.8 s) and 3.5x with them
+# (43 vs 150; boot 91 s). A process may leave that class itself:
+# setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_NORMAL) in the child before
+# exec put the same run back at 1469 (boot 5.5 s). Niceness cannot be lowered
+# without privilege, so it is only reported (/status "nice").
+PRIO_DARWIN_PROCESS, PRIO_DARWIN_NORMAL = 4, 0
+
+
+def _child_foreground():
+    """preexec_fn for the port child: leave the darwin background class if
+    the server inherited it (a no-op otherwise; never raises)."""
+    if sys.platform == "darwin":
+        try:
+            os.setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_NORMAL)
+        except OSError:
+            pass
+
+
+def host_nice():
+    """The server's own niceness (the child inherits it)."""
+    try:
+        return os.getpriority(os.PRIO_PROCESS, 0)
+    except OSError:
+        return None
+
+
 class PortProc:
     """One `ot_emu --interactive` child: a line out, a line back, flushed.
 
@@ -229,6 +262,12 @@ class PortProc:
         audio read [<maxframes>]     audio <frames> <hex>   (LE int16 stereo, released on read, never blocks)
         audio status                 audio status on= mode= captured= pending= rate=44100 dropped= cap=
         audio stop                   ok
+      and the pacing extensions (O15f, 12 Sep 2026; opt-in, the rest unchanged):
+        pace on [rate]               ok        (free-running: emulated time tracks the child's wall
+                                               clock x rate in 10 ms slices while stdin is empty)
+        pace off                     ok
+        pacestatus                   pacestatus on= rate= ratio= lag= slices= reanchors= slept= busy= stop= ms=
+        run <ms> wall <seconds>      ok sample= frames= stop=wall|time|...   (also ends when the wall budget is spent)
 
     A reader thread queues stdout lines so a wait can time out; lines that
     are not the expected reply (the port's own report before `ready`, any
@@ -248,7 +287,7 @@ class PortProc:
         self.started = time.perf_counter()
         err = open(log_path, "ab") if log_path else subprocess.DEVNULL
         self.proc = subprocess.Popen(self.argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=err, bufsize=0, cwd=str(ROOT))
+                                     stderr=err, bufsize=0, cwd=str(ROOT), preexec_fn=_child_foreground)
         if log_path:
             err.close()
         threading.Thread(target=self._reader, daemon=True, name="port-stdout").start()
@@ -361,6 +400,38 @@ class SpeedMeter:
         return round(ms / wall, 1) if wall > 1e-3 else None
 
 
+class RtMeter:
+    """x real time, honestly: emulated ms per WALL second over the last
+    ~second of the paced loop's `pacestatus` readings (sleeps, commands
+    and actions included) / 1000. 1.0 = the unit's own clock. None until
+    a window is there; reset on a fresh child (its clock starts over)."""
+    WINDOW = 1.0
+
+    def __init__(self):
+        self.samples = collections.deque()      # (t, emulated ms)
+        self.lock = threading.Lock()
+
+    def reset(self):
+        with self.lock:
+            self.samples.clear()
+
+    def add(self, ms):
+        now = time.perf_counter()
+        with self.lock:
+            self.samples.append((now, ms))
+            # keep one sample older than the window so a value always spans it
+            while len(self.samples) > 2 and self.samples[1][0] < now - self.WINDOW:
+                self.samples.popleft()
+
+    @property
+    def value(self):
+        with self.lock:
+            if len(self.samples) < 2:
+                return None
+            (t0, m0), (t1, m1) = self.samples[0], self.samples[-1]
+        return round((m1 - m0) / ((t1 - t0) * 1000.0), 3) if t1 - t0 >= 0.5 else None
+
+
 # -- the DSP main output: the child's audio ring drained into the server ------
 #
 # With sound on the port child runs --dsp and streams core 0's main L/R over
@@ -375,7 +446,7 @@ class SpeedMeter:
 AUDIO_RATE = 44100
 AUDIO_RING_S = 180           # the server-side ring: 180 s x 44100 x 4 B = 31.8 MB, allocated on the first frame
 AUDIO_READ_MAX = 441000      # frames per `audio read` (10 s = 3.5 MB of hex on one line); looped while full
-SOUND_ON_NOTE = "sound on -- while it plays the unit runs ~9x slower than real time (~3x slower than without the DSP cores)"
+SOUND_ON_NOTE = "sound on -- while it plays the unit runs slower than real time with the DSP cores (/status rt says how much; ~0.15x on the M5, 12 Sep 2026)"
 SOUND_OFF_NOTE = "sound off: the port child runs without the DSP cores"
 
 
@@ -567,19 +638,42 @@ class PortRt:
         self.uart64 = PortUart(self)
         self.uc = PortMem(self)
 
-    def run(self, ms=None, until=None, max_bursts=None):
+    def run(self, ms=None, until=None, max_bursts=None, wall=None):
+        """`run <ms>`, or with `wall` (seconds) `run <ms> wall <s>` (O15f):
+        the child also stops when that much wall time is spent, stop_reason
+        "wall" -- so a slice is bounded in wall time whatever the core's
+        rate. Where it stops moves no firmware event."""
         if ms is None or until is not None or max_bursts is not None:
             raise TypeError("the port backend runs by ms only")
         t0 = time.perf_counter()
-        rep = self.proc.command(f"run {float(ms):g}", "ok")
-        wall = time.perf_counter() - t0
+        line = f"run {float(ms):g}" + (f" wall {float(wall):g}" if wall is not None else "")
+        rep = self.proc.command(line, "ok")
+        wall_s = time.perf_counter() - t0
         f = dict(kv.split("=", 1) for kv in rep.split()[1:] if "=" in kv)
+        s0 = self.sample
         self.sample = float(f.get("sample", self.sample))
         self.frames = int(f.get("frames", self.frames))
         self.stop_reason = f.get("stop", "?")
         if self.meter is not None:
-            self.meter.add(float(ms), wall)
+            # what really ran (a wall-ended run advanced less than ms)
+            self.meter.add((self.sample - s0) / er.SAMPLE_HZ * 1000.0 if wall is not None else float(ms), wall_s)
         return self.stop_reason
+
+    # -- O15f: the child paces itself (see Panel._loop_paced) -------------
+    paced = False           # `pace on` accepted by this child
+
+    def pace(self, on, rate=1.0):
+        self.proc.command(f"pace on {float(rate):g}" if on else "pace off", "ok")
+        self.paced = bool(on)
+
+    def pacestatus(self):
+        """The child's own pacer figures as a dict (strings); updates
+        sample from its `ms`."""
+        rep = self.proc.command("pacestatus", "pacestatus")
+        f = dict(kv.split("=", 1) for kv in rep.split()[1:] if "=" in kv)
+        if "ms" in f:
+            self.sample = float(f["ms"]) * er.SAMPLE_HZ / 1000.0
+        return f
 
     def poll_tx(self):
         """Drain UART A's transmit bytes into uart64.tx; returns how many."""
@@ -991,6 +1085,8 @@ class Panel:
         self.proc = None                  # PortProc while the port backend runs
         self.restarts = 0                 # port respawns (watchdog kills, crashes)
         self.meter = SpeedMeter()         # emulated ms per wall s, both backends
+        self.rtmeter = RtMeter()          # x real time by the wall clock (the port, paced): /status "rt"
+        self.pace = None                  # the child's last `pacestatus` (dict of strings), port only
         self.loaded = None                # load_project_live's tuple once done
         self.phase = "booting"            # booting -> loading project -> ready
         self.actions = queue.Queue()
@@ -1365,6 +1461,9 @@ class Panel:
         if isinstance(rt, PortRt):
             rt.poll_tx()
 
+    PACE_POLL_S = 0.02       # the paced loop's cadence (tx, audio drain, pacestatus, render) when no action is queued
+    PACE_RATE = 1.0          # `pace on <rate>`: 1.0 = the unit's own clock
+
     def _loop(self):
         try:
             self._boot()
@@ -1373,6 +1472,18 @@ class Panel:
             self.phase = "failed"
             return
         threading.Thread(target=self._watchdog, daemon=True, name="watchdog").start()
+        if self.backend == "port":
+            try:
+                self.rt.pace(True, self.PACE_RATE)
+            except PortError as e:
+                # an older child (--port-bin) without `pace`: the pump below, as before
+                self.backend_note = ((self.backend_note + "; ") if self.backend_note else "") + \
+                    f"the child has no pacer ({e}); pumping 25 ms runs instead"
+                print(f"panel: {self.backend_note}")
+            else:
+                return self._loop_paced()
+        # Route A (and a child without `pace`): the pump below, unchanged
+        # (O15f paces the port child only).
         while True:
             try:
                 while True:
@@ -1432,6 +1543,91 @@ class Panel:
                 # idle bursts return instantly; don't spin the host
                 if burst < 0.01:
                     time.sleep(0.03)
+            except PortDied as e:
+                self.busy_since = None
+                if not self._respawn(str(e)):
+                    return
+            except Exception as e:
+                self.busy_since = None
+                self.fault = f"{type(e).__name__}: {e}"
+                time.sleep(0.5)
+
+    def _loop_paced(self):
+        """The port backend since O15f (12 Sep 2026): the CHILD paces
+        itself. `pace on` makes it free-running -- while its stdin is
+        empty it advances emulated time in 10 ms slices so that it tracks
+        its own wall clock (sleeping inside poll() on stdin when ahead, so
+        a command wakes it at once; flat out when the core is slower than
+        real time; re-anchoring past 250 ms of lag) -- and this thread
+        only serves the actions and, every PACE_POLL_S when none is
+        queued, drains tx and audio, reads `pacestatus` and renders. No
+        `run` from the loop at all. What that replaces: the 25 ms pump +
+        30 ms sleep ran idle at 0.69x without the cores and 1.02x in
+        bursts of 0.85-2.0x with them (the firmware's clocks neither at
+        hardware rate nor steady), and the SLOW_PUMP hack that compressed
+        0.45 s of wall into 191 emulated ms after a track key so a page
+        double-click could land. Now the double-tap window is a wall-time
+        property: two page clicks 0.15 s apart open the slot list, 0.30 s
+        apart miss (doubletap.py, 12 Sep 2026), as on the unit. Actions
+        still run their own `run`s (a key's 50 ms); those advance on top
+        of the pacer, which then waits for the wall clock, so the
+        emulated timing around a click is the same as before and the wall
+        timing is the unit's. Measured: idle 1.000x +- 0.01 with and
+        without --dsp at ~8 % / ~40 % of a core (the DSP cores do not
+        idle-skip); playing flat out until the core is >= 1.0x (no --dsp:
+        1.00x on this Mac since O15a-e; --dsp: ~0.15x)."""
+        armed = None            # the PortRt whose pacer is on
+        prev = None             # (ms, busy) of the previous pacestatus, for the speed meter
+        while True:
+            try:
+                # Actions first: a blocking get, so a queued click is served
+                # the moment it arrives (idle key round trip ~1 ms) instead of
+                # after a sleep; the timeout is the render/drain cadence.
+                try:
+                    act = self.actions.get(timeout=self.PACE_POLL_S)
+                except queue.Empty:
+                    act = None
+                while act is not None:
+                    self.busy_since = time.perf_counter()
+                    try:
+                        act()
+                        self._drain_audio(self.rt)   # what the action's own runs rendered
+                    finally:
+                        self.busy_since = None
+                    try:
+                        act = self.actions.get_nowait()
+                    except queue.Empty:
+                        act = None
+                rt = self.rt        # after the actions: a respawn / re-insert / sound switch replaces it
+                if rt is not armed:
+                    if not rt.paced:
+                        rt.pace(True, self.PACE_RATE)   # a fresh child: arm its pacer
+                    armed = rt
+                    prev = None
+                    self.rtmeter.reset()
+                t = time.perf_counter()
+                self.busy_since = t
+                self._poll(rt)
+                self._drain_audio(rt)
+                st = rt.pacestatus()
+                self.busy_since = None
+                self.pace = st
+                self.ran_ms = rt.sample / er.SAMPLE_HZ * 1000.0
+                self.rtmeter.add(self.ran_ms)
+                busy = float(st.get("busy", 0.0))
+                if prev is not None and busy > prev[1]:
+                    # `speed` keeps its meaning (emulated ms per wall s INSIDE
+                    # the emulation: idle slices are instant, so it reads high
+                    # idle); `rt` is the wall-clock figure
+                    self.meter.add(self.ran_ms - prev[0], busy - prev[1])
+                prev = (self.ran_ms, busy)
+                if st.get("on") != "1" and st.get("stop") not in ("time", "gate") \
+                        and not (self.fault or "").startswith("port: run stopped"):
+                    # the machine stopped inside a slice (fault/illegal): the
+                    # pacer ended itself; say so once, as the pump did
+                    self.fault = f"port: run stopped: {st.get('stop')}"
+                self._snapshot(self._uc())
+                self._parse_leds(rt)
             except PortDied as e:
                 self.busy_since = None
                 if not self._respawn(str(e)):
@@ -1748,8 +1944,11 @@ class Panel:
             # the helpers key() wraps around PLAY/STOP.
             row, bit = {"play": self.PLAY_KEY, "rec": (0x25, 1), "stop": self.STOP_KEY}[what]
             def tap(rt):
-                down = self._key_act(rt, row, bit, True)
-                up = self._key_act(rt, row, bit, False)
+                # one action, down then up: the down edge keeps its 50 ms of
+                # firmware (the paced child would otherwise see both edges
+                # in the same slice)
+                down = self._key_act(rt, row, bit, True, run_ms=50.0)
+                up = self._key_act(rt, row, bit, False, run_ms=50.0)
                 return f"matrix tap: {down}; {up}"
             return self.do(tap, timeout=120)
         if what == "play":
@@ -1885,12 +2084,18 @@ class Panel:
         slice_ms = getattr(rt, "SLICE_MS", self.RUN_SLICE_MS)   # the port: a round trip per slice
         while rt.sample < end:
             left = (end - rt.sample) / er.SAMPLE_HZ * 1000.0
-            rt.run(ms=min(left, slice_ms))
+            if isinstance(rt, PortRt):
+                # O15f: the child ends the slice itself when the budget is
+                # spent (`run <ms> wall <s>`), so the slice, not just the
+                # loop, is bounded in wall time
+                rt.run(ms=min(left, slice_ms), wall=max(0.01, wall - (time.perf_counter() - t0)))
+            else:
+                rt.run(ms=min(left, slice_ms))
             self.ran_ms = rt.sample / er.SAMPLE_HZ * 1000.0
             self._drain_audio(rt)       # the ring and the take keep up slice by slice
             if self.abort:
                 why = "watchdog"; break
-            if time.perf_counter() - t0 > wall:
+            if time.perf_counter() - t0 > wall or getattr(rt, "stop_reason", None) == "wall":
                 why = f"{wall:.0f} s wall budget"; break
         ran = (rt.sample - s0) / er.SAMPLE_HZ * 1000.0
         dt = time.perf_counter() - t0
@@ -1975,10 +2180,17 @@ class Panel:
             return f"{n} x ({hold:g} ms down, {gap:g} ms up): " + "; ".join(out)
         return self.do(act, timeout=120)
 
-    def _key_act(self, rt, row, bit, down, run_ms=50.0):
+    def _key_act(self, rt, row, bit, down, run_ms=None):
         """One key edge on the emu thread (key() queues it; transport() on
         the port taps down+up through it; tap() chains them), then
-        `run_ms` of firmware."""
+        `run_ms` of firmware. `run_ms` None = the default: 50 ms, or under
+        the paced child (O15f) NO run of its own for an ordinary key -- the
+        pacer's next 10 ms slice delivers it within a slice of emulated
+        time anyway, and the 50 ms run cost the click 50 emulated ms of
+        wall at the core's rate (40 ms playing without the cores, ~330 with
+        them; measured 12 Sep 2026) -- except PLAY down and STOP down,
+        which keep it so the frame-mode switch and the take open/close sit
+        around a processed key, as they always did."""
         if self.row_state is None:
             self.row_state = {}
         if down:
@@ -1995,17 +2207,30 @@ class Panel:
         func_held = bool(self.row_state.get(self.FUNC_KEY[0], 0) & (1 << self.FUNC_KEY[1]))
         play = down and (row, bit) == self.PLAY_KEY and not func_held
         stop = down and (row, bit) == self.STOP_KEY
+        if run_ms is None:
+            run_ms = 0.0 if getattr(rt, "paced", False) and not (play or stop) else 50.0
         note = ""
         if play:
             note = f" (play: active={self._before_play(rt)}, frame mode on)"
         rt.uart64.rx.extend([row, state])
-        rt.run(ms=run_ms)
+        if run_ms > 0:
+            rt.run(ms=run_ms)
         if stop:
             self._after_stop(rt)
             note = " (stop: frame mode off)"
         if not down and row == self.TRACK_ROW:
             self.slow_until = time.perf_counter() + self.SLOW_WALL_S
         return f"row {row:#04x} = {state:#04x}{note}"
+
+
+def _pace_json(st):
+    """The child's last `pacestatus` for /status: numbers, not strings."""
+    if not st:
+        return None
+    f = lambda k, c=float: c(st[k]) if k in st else None   # noqa: E731
+    return {"on": st.get("on") == "1", "rate": f("rate"), "ratio": f("ratio"), "lag_ms": f("lag"),
+            "slices": f("slices", int), "reanchors": f("reanchors", int), "slept_s": f("slept"),
+            "busy_s": f("busy"), "stop": st.get("stop")}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -2217,6 +2442,12 @@ class Handler(BaseHTTPRequestHandler):
                             # emulated ms per wall s over the last 5 s of run() calls;
                             # idle runs skip to the next timer, so idle reads high
                             "speed": p.meter.value,
+                            # O15f: x real time by the WALL clock (emulated ms per
+                            # wall s over the last second / 1000): 1.0 = the unit's
+                            # clock; None under route A and before the pacer is up
+                            "rt": p.rtmeter.value,
+                            "pace": _pace_json(p.pace),
+                            "nice": host_nice(),            # > 0: started as a zsh background job (BG_NICE); slower under load
                             "restarts": p.restarts,
                             "card_busy": p.card_busy,       # a /samples/commit re-insert in progress
                             "clock": p.clock_note,          # what the boot-time YES found
@@ -2426,6 +2657,9 @@ def main():
     Handler.html = (pathlib.Path(__file__).parent / "panel.html").read_bytes()
     print(f"panel: http://localhost:{a.port}/   image={image}   backend={backend}"
           f"   sound={'on' if Handler.panel.sound_wanted else 'off'} (takes in {takes_dir})")
+    if (host_nice() or 0) > 0:
+        print(f"panel: running at nice {host_nice()} (a zsh `&` job: BG_NICE) -- the unit will be slower "
+              f"whenever anything else wants the CPU; start the server in the foreground, or `unsetopt BG_NICE`")
     try:
         srv.serve_forever()
     finally:

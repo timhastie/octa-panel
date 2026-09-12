@@ -25,6 +25,8 @@
 #include <algorithm>
 #include <utility>
 #include <string>
+#include <functional>
+#include <poll.h>		// O15f: the paced child sleeps inside poll() on stdin
 
 #include "machine.h"
 #include "rtos.h"
@@ -94,6 +96,39 @@ namespace
 	// The ring holds the last DspPair::g_streamCapFrames (60 s); `run`
 	// without a read past that overwrites the oldest and counts them in
 	// `dropped`. A 25 ms `run` is ~1100 frames = 4.4 KB = 8.8 KB of hex.
+	//
+	// Real-time pacing (O15f, 12 Sep 2026; both opt-in, the old commands
+	// byte-for-byte as before -- the oracle drives fixed `run`s):
+	//
+	//   pace on [rate]    -> ok   FREE-RUNNING: while no command line is pending on
+	//                             stdin the child advances emulated time in 10 ms
+	//                             slices (`run 10`) so that it tracks its own wall
+	//                             clock x rate (1.0 = hardware rate): a slice ahead
+	//                             -> it sleeps INSIDE poll() on stdin (a command
+	//                             wakes it at once), behind -> flat out, more than
+	//                             250 ms behind -> it re-anchors (counted). A pending
+	//                             line is served between slices, one reply per
+	//                             command, exactly as unpaced; a `run` meanwhile
+	//                             advances on top of the pacer (the pacer then
+	//                             waits for the wall clock). A fault/illegal stop
+	//                             ends the free run (`pacestatus stop=` says so).
+	//   pace off          -> ok
+	//   pacestatus        -> pacestatus on=0|1 rate=<r> ratio=<r> lag=<ms> slices=<n> reanchors=<n>
+	//                             slept=<s> busy=<s> stop=<word> ms=<emulated ms>
+	//                             ratio = emulated ms per wall s over the last >= 1 s
+	//                             window / 1000 (0 until a window closed); lag = how far
+	//                             emulated time is behind its wall target now (0 when
+	//                             ahead); slept = wall s inside poll(); busy = wall s
+	//                             inside slices; stop = the last slice's Stop word.
+	//   run <ms> wall <seconds> -> ok sample= frames= stop=wall|time|...
+	//                             the plain run, ALSO ended when the wall budget is
+	//                             spent: the deadline is asked at every burst end
+	//                             (Rtos::Changes::OnEvent), at most 4096 instructions
+	//                             apart (Machine::instructions()); where the run ends
+	//                             moves no firmware event (timers, frames and the
+	//                             panel UART advance by sample count). `stop=wall`
+	//                             when the budget ended it. A script that needs
+	//                             `run` to advance exactly <ms> must not pass `wall`.
 	//
 	// `err <message>` for anything else -- an empty line, an unknown word,
 	// the wrong number of arguments (`tx`, `status` and `quit` take none) --
@@ -233,9 +268,120 @@ namespace
 		std::snprintf(buf, sizeof buf, "ready sample=%.3f frames=%llu", _rtos.sample(),
 			static_cast<unsigned long long>(_rtos.frameCount()));
 		reply(buf);
-		std::string line;
-		while(std::getline(std::cin, line))
+
+		// -- O15f: the pacer. Off unless `pace on`; nothing below runs the
+		// machine while it is off, so an unpaced session is the old loop.
+		// Emulated time is made to track wall time x rate from an anchor
+		// (wall, ms) taken at `pace on` and moved only by a re-anchor: with
+		// the lead (emulated - target) at a slice or more the child sleeps
+		// the excess, capped at one slice, inside poll() on stdin; below
+		// that it runs one 10 ms slice; more than PACE_MAX_LAG_MS behind (a
+		// core slower than real time, a long command) it re-anchors so the
+		// lag does not accumulate into a catch-up burst later. Idle, a
+		// slice is a few idle skips (microseconds), so the loop is nearly
+		// all sleep; playing, a slice costs what the core costs and the
+		// lead never builds, so it is flat out until the core is >= 1.0x.
+		constexpr double PACE_SLICE_MS = 10.0, PACE_MAX_LAG_MS = 250.0;
+		bool paceOn = false;
+		double paceRate = 1.0;
+		std::chrono::steady_clock::time_point paceAnchorWall{}, paceWinWall{};
+		double paceAnchorMs = 0.0, paceWinMs = 0.0, paceRatio = 0.0, paceSleptS = 0.0, paceBusyS = 0.0;
+		uint64_t paceSlices = 0, paceReanchors = 0;
+		ot::Rtos::Stop paceStop = ot::Rtos::Stop::Time;
+		const auto stdinPending = []() -> bool
 		{
+			// A line already in a buffer (iostream's, or stdio's: cin is
+			// synced with stdio, whose FILE may hold bytes poll() cannot see)
+			// or bytes on the pipe.
+			if(std::cin.rdbuf()->in_avail() > 0)
+				return true;
+#ifdef __APPLE__
+			if(stdin->_r > 0)
+				return true;
+#endif
+			pollfd pfd{0, POLLIN, 0};
+			return ::poll(&pfd, 1, 0) > 0;
+		};
+		const auto paceWindow = [&](const std::chrono::steady_clock::time_point _now)
+		{
+			// The ratio: emulated ms per wall s over the last closed window
+			// of at least a second (commands served inside it included).
+			const double sinceS = std::chrono::duration<double>(_now - paceWinWall).count();
+			if(sinceS >= 1.0)
+			{
+				paceRatio = (_rtos.ms() - paceWinMs) / (sinceS * 1000.0);
+				paceWinWall = _now;
+				paceWinMs = _rtos.ms();
+			}
+		};
+		const auto paceTargetMs = [&](const std::chrono::steady_clock::time_point _now) -> double
+		{
+			return paceAnchorMs + std::chrono::duration<double, std::milli>(_now - paceAnchorWall).count() * paceRate;
+		};
+		const auto paceStep = [&]() -> bool	// false: the machine stopped (fault/illegal), the free run ends
+		{
+			const auto now = std::chrono::steady_clock::now();
+			const double lead = _rtos.ms() - paceTargetMs(now);
+			if(lead >= PACE_SLICE_MS)
+			{
+				const double s = std::min(lead - PACE_SLICE_MS + 1.0, PACE_SLICE_MS) / 1000.0 / paceRate;
+				// Inside poll(): a command line on stdin ends the sleep at
+				// once (a sleep_for here made every command wait up to a
+				// slice: 13.7 ms median key round trip vs 0.09, measured on
+				// the prototype, out/_agents/speed-pacing).
+				pollfd pfd{0, POLLIN, 0};
+				::poll(&pfd, 1, std::max(1, static_cast<int>(s * 1000.0 + 0.5)));
+				const auto t1 = std::chrono::steady_clock::now();
+				paceSleptS += std::chrono::duration<double>(t1 - now).count();
+				paceWindow(t1);
+				return true;
+			}
+			if(lead < -PACE_MAX_LAG_MS)
+			{
+				paceAnchorWall = now;
+				paceAnchorMs = _rtos.ms();
+				++paceReanchors;
+			}
+			paceStop = _rtos.run(PACE_SLICE_MS, false);
+			const auto t1 = std::chrono::steady_clock::now();
+			const double w = std::chrono::duration<double>(t1 - now).count();
+			paceBusyS += w;
+			wallInRun += w;
+			++paceSlices;
+			paceWindow(t1);
+			return paceStop == ot::Rtos::Stop::Time || paceStop == ot::Rtos::Stop::Gate;
+		};
+		bool served = false;		// the previous line was a command: the client may be mid-round
+		const auto nextLine = [&](std::string& _line) -> bool
+		{
+			if(paceOn && served)
+			{
+				// A client sends its commands in rounds (the panel's tx, audio
+				// read, pacestatus: ~100 us apart), and a slice started in
+				// that gap makes every command of the round wait a slice --
+				// four slices (231 ms) per page click while playing with the
+				// cores, measured 12 Sep 2026. One millisecond of poll() after
+				// a reply lets the round through; at 1.0x it comes out of the
+				// sleep, flat out it is < 1 % (a round per 200 ms).
+				served = false;
+				pollfd pfd{0, POLLIN, 0};
+				::poll(&pfd, 1, 1);
+			}
+			while(paceOn && !stdinPending())
+			{
+				if(!paceStep())
+				{
+					paceOn = false;		// the machine stopped: the next `run` answers as it always did
+					break;
+				}
+			}
+			return static_cast<bool>(std::getline(std::cin, _line));
+		};
+
+		std::string line;
+		while(nextLine(line))
+		{
+			served = true;
 			const auto w = splitWords(line);
 			if(w.empty())
 			{
@@ -243,6 +389,47 @@ namespace
 				continue;
 			}
 			const auto& cmd = w[0];
+			if(cmd == "pace")
+			{
+				if(w.size() == 2 && w[1] == "off")
+				{
+					paceOn = false;
+					reply("ok");
+					continue;
+				}
+				double rate = 1.0;
+				char* end = nullptr;
+				const bool ok = w.size() >= 2 && w[1] == "on" && w.size() <= 3
+					&& (w.size() == 2 || (rate = std::strtod(w[2].c_str(), &end), end && !*end && rate > 0.0 && rate <= 1000.0));
+				if(!ok)
+				{
+					reply("err usage: pace on [rate] | pace off");
+					continue;
+				}
+				paceOn = true;
+				paceRate = rate;
+				paceAnchorWall = paceWinWall = std::chrono::steady_clock::now();
+				paceAnchorMs = paceWinMs = _rtos.ms();
+				paceRatio = 0.0;
+				paceStop = ot::Rtos::Stop::Time;
+				reply("ok");
+				continue;
+			}
+			if(cmd == "pacestatus")
+			{
+				if(w.size() != 1)
+				{
+					reply("err usage: pacestatus");
+					continue;
+				}
+				const auto now = std::chrono::steady_clock::now();
+				const double lag = paceOn ? std::max(0.0, paceTargetMs(now) - _rtos.ms()) : 0.0;
+				std::snprintf(buf, sizeof buf, "pacestatus on=%d rate=%.3f ratio=%.3f lag=%.1f slices=%llu reanchors=%llu slept=%.3f busy=%.3f stop=%s ms=%.3f",
+					paceOn ? 1 : 0, paceRate, paceRatio, lag, static_cast<unsigned long long>(paceSlices),
+					static_cast<unsigned long long>(paceReanchors), paceSleptS, paceBusyS, stopWord(paceStop), _rtos.ms());
+				reply(buf);
+				continue;
+			}
 			if(cmd == "quit")
 			{
 				if(w.size() != 1)
@@ -255,18 +442,50 @@ namespace
 			}
 			if(cmd == "run")
 			{
-				double ms = 0.0;
+				double ms = 0.0, wallBudget = 0.0;
 				char* end = nullptr;
-				if(w.size() != 2 || (ms = std::strtod(w[1].c_str(), &end), !end || *end) || !(ms >= 0.0) || ms > 1e9)
+				const bool plain = w.size() == 2;
+				bool ok = plain || (w.size() == 4 && w[2] == "wall");
+				ok = ok && !((ms = std::strtod(w[1].c_str(), &end), !end || *end) || !(ms >= 0.0) || ms > 1e9);
+				ok = ok && (plain || !((wallBudget = std::strtod(w[3].c_str(), &end), !end || *end) || !(wallBudget > 0.0) || wallBudget > 1e6));
+				if(!ok)
 				{
-					reply("err usage: run <ms>");
+					// the old reply for every old input; the new text only when the wall form was attempted
+					reply(w.size() == 4 && w[2] == "wall" ? "err usage: run <ms> [wall <seconds>]" : "err usage: run <ms>");
 					continue;
 				}
 				const auto t0 = std::chrono::steady_clock::now();
-				const auto st = _rtos.run(ms, false);
+				ot::Rtos::Stop st;
+				bool wallHit = false;
+				if(plain)
+					st = _rtos.run(ms, false);		// the old path, untouched (the oracle's runs)
+				else
+				{
+					// O15f: the deadline is a condition on nothing the machine
+					// does, so it is asked where the loop asks any event
+					// condition -- at every burst end and exact step -- and
+					// the clock is read once per 4096 instructions (a
+					// steady_clock read per burst would cost ~5 % on bursts
+					// that average ~70 instructions). Where the run ends
+					// moves no firmware event.
+					const auto deadline = t0 + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(wallBudget));
+					uint64_t next = _m.instructions() + 4096;
+					const std::function<bool()> stop = [&]() -> bool
+					{
+						const auto n = _m.instructions();
+						if(n < next)
+							return false;
+						next = n + 4096;
+						if(std::chrono::steady_clock::now() < deadline)
+							return false;
+						wallHit = true;
+						return true;
+					};
+					st = _rtos.runUntil(ms, stop, ot::Rtos::Changes::OnEvent);
+				}
 				wallInRun += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 				std::snprintf(buf, sizeof buf, "ok sample=%.3f frames=%llu stop=%s", _rtos.sample(),
-					static_cast<unsigned long long>(_rtos.frameCount()), stopWord(st));
+					static_cast<unsigned long long>(_rtos.frameCount()), wallHit ? "wall" : stopWord(st));
 				reply(buf);
 				continue;
 			}
