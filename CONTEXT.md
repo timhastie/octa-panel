@@ -24,6 +24,10 @@ emulators of the unit) on branch **`panel-ui`**, carrying Tim's additions:
   timers run).
 - `tools/verify/verify_ccpage2.py` fix (branch `fix-verify-ccpage2`).
 
+This fork lives at **https://github.com/timhastie/octa-panel** (remote `tim`,
+default branch `panel-ui`; push with `git push tim panel-ui`). Upstream is
+`sambanks/octabam` (remote `origin`).
+
 Tim has **no Octatrack to hand**; everything is validated in emulation. Real
 projects saved on units come from public test fixtures (see README §"No unit
 to hand"): `out/_projects/otlive/OTLIVE/{PROJECT,AUDIO}` is the default.
@@ -38,7 +42,21 @@ bash tools/panel/app/build.sh && open "out/Virtual Panel.app"
 .venv/bin/python3 tools/panel/panel_server.py --project out/_projects/otlive/OTLIVE/PROJECT --set OTLIVE --name PROJECT
 ```
 Boot + fixture load ≈ 40 s on the port backend (the page dims with a phase
-note). The SET DATE/TIME dialog is closed automatically with YES.
+note). The SET DATE/TIME dialog is closed automatically with YES (the server
+waits for the dialog's popup geometry before pressing; `/status clock` says
+what happened).
+
+**Samples** (12 Sep 2026): click the COMPACT FLASH slot on the rear edge (or
+the AUDIO POOL button, or in the app File ▸ Add Samples to Card…, or drop
+files on the window/Dock icon) → files go into the per-port pool
+`out/_panel_pool_<port>/` (converted with `afconvert` to 16-bit 44.1 kHz WAV
+when the unit could not read them) → **RE-INSERT CARD** rebuilds the card
+image and reboots the unit (~40 s). Then on the unit, as on the hardware:
+**double-click a track key** (T1–T8) → the sample slot list → ▲/▼ pick a
+slot → ▶ (or YES) opens the file browser → ▲/▼ find the file → YES loads
+it → NO leaves. README §"Loading samples" has the measured sequence and the
+endpoints (`/samples`, `/samples/add`, `/samples/upload`, `/samples/commit`,
+`/tap`).
 Backends: `--backend auto|port|routea` (port = `out/emu/ot_emu --interactive`,
 built when missing with `cmake --fresh -B out/emu -S tools/emu/ot_emu &&
 cmake --build out/emu -j8`; routea = `tools/emu/emu_rtos.py`, 100× slower).
@@ -82,6 +100,19 @@ EMAC-fixed Unicorn (`scripts/build_unicorn.sh`), `vendor/dsp56300` pinned to
   slower than real time); never enable `rt.exact_clock()` on route A (100×).
 - LCD framebuffer in RAM (0x460d1f80) is NOT what the screen shows (page
   order rotates) — always render from the UART stream.
+- **Popups** are drawn from the record at 0x46c7d34c while the UI slot
+  0x460d175c points at it (+0x08 x0, +0x0c y0, +0x18 x1, +0x20 flags 0x21
+  open, +0x28 rows). Geometry tells them apart: clock dialog 0xf/7/0xe6/0x32,
+  page SETUP windows 7/0/0xf4/0x40, ARM ALL 0x25/0x17/0xb8/0x12 (the rest in
+  panel_server.py). YES/NO on the bare main screen open ARM ALL/DISARM ALL.
+- **Double-tap chords** (a track key twice → its sample slot list) are timed
+  in firmware time: ~200 emulated ms press to press lands, 375 does not. The
+  server slows its idle pump for 0.5 s after a track key is released so two
+  page clicks land (0.15 and 0.30 s wall apart open the list, 0.45 s does
+  not); `/tap?row&bit&n=2` does it as one action for scripts. A third double
+  tap closes the list again.
+- The idle pump runs ~0.8× real time (25 emulated ms per ~30 ms wall);
+  `/status speed` reads high while idle because idle runs return early.
 
 ## Repo / process rules that matter
 
@@ -97,12 +128,15 @@ EMAC-fixed Unicorn (`scripts/build_unicorn.sh`), `vendor/dsp56300` pinned to
 
 ## Open items
 
-- LEDs in the page: the server's `/leds` rows chase while playing (verified),
-  but the page showed none lit on 12 Sep — element ids (`led-…`) vs map keys
-  (`led_…`) suspected; fix in `panel.html` `applyLeds`.
 - "LAST SET" record source; SETUP-page redraw; crossfader input path; encoder
   push (not found in the matrix); trig LEDs 9-16 colour vs hardware.
 - Upstream octabam main has moved (recfix, PR #97/#129, Workbench); this fork
   is a 10 Sep clone — merging upstream is pending.
-- Playback still ~3× slower than real time (port); the DSP audio path is not
-  wired to the panel (no sound).
+- Playback still ~3× slower than real time (port), ~9× with the DSP cores
+  (`--dsp`) rendering audio.
+- `.ot` slice files are not seeded onto the card with their samples; the pool
+  is wiped and re-seeded at every server start (files added through the
+  page survive only while that server runs, or if they are also in an
+  `--audio <dir>`).
+- The firmware's file browser lists files in card order, not name order.
+- RSS grows while the sequencer plays (pre-existing, ~+34 MB per 2 s slice).
