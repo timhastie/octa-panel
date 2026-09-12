@@ -245,7 +245,7 @@ namespace ot
 				}
 				++c.rxFrames;
 			};
-			auto sink = [this, &c](uint64_t&, const dsp56k::Audio::TxFrame& _f)
+			auto sink = [this, &c, i](uint64_t&, const dsp56k::Audio::TxFrame& _f)
 			{
 				++c.txFrames;
 				if(_f.size())
@@ -266,15 +266,19 @@ namespace ot
 				const uint32_t rot = (dsr2 - 9) & 7;
 				if(!c.rotSeen) { c.rotMin = c.rotMax = rot; c.rotSeen = true; }
 				c.rotMin = std::min(c.rotMin, rot); c.rotMax = std::max(c.rotMax, rot);
+				int32_t words[g_audioSlots];		// this frame by ring word, sign-extended (the pipe's ring takes the whole frame at once)
 				for(uint32_t ch = 0; ch < g_audioSlots; ++ch)
 				{
 					const uint32_t s = (ch - rot) & 7;
 					const uint32_t w = s < _f.size() ? (_f[s][0] & 0xffffff) : 0;
 					if(w)
 						++c.txNZ[ch];
+					words[ch] = static_cast<int32_t>(w << 8) >> 8;
 					if(m_capture)
-						c.capture.push_back(static_cast<int32_t>(w << 8) >> 8);
+						c.capture.push_back(words[ch]);
 				}
+				if(m_streamMode != StreamMode::Off && i == 0)
+					streamPush(words);
 			};
 			auto silence1 = [&c](uint64_t&, dsp56k::Audio::RxFrame& _f)
 			{
@@ -941,6 +945,53 @@ namespace ot
 	uint32_t DspPair::bootLength(const int _core) const { return m_cores[_core & 1]->boot->getLength(); }
 	uint32_t DspPair::bootAddress(const int _core) const { return m_cores[_core & 1]->boot->getInitialPC(); }
 	const std::vector<int32_t>& DspPair::audioOut(const int _core) const { return m_cores[_core & 1]->capture; }
+
+	// -- audio over the pipe (12 Sep 2026): a bounded ring of core 0's frames --
+	void DspPair::setAudioStream(const StreamMode _mode)
+	{
+		m_streamMode = _mode;
+		m_stream.clear();
+		m_stream.shrink_to_fit();
+		m_streamHead = m_streamCount = 0;
+		m_streamCaptured = m_streamDropped = 0;
+		if(_mode != StreamMode::Off)
+			m_stream.assign(static_cast<size_t>(g_streamCapFrames) * streamWords(_mode), 0);
+	}
+
+	void DspPair::streamPush(const int32_t* _words)
+	{
+		const auto n = streamWords(m_streamMode);
+		if(!n)
+			return;
+		if(m_streamCount == g_streamCapFrames)
+		{
+			// Full: the oldest frame goes, and is counted (`audio status dropped=`).
+			m_streamHead = (m_streamHead + 1) % g_streamCapFrames;
+			--m_streamCount;
+			++m_streamDropped;
+		}
+		auto* dst = &m_stream[((m_streamHead + m_streamCount) % g_streamCapFrames) * n];
+		const uint32_t first = m_streamMode == StreamMode::All ? 0 : m_streamMode == StreamMode::Main ? 2 : 4;
+		for(uint32_t k = 0; k < n; ++k)
+			dst[k] = static_cast<int16_t>(_words[first + k] >> 8);		// 24-bit word -> 16-bit, as writeWav24's top bytes
+		++m_streamCount;
+		++m_streamCaptured;
+	}
+
+	size_t DspPair::takeAudioStream(std::vector<int16_t>& _out, const size_t _maxFrames)
+	{
+		const auto n = streamWords(m_streamMode);
+		const size_t take = std::min(_maxFrames, m_streamCount);
+		if(!n || !take)
+			return 0;
+		const size_t firstRun = std::min(take, static_cast<size_t>(g_streamCapFrames) - m_streamHead);	// up to the ring's end, then the wrap
+		_out.insert(_out.end(), m_stream.begin() + m_streamHead * n, m_stream.begin() + (m_streamHead + firstRun) * n);
+		if(firstRun < take)
+			_out.insert(_out.end(), m_stream.begin(), m_stream.begin() + (take - firstRun) * n);
+		m_streamHead = (m_streamHead + take) % g_streamCapFrames;
+		m_streamCount -= take;
+		return take;
+	}
 	void DspPair::setAudioInput(std::vector<int32_t> _interleaved, const uint32_t _channels) { m_input = std::move(_interleaved); m_inputChannels = _channels; }
 	uint64_t DspPair::txAtFirstCommand(const int _core) const { return m_cores[_core & 1]->txAtFirstCmd; }
 	uint64_t DspPair::rxAtFirstCommand(const int _core) const { return m_cores[_core & 1]->rxAtFirstCmd; }

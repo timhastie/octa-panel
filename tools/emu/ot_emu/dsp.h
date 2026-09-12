@@ -156,6 +156,26 @@ namespace ot
 		// Keep every transmitted frame (8 words, slot order) for a WAV.
 		void setAudioCapture(const bool _on) { m_capture = _on; }
 		const std::vector<int32_t>& audioOut(int _core) const;
+		// -- audio over the pipe (12 Sep 2026, --interactive `audio ...`) ----
+		// A second, BOUNDED capture of core 0's TX0, beside the batch one
+		// above (which is one-shot, unbounded, written at exit -- and never
+		// under --interactive, which returns before the reports). The same
+		// sink, the same de-rotated ring words: `Main` keeps words 2/3 (the
+		// main L/R pair, measured 12 Sep: run3_core0.wav slots 2/3 = the
+		// fixture sample x 0.70 at level 64), `Cue` words 4/5 (the second
+		// pair, 3.1 dB lower), `All` the eight. Kept as 16-bit (the 24-bit
+		// word >> 8: the pipe never carries more) in a ring of
+		// g_streamCapFrames frames; a client takes frames out as it goes,
+		// and when it does not the OLDEST are overwritten and counted.
+		enum class StreamMode : uint8_t { Off, Main, Cue, All };
+		static constexpr uint32_t g_streamCapFrames = 60 * 44100;	// 60 s: 10.6 MB for a pair, 42.3 MB for all eight
+		static uint32_t streamWords(const StreamMode _m) { return _m == StreamMode::All ? g_audioSlots : _m == StreamMode::Off ? 0 : 2; }
+		void setAudioStream(StreamMode _mode);		// Off stops and frees; any other mode (re)starts empty
+		StreamMode audioStream() const { return m_streamMode; }
+		// Move up to _maxFrames pending frames (interleaved, streamWords() each) onto _out; returns the frames moved.
+		size_t takeAudioStream(std::vector<int16_t>& _out, size_t _maxFrames);
+		struct StreamStatus { StreamMode mode; uint64_t captured, pending, dropped; };
+		StreamStatus streamStatus() const { return {m_streamMode, m_streamCaptured, m_streamCount, m_streamDropped}; }
 		// Feed RX0 from the transport start (the first 0x8c) on: `_channels`
 		// interleaved channels onto slots 0..channels-1, silence past the end
 		// -- or the built-in tones (slot k = a sine at 500 x (k+1) Hz, -20 dBFS).
@@ -237,6 +257,12 @@ namespace ot
 		uint64_t m_traceEvery = 0, m_traceFrom = 0;
 		bool m_idleSkip = true;
 		bool m_capture = false, m_tones = false, m_mapOn = false, m_writesOn = false;
+		// The pipe's ring (setAudioStream): g_streamCapFrames x streamWords() int16, oldest at m_streamHead
+		StreamMode m_streamMode = StreamMode::Off;
+		std::vector<int16_t> m_stream;
+		size_t m_streamHead = 0, m_streamCount = 0;		// frames
+		uint64_t m_streamCaptured = 0, m_streamDropped = 0;	// frames since `audio start`
+		void streamPush(const int32_t* _words);			// one de-rotated frame of eight 24-bit words
 		bool m_pulling = false;
 		bool m_pcWatchOn = false; int m_pcWatchCore = 0; uint32_t m_pcWatchPc = 0; uint64_t m_pcWatchFrom = 0;	// with a `from`, the FIRST 24 arrivals after it are kept
 		std::vector<PcWatchHit> m_pcWatchHits;

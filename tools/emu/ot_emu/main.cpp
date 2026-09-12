@@ -72,6 +72,29 @@ namespace
 	// The hit log is the machine's (capped at 2M records, as the batch); a
 	// watched PC costs one compare per instruction, `watch off` when done.
 	//
+	// Audio over the pipe (12 Sep 2026; needs --dsp, else `err`). Core 0's
+	// ESAI TX0 frames, by de-rotated RING WORD (dsp.cpp's sink): words 2/3
+	// are the main L/R pair, 4/5 the second pair 3.1 dB lower, 0/1/6/7 zero
+	// (measured on the batch's run3_core0.wav, out/_agents/audio). Under
+	// --interactive the batch's --audio-out never writes (the loop returns
+	// before the reports), and the gain table 0x80003c60 stayed zero because
+	// --main-level was posted only inside --sequencer -- so every voice was
+	// silent (O9b's trap). Now --main-level defaults to 64 here (main()).
+	//
+	//   audio start [main|cue|all] -> ok   DspPair::setAudioStream: main = words 2/3 as L,R (the default),
+	//                                      cue = 4/5, all = the eight words per frame; restarts empty if on
+	//   audio read [<maxframes>]   -> audio <frames> <hex>   everything captured since the previous read
+	//                                      (at most <maxframes>): little-endian signed 16-bit interleaved
+	//                                      PCM, one L,R (or eight words) per frame, the 24-bit words >> 8;
+	//                                      those frames are released. Never blocks: it answers what is there.
+	//   audio status               -> audio status on=0|1 mode=off|main|cue|all captured=<frames since start>
+	//                                      pending=<frames unread> rate=44100 dropped=<frames overwritten> cap=<ring frames>
+	//   audio stop                 -> ok   frees the ring
+	//
+	// The ring holds the last DspPair::g_streamCapFrames (60 s); `run`
+	// without a read past that overwrites the oldest and counts them in
+	// `dropped`. A 25 ms `run` is ~1100 frames = 4.4 KB = 8.8 KB of hex.
+	//
 	// `err <message>` for anything else -- an empty line, an unknown word,
 	// the wrong number of arguments (`tx`, `status` and `quit` take none) --
 	// and the loop keeps serving. Integer arguments are decimal or 0x..
@@ -192,7 +215,7 @@ namespace
 		return "?";
 	}
 
-	int serveInteractive(ot::Machine& _m, ot::Rtos& _rtos)
+	int serveInteractive(ot::Machine& _m, ot::Rtos& _rtos, ot::DspPair* _dsp)
 	{
 		// The first `tx` answers everything since the boot: the panel's
 		// whole screen and LED state is in that stream (the boot's full draw,
@@ -442,6 +465,85 @@ namespace
 				reply(out);
 				continue;
 			}
+			if(cmd == "audio")
+			{
+				const auto sub = w.size() > 1 ? w[1] : std::string();
+				if(!_dsp)
+				{
+					reply("err audio needs --dsp");
+					continue;
+				}
+				using Mode = ot::DspPair::StreamMode;
+				if(sub == "start")
+				{
+					const auto mode = w.size() == 2 || w[2] == "main" ? Mode::Main
+						: w[2] == "cue" ? Mode::Cue : w[2] == "all" ? Mode::All : Mode::Off;
+					if(w.size() > 3 || mode == Mode::Off)
+					{
+						reply("err usage: audio start [main|cue|all]");
+						continue;
+					}
+					_dsp->setAudioStream(mode);
+					reply("ok");
+					continue;
+				}
+				if(sub == "stop")
+				{
+					if(w.size() != 2)
+					{
+						reply("err usage: audio stop");
+						continue;
+					}
+					_dsp->setAudioStream(Mode::Off);
+					reply("ok");
+					continue;
+				}
+				if(sub == "status")
+				{
+					if(w.size() != 2)
+					{
+						reply("err usage: audio status");
+						continue;
+					}
+					const auto st = _dsp->streamStatus();
+					static const char* const g_modes[] = {"off", "main", "cue", "all"};
+					std::snprintf(buf, sizeof buf, "audio status on=%d mode=%s captured=%llu pending=%llu rate=44100 dropped=%llu cap=%u",
+						st.mode != Mode::Off, g_modes[static_cast<int>(st.mode)],
+						static_cast<unsigned long long>(st.captured), static_cast<unsigned long long>(st.pending),
+						static_cast<unsigned long long>(st.dropped), ot::DspPair::g_streamCapFrames);
+					reply(buf);
+					continue;
+				}
+				if(sub == "read")
+				{
+					uint64_t maxFrames = ot::DspPair::g_streamCapFrames;
+					if(w.size() > 3 || (w.size() == 3 && (!parseNumber(w[2], maxFrames) || !maxFrames)))
+					{
+						reply("err usage: audio read [<maxframes>]");
+						continue;
+					}
+					if(_dsp->audioStream() == Mode::Off)
+					{
+						reply("err audio off (audio start first)");
+						continue;
+					}
+					std::vector<int16_t> pcm;
+					const auto n = _dsp->takeAudioStream(pcm, static_cast<size_t>(std::min<uint64_t>(maxFrames, ot::DspPair::g_streamCapFrames)));
+					std::string out = "audio " + std::to_string(n) + " ";
+					out.reserve(out.size() + 4 * pcm.size());
+					static const char* const hex = "0123456789abcdef";
+					for(const auto v : pcm)
+					{
+						const auto u = static_cast<uint16_t>(v);		// little-endian: low byte first
+						out += hex[(u >> 4) & 15]; out += hex[u & 15];
+						out += hex[u >> 12]; out += hex[(u >> 8) & 15];
+					}
+					reply(out);
+					continue;
+				}
+				reply("err usage: audio start [main|cue|all] | audio read [<maxframes>] | audio status | audio stop");
+				continue;
+			}
 			reply("err unknown command " + cmd);
 		}
 		return 0;		// EOF on stdin: the client went away
@@ -509,6 +611,7 @@ int main(int _argc, char** _argv)
 	bool frameTimer = false;	// O9b: keep the free-running 16-sample frame timer with --dsp (default: the DSP's bank word is the frame edge)
 	std::string pokeAfterLoad;	// O9c: "addr=byte;addr=byte" written after the load, before the frames (drive an apply the load skips)
 	int mainLevel = -1;			// O9b: post sys command 4 (SET MAIN LEVEL) with this level after the load; -1 = don't (the emulated load never does, and every voice then renders at gain zero)
+	bool mainLevelGiven = false;	// 12 Sep 2026: --interactive defaults it to 64 (the panel wants sound); `--main-level off` keeps the -1. The batch default stays -1.
 	std::string memDump;		// O10.21: "addr,len=path[;...]" -- ColdFire memory ranges, raw bytes, to FILE at the very end (peeks only support one word, pre-sequencer; this is a range, post-run)
 	bool interactive = false;	// 11 Sep 2026: after the boot (and load), serve the line protocol on stdin/stdout (serveInteractive above)
 	std::string rtc;			// 11 Sep 2026: the DSPI chip-select-2 clock -- "host", "off", or <epoch seconds> (UTC, frozen); default off, host under --interactive (Dspi::RtcClock)
@@ -571,7 +674,7 @@ int main(int _argc, char** _argv)
 		else if(a == "--dsp-stopwatch" && i + 1 < _argc)	dspStopwatch = _argv[++i];
 		else if(a == "--dsp-writes" && i + 1 < _argc)	dspWrites = _argv[++i];
 		else if(a == "--coverage" && i + 1 < _argc)	coverage = _argv[++i];
-		else if(a == "--main-level" && i + 1 < _argc)	mainLevel = std::atoi(_argv[++i]);
+		else if(a == "--main-level" && i + 1 < _argc)	{ const std::string v = _argv[++i]; mainLevel = v == "off" ? -1 : std::atoi(v.c_str()); mainLevelGiven = true; }
 		else if(a == "--mem-dump" && i + 1 < _argc)	memDump = _argv[++i];
 		else if(a == "--poke" && i + 1 < _argc)		pokeAfterLoad = _argv[++i];
 		else if(a == "--frame-timer")				frameTimer = true;
@@ -587,6 +690,8 @@ int main(int _argc, char** _argv)
 
 	if(sequencer)
 		mount = true;			// M6c needs the card mounted and the project loaded
+	if(interactive && !mainLevelGiven)
+		mainLevel = 64;			// the batch never posts it unless asked (byte-identical reports); the pipe wants audible voices
 
 	// --rtc: the batch keeps the DSPI loopback (chip-select 2 answers 0, the
 	// 2000-00-00 dialog: goldens and serial captures reproducible, and route
@@ -1151,7 +1256,20 @@ int main(int _argc, char** _argv)
 		// above; from here the machine is the client's. `quit` exits here,
 		// before the batch reports.
 		if(interactive)
-			return serveInteractive(m, rtos);
+		{
+			// SET MAIN LEVEL where the batch posts it (after the load, before
+			// anything plays) unless --sequencer already did: without it the
+			// gain table 0x80003c60 is zero and every voice renders silent
+			// (O9b). Costs up to 200 ms emulated before `ready`; the line is
+			// in the boot log, above `ready`, as in the batch.
+			if(mainLevel >= 0 && !sequencer)
+			{
+				const auto g = rtos.setMainLevelLive(static_cast<uint32_t>(mainLevel));
+				std::printf("main level : sys command %u posted with %d -> gain table[0] = %#x%s (bit 0 of 0x8000004a = %u)\n",
+					ot::g_setMainLevelCase, mainLevel, g, g ? "" : " -- NOT FILLED", m.read8(0x8000004a) & 1);
+			}
+			return serveInteractive(m, rtos, dspPair.get());
+		}
 
 		if(!watchPc.empty())
 		{

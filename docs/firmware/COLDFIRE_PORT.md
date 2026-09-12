@@ -3031,3 +3031,107 @@ neither in the DSP path (identical LED timelines with `--frame` and `--dsp`):
 Measured after: the lit trig pair equals the STEP byte `0x800065b5` in 84/84
 25 ms slices at 125.1-125.2 ms per step (120 BPM); the eight fired-track
 flashes at PLAY clear 83 ms later; STOP leaves the LED table all zero.
+
+## Milestone O14k — the DSP main output over the `--interactive` pipe ✅ (12 Sep 2026, branch `panel-ui`)
+
+The 12 Sep audio spike (`out/_agents/audio/`) proved the batch renders the
+sequenced sample sample-exact with `--dsp`: `run3_core0.wav` slots 2/3 =
+`third-0.wav` x 0.70 at `--main-level 64`. None of it reached the pipe, for
+two reasons in `main.cpp`: `--audio-out` is written only after the batch
+reports (`writeWav24`, one-shot, needs the total), and `--interactive`
+returns into `serveInteractive` before them; and `--main-level` was posted
+only inside `if(sequencer)`, so under `--interactive` the gain table
+`0x80003c60` stayed zero and every voice rendered silent (O9b's trap).
+
+### What changed (`main.cpp`, `dsp.h/.cpp`; the batch untouched)
+
+- **`--main-level` defaults to 64 under `--interactive`** and is posted
+  after the load, before `ready` (the same `Rtos::setMainLevelLive`, the
+  same `main level :` boot-log line, up to 200 ms emulated); `--main-level
+  off` (or a number, `0` included) overrides. The batch default stays -1
+  (never posted): the reference command's `run3_core0.wav` and its log are
+  byte-identical before and after (`cmp` silent; `out/_agents/port-audio/
+  base_run3_core0.wav` from the pre-change binary vs `new_run3_core0.wav`,
+  69 s wall each), and ctest passes 7/7.
+- **A second, bounded capture on the same ESAI TX sink** (`dsp.cpp`, the
+  de-rotated ring words of O9c; `DspPair::setAudioStream`): core 0 only,
+  16-bit (the 24-bit word >> 8, `writeWav24`'s top two bytes), in a ring of
+  `g_streamCapFrames` = 60 s x 44100 frames (10.6 MB for a pair, 42.3 MB
+  for all eight), allocated at `audio start`, freed at `audio stop`. Full
+  = the OLDEST frame is overwritten and counted. The batch's
+  `setAudioCapture` vector is untouched beside it.
+
+### The commands (`serveInteractive`; `err audio needs --dsp` without the cores)
+
+| command | reply | does |
+|---|---|---|
+| `audio start [main\|cue\|all]` | `ok` | starts empty (restarts if on). `main` (default) = ring words 2/3 as L,R; `cue` = words 4/5 (the second pair, 3.1 dB lower); `all` = the eight words per frame (0/1/6/7 are zero on the fixture) |
+| `audio read [<maxframes>]` | `audio <frames> <hex>` | everything pending (at most `<maxframes>`, 1..cap), little-endian signed 16-bit interleaved PCM, 2 (or 8) words per frame, lowercase hex; those frames are released. Never blocks: it answers what is there (`audio 0 ` when nothing is) |
+| `audio status` | `audio status on=0\|1 mode=off\|main\|cue\|all captured=<frames since start> pending=<unread> rate=44100 dropped=<overwritten> cap=2646000` | |
+| `audio stop` | `ok` | also when off |
+
+Bad input answers `err` and the loop keeps serving (`audio` alone, `audio
+start bogus`, `audio start main extra`, `audio read 0`, `audio read`
+before a start). A 25 ms `run` is ~1100 frames = 4.4 KB = 8.8 KB of hex on
+one line; a 100 ms one 4410 frames = 35 KB of hex.
+
+### Measured (`out/_agents/port-audio/smoke_audio.py`)
+
+`.venv/bin/python3 out/_agents/port-audio/smoke_audio.py` boots
+`--interactive --dsp` on the spike's card (`otlive2.img`, OTLIVE/PROJECT),
+checks the gain table at `ready`, the error answers, then YES, `frame on`,
+the batch's trig (track 1 step 5 poked into the PART_PTR blob as
+`--poke-trig 5` does), `audio start main`, PLAY as the matrix key `0x25
+0x01`/`0x25 0x00` (the pattern's +84 bytes left clear, O14j), and `run 100`
++ `audio read` for 4 s emulated (one read split with `audio read 500`).
+It writes `pipe_main.wav` (16-bit stereo) and `pipe_metrics.txt`, and
+asserts: frames per emulated second = 44100 within 0.5 %, `captured = read
++ pending`, nothing dropped, no read over 1 s wall, the capture not silent,
+`third-0.wav` L fits at the onset with a residual under -20 dB, and the
+capture equals the batch's `run3_core0.wav` slot 2 after onset alignment
+(residual under -20 dB). `--cap-test` instead runs 61 s emulated with no
+read and asserts `pending = cap`, `captured = cap + dropped`, RSS growth
+under 40 MB, and that exactly `cap` frames read back afterwards.
+
+Measured 12 Sep 2026 (the M5 Mac of O14j; `pipe_run.txt`, `pipe_metrics.txt`,
+`cap_run.txt`, `cap_cap_metrics.txt` beside the script):
+
+| measurement | value |
+|---|---|
+| boot + fixture load to `ready`, `--dsp` | 58.6 s wall (`ready sample=277688`; the batch's same boot is O14j's 37.5 s plus the cores) |
+| gain table `0x80003c60` at ready | `0xbf7fc081` (the boot log's `main level : sys command 4 posted with 64 -> gain table[0] = 0xbf7fc081`) |
+| frames captured, 4.064 s emulated of PLAY | 179,213 over 40 reads = **44,099.9 per emulated second** (status `captured=179213 pending=0 dropped=0`) |
+| wall, playing and reading every 100 ms | 37.4 s / 36.7 s (two runs) for 4.064 s = **9.0-9.2 wall s per emulated s** (109-111 emulated ms per wall s; O14i's `--dsp` play figure was 132, before O14j's timers) |
+| longest `audio read` | 0.2 ms wall (4410 frames, 35 KB of hex); the `audio read 500` split answers exactly 500 |
+| first sound | frame 81 = 1.8 ms after the PLAY key (the fixture pattern has a saved trig on step 1: PART_PTR blob bytes 6/7 = `01 01`) |
+| `third-0.wav` L in `pipe_main.wav` | gain-only fit over the whole sample: frame 80 x 0.7134, residual -18.5 dB -- and the batch's own `run3_core0.wav` slot 2 fits the same, x 0.7140, -18.4 dB: the DSP voice FADES IN over ~256 samples (residual rms 1666 in the first 1024 samples, 40-160 after). From sample 256 on: **x 0.7032, -33.0 dB** (pipe) vs x 0.7032, -33.2 dB (batch) -- the spike's "x 0.70" |
+| pipe vs the batch reference | the pipe's 9551 samples inside `run3_core0.wav` slot 2 at frame 282745: x 1.0005, **-30.1 dB**, 481 samples bit-identical; the residual is the attack (rms 446 in the first 1024, 1-42 in the rest against a signal of 2000-7600) -- the same voice, started by the PLAY key instead of `startTransportLive` |
+| 61 s emulated with no read (`--cap-test`, `frame` off) | 26 s wall; `captured=2690147 pending=2646000 dropped=44147` = cap + dropped; RSS 1010 -> 1012 MB; the 2,646,000 frames read back afterwards in 500,000-frame reads; `audio stop` frees the ring |
+
+The first run's fit was asserted on the whole sample and failed at -18.5 dB
+on BOTH the pipe and the batch; the attack is the DSP's, not the pipe's,
+and the script fits from sample 256 (`ATTACK`) and finds the batch lag by
+search (its first non-zero sample is one frame before the pipe's). The
+second run, with those fits, passes every check (`PASS`, exit 0, 98 s wall).
+
+### What it does not do
+
+- Core 1 is not captured (it puts out no ESAI frames on the fixture).
+- 16-bit only over the pipe; the batch's `--audio-out` keeps the 24-bit
+  words, and the two capture paths are independent (`--audio-out` under
+  `--interactive` still writes nothing, as before).
+- Nothing paces playback to wall time: at 9 wall s per emulated s the
+  client that wants sound in real time buffers (60 s of ring) and plays
+  what it has.
+- `out/_agents/port/smoke.py` without a card fails 7 checks on this binary
+  AND on the pre-change one (the O14j boot change: `ready` at sample 9083,
+  the dialog not yet drawn); the only difference here is `ready` 139
+  samples later (the main-level post).
+
+Note (verifier, 12 Sep 2026): the `--main-level` default under `--interactive`
+also moves the firmware's own main-level tick on the status bar (bottom right,
+cols 104-108 of rows 59-61: col 108 = off/0, 107 = 32, 106 = 64, 105 = 100,
+104 = 127) and adds one panel message; `--main-level off` reproduces the
+pre-change screens byte for byte. RSS grows in bursts while the sequencer
+plays regardless of the audio ring (pre-existing; ~+34 MB per 2 s slice
+observed) -- a long playing session has not been measured.
