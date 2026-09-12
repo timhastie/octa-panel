@@ -24,8 +24,20 @@ open "out/Virtual Panel.app"
   to that server and leaves it running on quit.
 - The spawned server is terminated on quit, on window close and on
   SIGTERM/SIGINT/SIGHUP to the app. Only `kill -9` of the app orphans it
-  (`pkill -f panel_server.py`). `kill -USR1 <app pid>` is File > Reload,
-  for scripts (the menu itself needs the Accessibility grant to drive).
+  (`pkill -f panel_server.py`). `kill -USR1 <app pid>` is File > Reload
+  and `kill -USR2 <app pid>` File > Show Card Audio Folder, for scripts
+  (the menus themselves need the Accessibility grant to drive).
+- A sheet that is up when the app is asked to quit (the "N files added"
+  alert, an open panel) is ended first, as Later / Cancel: AppKit refuses
+  `terminate:` while a sheet is attached to the window (measured 12 Sep
+  2026: SIGTERM and SIGINT to the app were ignored until the sheet was
+  answered, SIGUSR1 handled meanwhile). Quit Virtual Panel (cmd-Q) and the
+  three signals go through the app's own `quit()`, which ends the sheet and
+  then calls `terminate:`; measured after the change, the app was gone
+  291-356 ms after the signal in every run, the server stopped, and the
+  direct-exit fallback behind `terminate:` was never needed. The Dock's
+  Quit and an AppleScript `quit` call `terminate:` directly and stay
+  refused while a sheet is up, as in any Cocoa app.
 - When the spawned server dies the placeholder says how, with the log tail:
   `status N` for an exit code, `signal N (SIGxxx)` when a signal ended it
   (a bind failure on a busy port ends in the interpreter's SIGBUS, measured
@@ -62,7 +74,78 @@ open "out/Virtual Panel.app"
   placeholder and polls -- it does not spawn, so a server the user is
   restarting by hand (what the Open Project alert asks for) is not raced for
   the port.
+- **File > Add Samples to Card...** (cmd-shift-A): an open panel (several
+  files; anything whose type conforms to `public.audio` -- wav, aif/aiff,
+  mp3, m4a, flac, ogg, and caf, aac, aifc, mp2 ... since the server's pool
+  converts whatever afconvert reads; the seven named extensions are also
+  taken when the type database does not know one). The same thing happens
+  for files dropped on the window, on the Dock icon, or opened with the
+  app from Finder (`CFBundleDocumentTypes`: `public.audio` and folders,
+  rank Alternate -- listed under Open With, never the default); a folder
+  gives its audio files, one level deep. A batch first waits for `/status`
+  phase `ready` (logged as the phase changes: `add (Dock / Finder):
+  waiting for phase ready (now: booting the port ...)`): a Dock drop can
+  launch the app before its server exists, and during the boot the server
+  takes adds but refuses the re-insert ("the unit is still booting"), so a
+  batch added then used to end in "The card could not be re-inserted";
+  a batch queued behind a re-insert waits for that reboot the same way.
+  Then each file is `GET /samples/add?path=<abs>` (the server copies it
+  into the card's AUDIO pool, converting what is not 16/24-bit 44.1 kHz
+  WAV/AIFF with afconvert; the path is percent-encoded down to the RFC
+  3986 unreserved set plus `/`, so `&`, `=`, `+` and spaces in a name
+  survive). The replies are logged (`add ok: <path> -> <name>
+  converted=...`, `add failed: ...`), then an alert: "N files added to the
+  card. Re-insert the card now? (the unit reboots, ~40 s)" with Re-insert
+  / Later, the details (renamed, converted, failed, skipped non-audio)
+  below it. Re-insert is `GET /samples/commit`: the card image is rebuilt
+  from the pool and the unit rebooted, the way a CF card put back in a
+  unit is; the page shows the phase. One batch at a time: files that
+  arrive while one is waiting or running are queued (`queued behind the
+  running batch`) and start when its alert, and the re-insert it may have
+  started, are done. Every alert after launch is a sheet on the window,
+  never a modal `runModal()`: a modal loop entered from a URLSession
+  completion (a block on the main queue) left the main queue undrained
+  until the click -- other replies, the ready poll and the signal handlers
+  all waited on the "could not be re-inserted" alert (measured 12 Sep
+  2026; as a sheet, a second batch was logged 40 ms after `open -a` and
+  SIGUSR1 handled in 39 ms with it up).
+- **File > Show Card Audio Folder**: `GET /samples` -> `pool`, opened in
+  Finder. That is the staged folder the card is built from, not the
+  project's own AUDIO: the server seeds it at start (and from `--audio`),
+  so a file put there by hand is on the card after the next re-insert.
+- `VIRTUAL_PANEL_ADD=/a.wav:/b.mp3` (paths separated by `:`) in the
+  environment runs the add flow at launch, once `/status` says `ready`
+  (the same wait every batch does), without the open panel;
+  `VIRTUAL_PANEL_ADD_THEN=commit` or `later` answers the alert without
+  showing it -- unset, empty or any other value shows the alert (another
+  value is logged: `VIRTUAL_PANEL_ADD_THEN=x: neither commit nor later`).
+  For scripts and the verification below.
 - Window: Minimize, Zoom. Edit: the clipboard for the key-map drawer.
+
+Measured 12 Sep 2026 (port 8588, the OTLIVE fixture, launched from a shell
+with `VIRTUAL_PANEL_ADD` naming a `.caf`, a 16-bit 48 kHz WAV and a `.txt`,
+`VIRTUAL_PANEL_ADD_THEN=commit`, plus a second batch sent with `open -a`
+at +3 s, during the boot): the first batch logged `waiting for phase ready
+(now: no answer)` at +0 s and `(now: booting the port ...)` at +1 s, the
+second `queued behind the running batch` at +3 s; `/status` ready at
++42 s, when the caf came back `converted: true` as `plain.wav`, the 48 kHz
+WAV converted under its own name, the `.txt` skipped before any request;
+`/samples/commit` went out the same second, `/status` read `phase:
+re-inserting the card (reboot, ~40 s)`, `card_busy: true`, and the second
+batch logged `waiting for phase ready (now: re-inserting the card ...)`;
+`ready` again at +86 s, the second batch's add answered at +85 s and its
+sheet up; `/samples` then listed the three (the first two also in
+`out/_panel_stage_8588/OTLIVE/AUDIO`, `mono24.wav` under `pending`);
+SIGTERM at +88 s with the sheet up: `quit: ending the open sheet`, the
+server stopped, the app gone within a second, no `panel_server.py --port
+8588` and no `ot_emu` on `_panel_card_8588.img` left (`pgrep -fl ot_emu`:
+the child's `--interactive` is not next to the binary name, so grep for
+the card file), port free. An earlier run the same day with a 24-bit
+48 kHz AIFF, an AAC `.m4a`, `my kick & snare.wav` (kept as `my kick _
+snare.wav`), a folder and a missing path ("not a file" from the server)
+measured the same boot (+41 s) and re-insert (39.4 s, the server's `card
+re-inserted with 41 files` line; `/status` `restarts` counts watchdog
+respawns, not re-inserts).
 
 Window: 1440x860 to start, centered on the first launch, 960x560 minimum,
 size and position remembered (`NSWindow Frame VirtualPanelWindow` in the
@@ -74,6 +157,6 @@ VirtualPanelWindow"` forgets it).
 | file | is |
 |---|---|
 | `VirtualPanel.swift` | the whole app |
-| `Info.plist` | bundle id `io.octabam.virtual-panel`, min macOS 13 |
+| `Info.plist` | bundle id `io.octabam.virtual-panel`, min macOS 13, the audio document types for Dock drops |
 | `build.sh` | swiftc -O (explicit arm64 target + SDK: a Rosetta shell otherwise loses both), bundle assembly, `repo_root`, icon, `codesign -s -` |
 | `make_icon.py` | draws the icon PNG (stdlib); `build.sh` runs sips + iconutil on it |

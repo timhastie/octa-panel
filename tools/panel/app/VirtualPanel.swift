@@ -13,7 +13,27 @@
 // app spawned is terminated on quit, window close, SIGTERM/SIGINT/SIGHUP.
 // Everything the server prints, and the app's own lines, go to
 // out/panel_app.log.
+//
+// Samples (12 Sep 2026): File > Add Samples to Card... (cmd-shift-A), files
+// dropped on the window or the Dock icon, and VIRTUAL_PANEL_ADD=<p>[:<p>...]
+// (for scripts) all go the same way: the batch waits for /status phase
+// "ready" (a Dock drop can launch the app; the server refuses a re-insert
+// while the unit boots), then GET /samples/add?path=<abs> per file (the
+// server copies it into the card's AUDIO pool, converting what is not
+// 16/24-bit 44.1 kHz WAV/AIFF), then an alert offers /samples/commit -- the
+// card image is rebuilt and the unit rebooted, the way a re-inserted CF card
+// is. VIRTUAL_PANEL_ADD_THEN=commit|later answers that alert unattended.
+//
+// Every alert after launch is a sheet on the window, never runModal(): a
+// modal loop entered from a URLSession completion (a block on the main
+// queue) leaves the main queue undrained until the click -- other replies,
+// the signal handlers and the ready poll all froze (measured 12 Sep 2026).
+// And NSApplication.terminate(_:) is refused while a sheet is attached to
+// the window (measured the same day: SIGTERM, SIGINT and cmd-Q ignored until
+// the sheet was answered), so quit() ends the sheet first and, should
+// terminate: still return, stops the server and exits itself.
 import Cocoa
+import UniformTypeIdentifiers
 import WebKit
 
 // MARK: - repo root, log
@@ -168,14 +188,80 @@ final class PanelServer {
     /// GET /status. ok = HTTP 200 carrying JSON. Completion on the main thread;
     /// a refused connection fails within milliseconds, so a 500 ms poll is cheap.
     func probe(timeout: TimeInterval, _ done: @escaping (Bool, [String: Any]?) -> Void) {
-        let req = URLRequest(url: statusURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout)
-        Self.session.dataTask(with: req) { data, resp, _ in
+        get("/status", timeout: timeout) { ok, st, _ in done(ok, st) }
+    }
+
+    /// Everything but the unreserved set (RFC 3986) and "/" is percent-encoded,
+    /// so a path with "&", "=", "+" or "#" in it survives the server's own
+    /// split on "&"/"=" and both unquote() and unquote_plus() give it back.
+    static let pathAllowed = CharacterSet(charactersIn:
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~/")
+
+    /// GET <path>?<query>, JSON reply. ok = HTTP 200 carrying a JSON object;
+    /// `why` says what went wrong otherwise ("HTTP 404", the URL error).
+    /// Completion on the main thread.
+    func get(_ path: String, query: [(String, String)] = [], timeout: TimeInterval,
+             _ done: @escaping (Bool, [String: Any]?, String) -> Void) {
+        var s = "http://127.0.0.1:\(port)" + path
+        if !query.isEmpty {
+            s += "?" + query.map { k, v in
+                k + "=" + (v.addingPercentEncoding(withAllowedCharacters: Self.pathAllowed) ?? v)
+            }.joined(separator: "&")
+        }
+        guard let u = URL(string: s) else { done(false, nil, "bad URL \(s)"); return }
+        let req = URLRequest(url: u, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout)
+        Self.session.dataTask(with: req) { data, resp, err in
             var st: [String: Any]? = nil
-            if let d = data, (resp as? HTTPURLResponse)?.statusCode == 200 {
+            var why = ""
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            if let d = data, code == 200 {
                 st = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any]
+                if st == nil { why = "not JSON: " + String(decoding: d.prefix(80), as: UTF8.self) }
+            } else if let e = err {
+                why = e.localizedDescription
+            } else {
+                why = "HTTP \(code)"
             }
-            DispatchQueue.main.async { done(st != nil, st) }
+            DispatchQueue.main.async { done(st != nil, st, why) }
         }.resume()
+    }
+}
+
+// MARK: - the web view (a drop target)
+
+/// WKWebView that takes audio files dropped on the window for the sample
+/// pool instead of letting the page (or WebKit's default navigation) have
+/// them. Every other drag -- text into the key-map drawer's fields -- goes
+/// to super, i.e. the page, as before.
+final class PanelWebView: WKWebView {
+    var onDropFiles: (([URL]) -> Void)?
+
+    override init(frame: CGRect, configuration: WKWebViewConfiguration) {
+        super.init(frame: frame, configuration: configuration)
+        registerForDraggedTypes(registeredDraggedTypes + [.fileURL])
+    }
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    private func droppedFiles(_ info: NSDraggingInfo) -> [URL] {
+        let urls = info.draggingPasteboard.readObjects(forClasses: [NSURL.self],
+                                                       options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+        return urls.filter { AppDelegate.isSampleSource($0) }
+    }
+
+    override func draggingEntered(_ info: NSDraggingInfo) -> NSDragOperation {
+        droppedFiles(info).isEmpty ? super.draggingEntered(info) : .copy
+    }
+    override func draggingUpdated(_ info: NSDraggingInfo) -> NSDragOperation {
+        droppedFiles(info).isEmpty ? super.draggingUpdated(info) : .copy
+    }
+    override func prepareForDragOperation(_ info: NSDraggingInfo) -> Bool {
+        droppedFiles(info).isEmpty ? super.prepareForDragOperation(info) : true
+    }
+    override func performDragOperation(_ info: NSDraggingInfo) -> Bool {
+        let urls = droppedFiles(info)
+        if urls.isEmpty { return super.performDragOperation(info) }
+        onDropFiles?(urls)
+        return true
     }
 }
 
@@ -193,6 +279,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     var probeGen = 0                       // startServer probes older than this are dropped
     var panelShown = false                 // the web view is on the server's page
     var signalSources: [DispatchSourceSignal] = []
+    /// One add batch as it was asked for; queued whole so a VIRTUAL_PANEL_ADD
+    /// that arrives before the server answers keeps its auto-answer (the
+    /// first version queued bare URLs and re-ran them with the alert).
+    struct AddRequest { let urls: [URL]; let source: String; let autoAnswer: String? }
+    var pendingAdds: [AddRequest] = []     // batches waiting for the unit (or for a running batch)
+    var adding = false                     // an add batch (ready wait, requests, alert, commit) is in flight
+    var quitting = false                   // quit() has begun: sheet handlers and queued batches do nothing
+    var shutDown = false                   // shutdown() ran (once, whichever path quits)
 
     init(repo: URL, port: Int) {
         self.repo = repo
@@ -212,26 +306,83 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             self.showPlaceholder("the panel server exited: \(how)", failed: true)
         }
         startServer()
+        // VIRTUAL_PANEL_ADD=<path>[:<path>...]: the add flow without the UI,
+        // with VIRTUAL_PANEL_ADD_THEN=commit|later standing in for the alert
+        // (unset, empty or anything else: the alert is shown).
+        let env = ProcessInfo.processInfo.environment
+        if let spec = env["VIRTUAL_PANEL_ADD"], !spec.isEmpty {
+            let urls = spec.split(separator: ":").map { URL(fileURLWithPath: String($0)) }
+            var then = env["VIRTUAL_PANEL_ADD_THEN"] ?? ""
+            if !then.isEmpty && then != "commit" && then != "later" {
+                Log.write("VIRTUAL_PANEL_ADD_THEN=\(then): neither commit nor later, the alert is shown instead")
+                then = ""
+            }
+            Log.write("VIRTUAL_PANEL_ADD: \(urls.count) path(s), then \(then.isEmpty ? "the alert" : then)")
+            addSamples(urls, source: "VIRTUAL_PANEL_ADD", autoAnswer: then.isEmpty ? nil : then)
+        }
+        drainPendingAdds()   // a Dock-drop launch queued its files before the window existed
+    }
+
+    /// Files handed to the app by Finder: dropped on the Dock icon, or opened
+    /// with it. Called before the window exists when the app is launched by
+    /// the drop, hence the queue.
+    func application(_ app: NSApplication, open urls: [URL]) {
+        addSamples(urls, source: "Dock / Finder")
     }
 
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { true }
     func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { true }
 
-    func applicationWillTerminate(_ n: Notification) {
+    /// Also reached by the Dock's Quit and an AppleScript quit, which call
+    /// terminate: directly (with a sheet up those are refused before this
+    /// runs -- as in every Cocoa app; the app's own routes end the sheet
+    /// first, see quit()).
+    func applicationShouldTerminate(_ s: NSApplication) -> NSApplication.TerminateReply {
+        quitting = true
+        return .terminateNow
+    }
+
+    func applicationWillTerminate(_ n: Notification) { shutdown() }
+
+    /// Stop what the app started; once, whichever way the process ends.
+    func shutdown() {
+        guard !shutDown else { return }
+        shutDown = true
         stopPolling()
         server.stop()
         Log.write("quit")
     }
 
+    /// Quit Virtual Panel (cmd-Q), SIGTERM/SIGINT/SIGHUP. terminate: is
+    /// refused while a sheet is attached to the window (measured 12 Sep 2026
+    /// with the "N files added" sheet: SIGTERM, SIGINT and cmd-Q ignored until
+    /// it was answered, SIGUSR1 handled in 42 ms meanwhile), so the sheet is
+    /// ended first, as Cancel / Later. terminate: exits the process when it
+    /// goes through; if it returns anyway the server is stopped here and the
+    /// process exits directly, so a kill never has to be repeated.
+    @objc func quit(_ sender: Any?) {
+        quitting = true
+        if let s = window?.attachedSheet {
+            Log.write("quit: ending the open sheet")
+            window.endSheet(s, returnCode: .cancel)
+        }
+        NSApp.terminate(nil)
+        Log.write("quit: terminate: returned (refused); stopping the server and exiting directly")
+        shutdown()
+        exit(0)
+    }
+
     /// SIGTERM/SIGINT/SIGHUP (kill, ctrl-C in the shell that launched it,
-    /// terminal closed) go through NSApp.terminate so the server is stopped
-    /// too. SIGKILL cannot be caught: that one orphans a spawned server
-    /// (pkill -f panel_server.py). SIGUSR1 is File > Reload, for scripts
-    /// (menus cannot be driven without the Accessibility grant).
+    /// terminal closed) go through quit() so the server is stopped too.
+    /// SIGKILL cannot be caught: that one orphans a spawned server (pkill -f
+    /// panel_server.py). SIGUSR1 is File > Reload and SIGUSR2 File > Show
+    /// Card Audio Folder, for scripts (menus cannot be driven without the
+    /// Accessibility grant).
     func installSignalHandlers() {
-        let quit: () -> Void = { NSApp.terminate(nil) }
+        let quit: () -> Void = { [weak self] in self?.quit(nil) }
         let reload: () -> Void = { [weak self] in self?.reload(nil) }
-        for (sig, act) in [(SIGTERM, quit), (SIGINT, quit), (SIGHUP, quit), (SIGUSR1, reload)] {
+        let showPool: () -> Void = { [weak self] in self?.showCardAudioFolder(nil) }
+        for (sig, act) in [(SIGTERM, quit), (SIGINT, quit), (SIGHUP, quit), (SIGUSR1, reload), (SIGUSR2, showPool)] {
             signal(sig, SIG_IGN)
             let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
             src.setEventHandler { act() }
@@ -257,7 +408,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         // there is one, overrides the centered position.
         window.center()
         _ = window.setFrameAutosaveName("VirtualPanelWindow")
-        web = WKWebView(frame: rect, configuration: WKWebViewConfiguration())
+        let pw = PanelWebView(frame: rect, configuration: WKWebViewConfiguration())
+        pw.onDropFiles = { [weak self] urls in self?.addSamples(urls, source: "window drop") }
+        web = pw
         web.autoresizingMask = [.width, .height]
         web.navigationDelegate = self
         web.underPageBackgroundColor = NSColor(srgbRed: 0.086, green: 0.086, blue: 0.090, alpha: 1)  // panel.html's body
@@ -274,13 +427,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         app.addItem(withTitle: "About Virtual Panel",
                     action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
         app.addItem(.separator())
-        app.addItem(withTitle: "Quit Virtual Panel", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        app.addItem(withTitle: "Quit Virtual Panel", action: #selector(quit(_:)), keyEquivalent: "q").target = self
         appItem.submenu = app
 
         let fileItem = NSMenuItem(); main.addItem(fileItem)
         let file = NSMenu(title: "File")
         file.addItem(withTitle: "Open Project...", action: #selector(openProject(_:)), keyEquivalent: "o").target = self
         file.addItem(withTitle: "Reload", action: #selector(reload(_:)), keyEquivalent: "r").target = self
+        file.addItem(.separator())
+        let add = file.addItem(withTitle: "Add Samples to Card...", action: #selector(addSamples(_:)), keyEquivalent: "A")
+        add.keyEquivalentModifierMask = [.command, .shift]
+        add.target = self
+        file.addItem(withTitle: "Show Card Audio Folder", action: #selector(showCardAudioFolder(_:)), keyEquivalent: "").target = self
         fileItem.submenu = file
 
         // Edit: the panel's key-map drawer has text fields and EXPORT MAP uses the clipboard.
@@ -357,11 +515,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     /// ours to restart, so say what to run instead.
     func restartServer(project: URL?) {
         if server.attached {
-            let a = NSAlert()
-            a.messageText = "The server on port \(server.port) was not started by this app"
-            a.informativeText = "Restart it yourself with the project, then choose File > Reload:\n\n"
-                + server.commandLine(project: project)
-            a.runModal()
+            sheet("The server on port \(server.port) was not started by this app",
+                  "Restart it yourself with the project, then choose File > Reload:\n\n"
+                  + server.commandLine(project: project))
             return
         }
         stopPolling()
@@ -399,6 +555,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         web.load(URLRequest(url: server.url, cachePolicy: .reloadIgnoringLocalCacheData))
     }
 
+    /// Poll /status once a second until phase is "ready" (true), or the
+    /// server says failed / the deadline has passed (false). The phase is
+    /// logged under `what` each time it changes, "no answer" while nothing
+    /// listens on the port yet. Main thread.
+    func whenReady(deadline: Date, what: String, seen: String = "", _ done: @escaping (Bool) -> Void) {
+        server.probe(timeout: 2.0) { [weak self] ok, st in
+            guard let self = self else { return }
+            let phase = ok ? (st?["phase"] as? String ?? "?") : "no answer"
+            if phase == "ready" { done(true); return }
+            if phase == "failed" { Log.write("\(what): the server failed: \(st?["fault"] ?? "")"); done(false); return }
+            if phase != seen { Log.write("\(what): waiting for phase ready (now: \(phase))") }
+            if Date() > deadline { Log.write("\(what): still not ready, giving up"); done(false); return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                self.whenReady(deadline: deadline, what: what, seen: phase, done)
+            }
+        }
+    }
+
+    /// An alert as a sheet on the window; `done` gets the index of the
+    /// button pressed (0 = the first). Never runModal() after launch: a modal
+    /// loop entered from a URLSession completion (a block on the main queue)
+    /// leaves the main queue undrained until the click -- other replies, the
+    /// ready poll and the signal handlers all waited on the commit-failure
+    /// alert (measured 12 Sep 2026). Sheets on one window queue up; nothing
+    /// is shown once quitting, and a sheet quit() ended gets no `done`.
+    func sheet(_ title: String, _ info: String, buttons: [String] = ["OK"],
+               _ done: @escaping (Int) -> Void = { _ in }) {
+        guard !quitting else { return }
+        let a = NSAlert()
+        a.messageText = title
+        a.informativeText = info
+        for b in buttons { a.addButton(withTitle: b) }
+        a.beginSheetModal(for: window) { [weak self] resp in
+            guard let self = self, !self.quitting else { return }
+            done(max(0, resp.rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue))
+        }
+    }
+
     // MARK: menu actions
 
     @objc func openProject(_ sender: Any?) {
@@ -430,6 +624,226 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             if panelShown { web.reload() } else { startPolling() }
         } else {
             startServer()
+        }
+    }
+
+    // MARK: samples
+
+    /// The extensions the open panel lists by name, beside every type that
+    /// conforms to public.audio: what the unit plays as is (WAV/AIFF) and the
+    /// usual ones the server converts with afconvert.
+    static let sampleExtensions = ["wav", "aif", "aiff", "mp3", "m4a", "flac", "ogg"]
+
+    /// What is sent to the server: one of the extensions above, or any file
+    /// whose type conforms to public.audio (caf, aac, aifc, mp2 ... -- the
+    /// panel lets those be picked and the server's pool converts whatever
+    /// afconvert reads). The type comes from the file itself when it can be
+    /// read, else from the extension.
+    static func isAudioFile(_ u: URL) -> Bool {
+        if sampleExtensions.contains(u.pathExtension.lowercased()) { return true }
+        let t = (try? u.resourceValues(forKeys: [.contentTypeKey]))?.contentType
+            ?? UTType(filenameExtension: u.pathExtension)
+        return t?.conforms(to: .audio) ?? false
+    }
+
+    /// An audio file, or a folder (its audio files are taken, one level deep).
+    static func isSampleSource(_ u: URL) -> Bool {
+        var dir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: u.path, isDirectory: &dir), dir.boolValue { return true }
+        return isAudioFile(u)
+    }
+
+    /// Folders expanded, non-audio files listed under `skipped`.
+    static func sampleFiles(_ urls: [URL]) -> (files: [URL], skipped: [URL]) {
+        var files: [URL] = [], skipped: [URL] = []
+        let fm = FileManager.default
+        for u in urls {
+            var dir: ObjCBool = false
+            if fm.fileExists(atPath: u.path, isDirectory: &dir), dir.boolValue {
+                let kids = (try? fm.contentsOfDirectory(at: u, includingPropertiesForKeys: [.contentTypeKey],
+                                                        options: [.skipsHiddenFiles])) ?? []
+                files += kids.filter { isAudioFile($0) }
+                            .sorted { $0.lastPathComponent.lowercased() < $1.lastPathComponent.lowercased() }
+            } else if isAudioFile(u) {
+                files.append(u)
+            } else {
+                skipped.append(u)
+            }
+        }
+        return (files, skipped)
+    }
+
+    @objc func addSamples(_ sender: Any?) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        panel.prompt = "Add"
+        panel.message = "Audio files for the card's AUDIO folder (WAV/AIFF go as they are; mp3, m4a, flac, ogg and other rates are converted to 16-bit 44.1 kHz WAV)"
+        panel.allowedContentTypes = Self.sampleExtensions.compactMap { UTType(filenameExtension: $0) } + [.audio]
+        panel.beginSheetModal(for: window) { [weak self] resp in
+            guard let self = self, resp == .OK, !panel.urls.isEmpty else { return }
+            self.addSamples(panel.urls, source: "Add Samples to Card")
+        }
+    }
+
+    /// The one add flow, whatever brought the files: the batch is queued and
+    /// run when the unit is ready, one batch at a time (each has its own
+    /// alert or answer). `autoAnswer` "commit" / "later" replaces the alert
+    /// (VIRTUAL_PANEL_ADD_THEN); nil shows it.
+    func addSamples(_ urls: [URL], source: String, autoAnswer: String? = nil) {
+        Log.write("add (\(source)): \(urls.count) path(s)\(adding ? ", queued behind the running batch" : "")")
+        pendingAdds.append(AddRequest(urls: urls, source: source, autoAnswer: autoAnswer))
+        drainPendingAdds()
+    }
+
+    /// Start the next queued batch once /status says ready -- not before: a
+    /// Dock drop can launch the app (no server yet), files dropped during
+    /// the boot used to be added at once and then offered a re-insert the
+    /// server refuses ("the unit is still booting", measured 12 Sep 2026),
+    /// and adds are refused while a re-insert runs. `adding` holds from here
+    /// until the batch's alert, and the commit it may start, are done.
+    func drainPendingAdds() {
+        guard window != nil, !adding, !quitting, !pendingAdds.isEmpty else { return }
+        adding = true
+        let r = pendingAdds.removeFirst()
+        let what = "add (\(r.source))"
+        whenReady(deadline: Date().addingTimeInterval(900), what: what) { [weak self] ok in
+            guard let self = self, !self.quitting else { return }
+            if ok { self.runAddBatch(r); return }
+            Log.write("\(what): the unit is not ready, \(r.urls.count) path(s) not added")
+            if r.autoAnswer == nil {
+                self.sheet("The unit is not ready, nothing was added to the card.",
+                           "\(r.urls.count) path(s) dropped. Try again once the panel shows the unit running.") { _ in self.endBatch() }
+            } else {
+                self.endBatch()
+            }
+        }
+    }
+
+    func endBatch() {
+        adding = false
+        drainPendingAdds()
+    }
+
+    /// The batch itself, the unit ready: folders expanded, each file GET
+    /// /samples/add?path=<abs>, then the alert, Re-insert being GET
+    /// /samples/commit.
+    func runAddBatch(_ req: AddRequest) {
+        let source = req.source
+        let (files, skipped) = Self.sampleFiles(req.urls)
+        for u in skipped { Log.write("add (\(source)): skipped, not an audio file: \(u.path)") }
+        Log.write("add (\(source)): \(files.count) file(s)")
+        var added: [String] = []      // lines for the alert: new on the card
+        var already: [String] = []    // identical bytes already on the card
+        var failed: [String] = []
+        var i = 0
+        func next() {
+            guard i < files.count else { finish(); return }
+            let u = files[i]; i += 1
+            // conversion (afconvert of a long flac) can take a while: a generous timeout
+            server.get("/samples/add", query: [("path", u.path)], timeout: 300) { ok, r, why in
+                if ok, let r = r, r["ok"] as? Bool == true {
+                    let name = r["name"] as? String ?? u.lastPathComponent
+                    let conv = r["converted"] as? Bool ?? false
+                    let note = r["note"] as? String ?? ""
+                    var line = u.lastPathComponent
+                    if name != u.lastPathComponent { line += " -> " + name }
+                    if conv { line += " (converted to 16-bit 44.1 kHz WAV)" }
+                    if !note.isEmpty { line += conv ? "; " + note : " (" + note + ")" }
+                    // the reply's `pending` lists what the next re-insert would add;
+                    // identical bytes already on the card are not in it (12 Sep 2026)
+                    if let pend = r["pending"] as? [String], !pend.contains(name) {
+                        already.append(line)
+                    } else {
+                        added.append(line)
+                    }
+                    Log.write("add ok: \(u.path) -> \(name) converted=\(conv)\(note.isEmpty ? "" : " note=\(note)")")
+                } else {
+                    let e = (r?["error"] as? String) ?? why
+                    failed.append("\(u.lastPathComponent): \(e)")
+                    Log.write("add failed: \(u.path): \(e)")
+                }
+                next()
+            }
+        }
+        func finish() {
+            let n = added.count
+            var details: [String] = added
+            details += already.map { "already on the card: " + $0 }
+            details += failed.map { "failed: " + $0 }
+            details += skipped.map { "skipped, not an audio file: " + $0.lastPathComponent }
+            // An NSAlert grows with its text and a folder drop can hold dozens
+            // of files (measured 12 Sep 2026: 30 lines put the buttons off
+            // screen), so the sheet shows a few and the log keeps the rest.
+            let shown = 8
+            if details.count > shown {
+                let rest = details.count - shown
+                details = Array(details.prefix(shown)) + ["... and \(rest) more (see \(Log.path))"]
+            }
+            let summary = "\(n) added, \(already.count) already on the card, \(failed.count) failed, \(skipped.count) skipped"
+            if let ans = req.autoAnswer {
+                Log.write("add batch done: \(summary); auto-answer \(ans)")
+                if ans == "commit" && n > 0 { commit() } else { endBatch() }
+                return
+            }
+            Log.write("add batch done: \(summary)")
+            if n > 0 {
+                sheet("\(n) file\(n == 1 ? "" : "s") added to the card.",
+                      "Re-insert the card now? (the unit reboots, ~40 s)"
+                      + (details.isEmpty ? "" : "\n\n" + details.joined(separator: "\n")),
+                      buttons: ["Re-insert", "Later"]) { [weak self] b in
+                    if b == 0 { self?.commit() } else { Log.write("add batch: later (no re-insert)"); self?.endBatch() }
+                }
+            } else if !already.isEmpty && failed.isEmpty {
+                sheet("Already on the card.",
+                      "Nothing new to add, so no re-insert is needed.\n\n" + details.joined(separator: "\n")) { [weak self] _ in
+                    Log.write("add batch: nothing new")
+                    self?.endBatch()
+                }
+            } else {
+                sheet("No files were added to the card.",
+                      details.isEmpty ? "Nothing to add." : details.joined(separator: "\n")) { [weak self] _ in
+                    Log.write("add batch: nothing added")
+                    self?.endBatch()
+                }
+            }
+        }
+        next()
+    }
+
+    /// GET /samples/commit: the card rebuilt from the pool and the unit
+    /// rebooted on it (the page shows the phase). The batch ends with the
+    /// reply, or with the failure sheet; a queued batch then waits for
+    /// ready again, i.e. for the reboot.
+    func commit() {
+        server.get("/samples/commit", timeout: 30) { [weak self] ok, r, why in
+            guard let self = self else { return }
+            if ok, let r = r, r["ok"] as? Bool == true {
+                Log.write("commit: \(r["phase"] as? String ?? "ok")")
+                self.endBatch()
+            } else {
+                let e = (r?["error"] as? String) ?? why
+                Log.write("commit failed: \(e)")
+                self.sheet("The card could not be re-inserted", e + "\n\nThe files stay in the pool: RE-INSERT CARD on the panel page, or the next batch.") { _ in self.endBatch() }
+            }
+        }
+    }
+
+    /// GET /samples "pool" -> the AUDIO folder the card is built from, opened
+    /// in Finder (a file put there by hand is on the card after the next
+    /// /samples/commit).
+    @objc func showCardAudioFolder(_ sender: Any?) {
+        server.get("/samples", timeout: 10) { [weak self] ok, r, why in
+            guard let self = self else { return }
+            if ok, let pool = r?["pool"] as? String, !pool.isEmpty {
+                Log.write("show pool: \(pool)")
+                NSWorkspace.shared.open(URL(fileURLWithPath: pool, isDirectory: true))
+            } else {
+                let e = (r?["error"] as? String) ?? (why.isEmpty ? "no pool in the reply" : why)
+                Log.write("show pool failed: \(e)")
+                self.sheet("The card's audio folder is not known", "GET /samples on port \(self.server.port): \(e)")
+            }
         }
     }
 

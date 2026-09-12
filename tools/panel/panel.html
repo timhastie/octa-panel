@@ -48,6 +48,46 @@
   #export { display:none; width:100%; height:80px; margin-top:6px; background:#0d0d0e; color:#bdbab2;
             border:1px solid #3e3e42; font:10px ui-monospace, Menlo, monospace; box-sizing:border-box; }
 
+  /* ---- AUDIO POOL drawer: the card's AUDIO folder (GET /samples), opened by
+          clicking the COMPACT FLASH slot on the rear edge (or its toolbar button) ---- */
+  #pool { display:none; padding:6px 10px 8px; border-top:1px solid #232326; }
+  #pool.open { display:block; }
+  #pool.drop { background:rgba(98,224,106,.06); }
+  #pool .note { font-size:10px; color:var(--dim); margin-bottom:6px; max-width:1100px; }
+  #pool .note b { color:#bdbab2; }
+  #pool code { font-family:ui-monospace, Menlo, monospace; font-size:10px; color:#bdbab2; }
+  #poolrow { display:flex; gap:14px; align-items:flex-start; flex-wrap:wrap; }
+  #poollist { flex:1 1 520px; min-width:0; max-height:190px; overflow:auto; background:#0d0d0e;
+              border:1px solid #2a2a2d; border-radius:3px; }
+  .f { display:grid; grid-template-columns:minmax(120px,1fr) minmax(150px,auto) 60px minmax(110px,auto) 58px;
+       gap:0 12px; align-items:center; padding:2px 8px; border-bottom:1px solid #1a1a1c; font-size:10px; }
+  .f:last-child { border-bottom:0; }
+  .f.h { color:var(--dim); position:sticky; top:0; background:#131315; }
+  .f .n { font-family:ui-monospace, Menlo, monospace; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:#d8d5cc; }
+  .f .b { text-align:right; color:#bdbab2; }
+  .f .fm, .f .st { color:#bdbab2; white-space:nowrap; }
+  .f.pending { background:#26210f; }
+  .f.pending .n, .f.pending .st { color:#f0c85a; }
+  .f button { background:#2c2c2e; color:#d8d5cc; border:1px solid #47474a; border-radius:3px; padding:0 6px; font-size:9px; cursor:pointer; }
+  .f button:hover { background:#3f2a28; border-color:#a03530; }
+  #poolside { flex:0 1 380px; min-width:260px; display:flex; flex-direction:column; gap:6px; font-size:10px; }
+  #poolside button { background:#2c2c2e; color:#d8d5cc; border:1px solid #47474a; border-radius:4px;
+                     padding:3px 10px; font-size:10px; cursor:pointer; letter-spacing:.04em; }
+  #poolside button:hover { background:#38383a; }
+  #poolside button:disabled { opacity:.45; cursor:default; }
+  #reinsert { background:#5a1512 !important; border-color:#d02b26 !important; color:#fff !important;
+              font-size:12px !important; padding:8px 16px !important; letter-spacing:.14em !important; font-weight:600; }
+  #reinsert:hover:not(:disabled) { background:#7a1f1a !important; }
+  #reinsert.armed { background:#b8261f !important; }
+  #poolstate { color:var(--dim); }
+  #poollog { font-family:ui-monospace, Menlo, monospace; font-size:9.5px; color:#bdbab2; max-height:70px; overflow:auto; white-space:pre-wrap; }
+  #poollog .bad { color:#ff8a80; }
+  #poollog .conv { color:#f0c85a; }
+  #howto { border-top:1px solid #232326; padding-top:5px; color:var(--dim); line-height:1.5; }
+  #howto b { color:#bdbab2; }
+  #howto kbd { font:9px ui-monospace, Menlo, monospace; color:#e8e6df; background:#2c2c2e; border:1px solid #47474a;
+               border-radius:3px; padding:0 4px; }
+
   /* ---- stage ---- */
   #view { flex:1; position:relative; overflow:hidden; }
   #stage { position:absolute; left:50%; top:50%; width:1420px; height:760px; overflow:hidden;
@@ -66,6 +106,20 @@
   .screw::before, .screw::after { content:""; position:absolute; background:#141416; left:50%; top:50%; }
   .screw::before { width:9px; height:1.5px; margin:-.75px 0 0 -4.5px; }
   .screw::after  { width:1.5px; height:9px; margin:-4.5px 0 0 -.75px; }
+  /* COMPACT FLASH: the slot on the rear edge (the 46x7 jack of the first
+     version) with the card's edge seated in it; a transparent hit area over
+     slot and label -- click opens the AUDIO POOL drawer, files dropped on it
+     go to the pool. .ejected pulls the card out while the unit reboots. */
+  #card { cursor:pointer; border-radius:4px; }
+  #card .slot { position:absolute; left:27px; top:9px; width:46px; height:7px; border-radius:2px;
+                background:linear-gradient(#3a3a3d, #202022); border:1px solid #4a4a4d; box-sizing:border-box; }
+  #card .cf { position:absolute; left:31px; top:5px; width:38px; height:5px; border-radius:1px 1px 0 0;
+              background:linear-gradient(#2f6396, #1d4269); border:1px solid #0e2338; border-bottom:0;
+              box-sizing:border-box; transition:top .3s; }
+  #card.ejected .cf { top:-3px; }
+  #card:hover .slot, #card.open .slot { border-color:#e8b23a; box-shadow:0 0 6px rgba(232,178,58,.45); }
+  #card.drop { background:rgba(98,224,106,.1); }
+  #card.drop .slot { border-color:#8fe39a; box-shadow:0 0 8px rgba(98,224,106,.6); }
 
   /* labels: white 10px caps, function (shifted) labels red 9px */
   .lb { color:var(--txt); font-size:10px; letter-spacing:.02em; white-space:nowrap; text-transform:uppercase;
@@ -157,6 +211,7 @@
     <span id="phase">…</span>
     <span id="fault"></span>
     <button id="mapbtn" onclick="toggleMap()">MAP KEYS</button>
+    <button id="poolbtn" onclick="togglePool()" title="the card's AUDIO folder (also: click the COMPACT FLASH slot)">AUDIO POOL</button>
     <button onclick="doRun(1000)">RUN 1s</button>
     <button onclick="doRun(5000)">RUN 5s</button>
     <button onclick="exportMap()">EXPORT MAP</button>
@@ -171,6 +226,31 @@
     <div id="matrix"></div>
     <div id="encoders"></div>
     <textarea id="export" readonly spellcheck="false"></textarea>
+  </div>
+  <div id="pool">
+    <div class="note">
+      <b>COMPACT FLASH &middot; AUDIO POOL</b> &mdash; the card's <code id="pooldir">AUDIO</code> folder, what the
+      unit's file browser sees. Add WAV/AIFF (16/24-bit 44.1 kHz; anything else &mdash; mp3, aac, flac, 48 kHz &mdash;
+      is converted to 16-bit 44.1 kHz WAV), then <b>RE-INSERT CARD</b>: the card image is rebuilt from the pool and
+      the unit reboots (~40 s; the screen shows the phase). The same as copying files onto the card in USB disk
+      mode and putting it back &mdash; the unit only sees files that are on the card it booted with.
+    </div>
+    <div id="poolrow">
+      <div id="poollist"></div>
+      <div id="poolside">
+        <div>
+          <button id="addbtn" onclick="document.getElementById('addinput').click()">ADD FILES&hellip;</button>
+          <span style="color:var(--dim)">or drop files on the card slot</span>
+          <input id="addinput" type="file" multiple accept=".wav,.aif,.aiff,.mp3,.m4a,.flac,.ogg" hidden>
+        </div>
+        <div>
+          <button id="reinsert" onclick="reinsert()">RE-INSERT CARD</button>
+        </div>
+        <div id="poolstate"></div>
+        <div id="poollog"></div>
+        <div id="howto"></div>
+      </div>
+    </div>
   </div>
 </div>
 <div id="view"><div id="stage">
@@ -285,7 +365,7 @@ for (const [x, kind] of JACKS) {
   if (kind === 1) el("jack", x, 15, 12, 12);
   else if (kind === 2) { el("jack", x - 9, 15, 12, 12); el("jack", x + 9, 15, 12, 12); }
   else if (kind === "din") el("jack", x, 15, 16, 16);
-  else if (kind === "cf") el("jack rect", x, 15, 46, 7);
+  else if (kind === "cf") continue;                       // drawn as #card below the labels (it is a control)
   else if (kind === "usb") el("jack rect", x, 15, 12, 7);
   else el("jack rect", x, 15, 16, 9);
 }
@@ -302,6 +382,12 @@ for (const [id, x, y, r, live] of KNOBS) {
   const cap = document.createElement("div"); cap.className = "cap"; k.append(cap);
 }
 for (const [t, x, y, cls] of LABELS) label(t, x, y, cls);
+{ // the COMPACT FLASH slot (JACKS "cf" at 840,15): a 100x64 hit area over slot + label, after the labels so it is on top
+  const c = el("", 840, 34, 100, 64); c.id = "card";
+  c.title = "COMPACT FLASH — click: the card's AUDIO pool (add samples; RE-INSERT CARD reboots the unit); drop audio files here to add them";
+  for (const cls of ["cf", "slot"]) { const d = document.createElement("div"); d.className = cls; c.append(d); }
+  c.addEventListener("click", () => togglePool());
+}
 el("sw", 122, 462, 8, 8);   // "FUNCTION" legend: red labels are FUNC + key
 for (const [x1, x2, y, text, tx] of RULES) {
   const l = label(text, tx, y, "r");
@@ -496,6 +582,11 @@ function turn(el, detents) {
   }, 80);
   pending.set(el, p);
 }
+// Track keys: a quick double tap (two clicks) opens the track's sample slot
+// list, as on the unit. The two clicks are two ordinary presses; the server
+// slows its idle pump for a moment after a track key is released so the
+// second press lands inside the firmware's double-tap window (a third
+// double tap would close the list again, so nothing extra is sent here).
 document.addEventListener("dblclick", e => {
   const el = e.target.closest(".knob.live");
   if (!el) return;
@@ -621,6 +712,152 @@ async function doRun(ms) {
   hint(r.ok ? `ran ${ms} ms` : `run failed: ${r.result}`);
 }
 
+// ---------------- AUDIO POOL drawer (the card) ----------------
+// The unit's samples live in the set's AUDIO folder on the card; here the
+// card is a FAT image built at boot from a staged tree, and the pool is that
+// tree's AUDIO folder (GET /samples: name, bytes, format, plus "pending" =
+// added since the card was built). ADD FILES / a drop on the slot POSTs each
+// file's bytes to /samples/upload?name= (the server converts what the unit
+// would not read); REMOVE takes a pending file back out; RE-INSERT CARD
+// (GET /samples/commit) rebuilds the image and reboots the unit -- the
+// server respawns the child as the watchdog does, ~40 s, and the phase
+// overlay on the screen covers the wait. Nothing reaches the firmware
+// until then, exactly as on the hardware (no hot-plug).
+let poolOpen = false, poolDirty = false, poolBusy = false, poolData = null, armTimer = 0;
+// the key sequence on the unit, from tools/panel/README.md "Loading samples"
+const HOWTO = `<b>To put a pool file in a slot on the unit</b> (after RE-INSERT CARD, as on the hardware):
+  <b>double-click a track key</b> T1–T8 → its slot list (<kbd>MACHINE:FLEX</kbd> or <kbd>STATIC</kbd>) ·
+  <kbd>▲</kbd>/<kbd>▼</kbd> pick a slot · <kbd>▶</kbd> (or <kbd>YES</kbd>) opens the file browser on it ·
+  <kbd>▲</kbd>/<kbd>▼</kbd> find the file in AUDIO · <kbd>YES</kbd> loads it · <kbd>NO</kbd> leaves.
+  Details: <code>tools/panel/README.md</code>, "Loading samples".`;
+const fmtBytes = n => n >= 1e6 ? (n / 1e6).toFixed(1) + " MB" : n >= 1e3 ? Math.round(n / 1e3) + " kB" : n + " B";
+function togglePool(open) {
+  poolOpen = open === undefined ? !poolOpen : !!open;
+  $("#pool").classList.toggle("open", poolOpen);
+  $("#poolbtn").classList.toggle("on", poolOpen);
+  $("#card").classList.toggle("open", poolOpen);
+  if (poolOpen) loadPool();
+  fit();
+}
+function poolLog(msg, cls = "") {
+  const d = document.createElement("div"); d.className = cls; d.textContent = msg;
+  const log = $("#poollog"); log.append(d); log.scrollTop = log.scrollHeight;
+}
+async function loadPool() {
+  try {
+    const r = await fetch("/samples");
+    if (!r.ok) throw new Error(`HTTP ${r.status} (this panel_server.py has no /samples)`);
+    poolData = await r.json();
+  } catch (e) {
+    poolData = null;
+    $("#poollist").innerHTML = "";
+    $("#poolstate").textContent = `pool unavailable: ${e.message}`;
+    return;
+  }
+  renderPool();
+}
+function renderPool() {
+  const d = poolData || {files: [], pending: []};
+  const pending = new Set(d.pending || []);
+  const files = [...(d.files || [])];
+  for (const n of pending) if (!files.some(f => f.name === n)) files.push({name: n, bytes: 0, format: "?"});
+  files.sort((a, b) => a.name.localeCompare(b.name, undefined, {numeric: true}));
+  $("#pooldir").textContent = d.pool || "AUDIO";
+  const list = $("#poollist"); list.innerHTML = "";
+  const row = (cls, cells) => {
+    const r = document.createElement("div"); r.className = "f " + cls;
+    for (const [c, v] of cells) { const s = document.createElement("span"); s.className = c; if (v instanceof Node) s.append(v); else s.textContent = v; r.append(s); }
+    list.append(r); return r;
+  };
+  row("h", [["n", "file"], ["fm", "format"], ["b", "size"], ["st", "status"], ["", ""]]);
+  for (const f of files) {
+    const p = pending.has(f.name);
+    let rm = "";
+    if (p) { rm = document.createElement("button"); rm.textContent = "REMOVE"; rm.onclick = () => removeFile(f.name); }
+    row(p ? "pending" : "", [["n", f.name], ["fm", f.format || ""], ["b", f.bytes ? fmtBytes(f.bytes) : ""],
+                             ["st", p ? "not on the card yet" : "on the card"], ["", rm]]);
+  }
+  if (!files.length) row("", [["n", "(the AUDIO folder is empty)"], ["fm", ""], ["b", ""], ["st", ""], ["", ""]]);
+  // "removed": card files no longer in the pool (the server's diff against
+  // the card it built); an older server without it falls back to poolDirty
+  const removed = (d.removed || []).length;
+  const n = files.length - pending.size;
+  const waiting = [pending.size ? `${pending.size} to add` : "", removed ? `${removed} to remove` : ""].filter(Boolean).join(", ");
+  $("#poolstate").textContent =
+    `${n} file${n === 1 ? "" : "s"} on the card` +
+    (waiting ? ` — ${waiting} at the next RE-INSERT CARD` : poolDirty && !d.removed ? " — changes waiting for RE-INSERT CARD" : "") +
+    (poolBusy || d.busy ? " — the unit is busy (see the phase); RE-INSERT waits" : "");
+  $("#reinsert").disabled = poolBusy || !!d.busy || !poolData;
+  $("#addbtn").disabled = !poolData || !!d.busy;
+}
+async function uploadFiles(files) {
+  files = [...files].filter(f => f && f.name);
+  if (!files.length) return;
+  if (!poolOpen) togglePool(true);
+  for (const f of files) {
+    hint(`uploading ${f.name} (${fmtBytes(f.size)})…`);
+    let r;
+    try {
+      const resp = await fetch(`/samples/upload?name=${encodeURIComponent(f.name)}`, {method: "POST", body: f});
+      r = await resp.json();
+    } catch (e) { r = {ok: false, error: `upload failed: ${e.message}`}; }
+    if (r.ok) { poolDirty = true; poolLog(`${f.name} → ${r.name}${r.converted ? " (converted)" : ""}${r.note ? ": " + r.note : ""}`, r.converted ? "conv" : ""); }
+    else poolLog(`${f.name}: ${r.error || "refused"}`, "bad");
+  }
+  hint(`${files.length} file${files.length === 1 ? "" : "s"} sent to the pool — RE-INSERT CARD to let the unit see them`);
+  await loadPool();
+}
+async function removeFile(name) {
+  const wasPending = !!poolData && (poolData.pending || []).includes(name);   // never on the card: nothing changes there
+  let r;
+  try { r = await fetch(`/samples/remove?name=${encodeURIComponent(name)}`).then(x => x.json()); }
+  catch (e) { r = {ok: false, error: e.message}; }
+  if (r.ok) { if (!wasPending) poolDirty = true; poolLog(`${name}: removed from the pool`); }
+  else poolLog(`${name}: remove failed: ${r.error || "?"}`, "bad");
+  await loadPool();
+}
+// Two clicks (no confirm(): WKWebView answers false to it without a UI
+// delegate): the first arms the button for 5 s, the second commits.
+async function reinsert() {
+  const b = $("#reinsert");
+  if (!b.classList.contains("armed")) {
+    b.classList.add("armed"); b.textContent = "REBOOT THE UNIT? CLICK AGAIN";
+    clearTimeout(armTimer);
+    armTimer = setTimeout(() => { b.classList.remove("armed"); b.textContent = "RE-INSERT CARD"; }, 5000);
+    return;
+  }
+  clearTimeout(armTimer);
+  b.classList.remove("armed"); b.textContent = "RE-INSERT CARD"; b.disabled = true;
+  let r;
+  try { r = await fetch("/samples/commit").then(x => x.json()); }
+  catch (e) { r = {ok: false, error: e.message}; }
+  if (r.ok) { poolDirty = false; poolLog(`card re-inserted: ${r.phase || "the unit reboots"}`); hint(r.phase || "re-inserting the card"); }
+  else { poolLog(`re-insert failed: ${r.error || "?"}`, "bad"); b.disabled = false; }
+  await loadPool();
+}
+// the phase poll feeds this: the card is out while the unit reboots, and
+// the list refreshes when the unit comes back (pending files become "on the card")
+function poolPhase(phase) {
+  const busy = phase !== "ready";
+  $("#card").classList.toggle("ejected", /re-insert|restart/.test(phase));
+  if (busy === poolBusy) return;
+  poolBusy = busy;
+  if (poolOpen) loadPool(); else if (poolData) renderPool();
+}
+$("#addinput").addEventListener("change", e => { uploadFiles(e.target.files); e.target.value = ""; });
+// drops: on the card slot or the open drawer; anywhere else the browser
+// would navigate to the file, so the window swallows those
+const hasFiles = e => !!e.dataTransfer && Array.from(e.dataTransfer.types || []).indexOf("Files") >= 0;   // types is a DOMStringList in WebKit
+for (const t of [$("#card"), $("#pool")]) {
+  t.addEventListener("dragover", e => { if (!hasFiles(e)) return; e.preventDefault(); e.dataTransfer.dropEffect = "copy"; t.classList.add("drop"); });
+  t.addEventListener("dragleave", e => { if (!t.contains(e.relatedTarget)) t.classList.remove("drop"); });
+  t.addEventListener("drop", e => { e.preventDefault(); t.classList.remove("drop"); uploadFiles(e.dataTransfer.files); });
+}
+window.addEventListener("dragover", e => e.preventDefault());
+window.addEventListener("drop", e => e.preventDefault());
+// how to get a pool file into a slot on the unit (tools/panel/README.md, "Loading samples")
+$("#howto").innerHTML = HOWTO;
+
 // ---------------- LEDs (only when the map names them) ----------------
 // a map entry is [byte, bit] into the 0x10 bitmap blocks (bits: hex string)
 // or an LED id ("0x21" or 33), lit when its last value is > 0x20
@@ -656,6 +893,7 @@ async function poll() {
     $("#screen").classList.toggle("dim", busy);
     $("#note").classList.toggle("show", busy);
     $("#note span").textContent = busy ? `loading — ${phase}` : "";
+    poolPhase(phase);
     if (s.seq !== lastSeq) { lastSeq = s.seq; $("#screen").src = "/screen.png?" + s.seq; }
     if (Object.keys(mapLeds).length) applyLeds(await fetch("/leds").then(x => x.json()));
   } catch (e) {}

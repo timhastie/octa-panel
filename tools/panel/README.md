@@ -18,6 +18,7 @@ File ▸ Open Project… (`tools/panel/app/README.md`).
 .venv/bin/python3 tools/panel/panel_server.py                 # stock OS image
 .venv/bin/python3 tools/panel/panel_server.py --image out/mainos_bus.bin   # a built remix
 .venv/bin/python3 tools/panel/panel_server.py --project ~/octa/backups/<snap>/<project>
+.venv/bin/python3 tools/panel/panel_server.py --project <dir> --audio ~/samples   # more WAV/AIFF on the card
 ```
 
 Open <http://localhost:8563/>. Under the port, boot is ~3 s and boot + the
@@ -113,9 +114,15 @@ beside it), is a good PR — it is pure discovery, no firmware bytes.
 |---|---|
 | `GET /screen.png` | current LCD as a 128×64 PNG |
 | `GET /screen.txt` | the same frame as 64 lines of 128 `#` (dark) / `.` — for agents that grep |
-| `GET /status` | `{booted, seq, ran_ms, fault, image, phase, backend, backend_note, speed, restarts}` — `seq` bumps on any screen change; `speed` is emulated ms per wall s over the last 5 s of runs |
+| `GET /status` | `{booted, seq, ran_ms, fault, image, phase, backend, backend_note, speed, restarts, card_busy}` — `seq` bumps on any screen change; `speed` is emulated ms per wall s over the last 5 s of runs; `card_busy` while a `/samples/commit` reboots (`booted` is false through any reboot, respawn or re-insert) |
 | `GET /key?row=0x26&bit=0&down=1` | one matrix key edge |
+| `GET /tap?row=0x22&bit=0&n=2&hold=50&gap=150` | `n` presses of one key inside one action (the double-tap chords, see "Loading samples") |
 | `GET /knob?row=0x30&delta=2` | one encoder report (rows 0x30–0x36, signed delta) |
+| `GET /samples` | the sample pool: `{pool, staged, files: [{name, bytes, format}], pending, removed, busy, phase}` |
+| `GET /samples/add?path=<abs>` | copy a Mac file into the pool (converted when needed): `{ok, name, converted, note, format, bytes, pending}` (+ `cmd`, afconvert's argv, when converted) or `{ok: false, error}` |
+| `POST /samples/upload?name=<n>` | the same with the raw file bytes as the body (one file per request, no multipart) |
+| `GET /samples/remove?name=<n>` | take a file out of the pool |
+| `GET /samples/commit` | re-insert the card: `{ok, phase}`, then `/status phase` shows the reboot |
 | `GET /keys` | the jump-table handlers (the `press()` fallback) |
 | `GET /press?idx=28&edge=0` | call a jump-table handler directly (route A only) |
 | `GET /transport?k=play\|rec\|stop` | PLAY/REC/STOP: the handlers under route A, matrix taps under the port |
@@ -124,6 +131,62 @@ beside it), is a good PR — it is pure discovery, no firmware bytes.
 | `GET /peek?addr=0x460d175c&len=4` | read memory (either backend), hex |
 | `GET /port` | the port child: pid, argv, its own `status` line, report tail, `restarts` |
 | `GET /project`, `/map`, `/stack`, `/poke_trig?step=1` | the load report, `key_map.json`, thread stacks, a trig on track 1 |
+
+## Loading samples
+
+On the unit, samples live on the CF card in the set's AUDIO folder: copy
+files there over USB, then load them into FLEX/STATIC slots with the
+firmware's own file browser. The panel does the same in two steps, because
+the card is a FAT image built at boot and the emulator has no hot-plug:
+
+1. **Into the pool.** `/samples/add?path=<abs>` (a file on the Mac) or
+   `POST /samples/upload?name=<n>` (the bytes) put a file in
+   `out/_panel_pool_<port>/`, the AUDIO folder the card is built from. The
+   unit reads WAV and AIFF, 16 or 24 bit, 44.1 kHz, mono or stereo (a
+   WAVE_FORMAT_EXTENSIBLE header with a PCM SubFormat included — it loaded
+   one, footer `44.1k 16b 2Ch`, 12 Sep 2026 — listed as `… WAV
+   (extensible)`); anything else (mp3, aac, flac, 48 kHz, 32-bit float,
+   AIFC, 8-bit, more than two channels …) is converted with `afconvert -f
+   WAVE -d LEI16@44100 in out` (channels kept, `-c 2` above two;
+   `converted: true`, the command in `note` with the file as you named it
+   and the pool file it became, afconvert's argv exactly as run in `cmd`; a
+   failure answers `ok: false` with afconvert's stderr). Names keep their long form (the
+   card is VFAT), the extension is normalised (`.wav`, `.aif`/`.aiff`) and
+   characters outside `[A-Za-z0-9._ -]` become `_`; a name already in the
+   pool is refused unless the bytes are identical. `/samples` lists the
+   pool with each file's header (`16-bit 44.1 kHz stereo WAV`) and what is
+   `pending` (not on the card yet) or `removed`. The pool is per server
+   port and re-seeded at start from the project's sibling `AUDIO/` and
+   every `--audio <dir>`; a running server's additions never touch the
+   fixture folder.
+2. **Re-insert the card.** `/samples/commit` writes the whole pool into the
+   staging tree, rebuilds the image and reboots the unit on it, exactly
+   the watchdog's respawn: `/status phase` reads `re-inserting the card
+   (reboot, ~40 s)`, then the clock dialog closes, then `ready` (41 s on
+   the OTLIVE fixture, 12 Sep 2026). Adds, removes and a second commit
+   answer `ok: false` meanwhile. Same on route A (a fresh attach).
+
+Then load a slot through the matrix, measured 12 Sep 2026 on the port
+with the OTLIVE fixture (`out/_agents/samples/`: `scan.py`, `drive.py`,
+shots `r*` `s*` `t*` `u*`; re-run after the fixes in
+`out/_agents/samples-fix/`, shots `f*` — as PNG and `/screen.txt`):
+
+| step | keys | screen |
+|---|---|---|
+| open the slot list of a track | the **track key twice** — a double-click on T1–T8 in the page, or `/tap?row=0x22&bit=<t-1>&n=2` (one action, 200 ms press to press) from a script. Two `/key` taps land because the server slows its idle pump for 0.5 s after a track key is released (`SLOW_PUMP_MS`): taps 0.15 and 0.30 s of wall apart opened it, 0.45 s did not (12 Sep 2026); before that, taps 0.2 s apart reached the firmware 375 emulated ms press to press and missed | `<< MACHINE:STATIC` (or `FLEX`, the track's machine — the OTLIVE fixture boots with T5 current, T1–T4 STATIC, T5 FLEX), `SLOT / BPM / SIZE`, the track's slot highlighted |
+| pick a slot | DOWN `0x24.0` / UP `0x26.3` | |
+| open the file browser on it | RIGHT `0x24.1` (YES `0x26.1` does the same) | `LOAD FILE TO STATIC 5`, folder `OTLIVE>AUDIO`, the files in name order, the cursor where it was last; the footer reads the highlighted file's header (`44.1k 16b 2Ch`) |
+| find the file | DOWN / UP (no wrap; the list is in name order, `extra-1` … `extra-32` numerically, and starts at the top after a boot: 35 taps from `extra-1.wav` to the first file after `fourth-0.wav`) | `clap.aiff`, `sine48k24.wav`, `Upload Sine 48k.wav` were all listed with their 0.33 MB; an unconverted extensible WAV reads `44.1k 16b 2Ch` (16-bit) / `44.1k 24b 2Ch` (24-bit) in the footer |
+| load it | YES | back in the list: `5>Upload Sine 48  120  0.33`, `6>clap.aiff  120  0.33`; after the fixes `5>fxext16.wav  0.08`, `6>fxext24  0.12`, `7>Upload Fx 48k.  120  0.33` |
+| the other list | LEFT `0x26.4` on the `<<` opens `SELECT MACHINE TYPE` (STATIC/FLEX/THRU/NEIGHBOR/PICKUP): the list follows the track's machine | |
+| leave | NO `0x26.2` once — a second NO on the main screen draws `DISARM ALL` (KEYMAP.md) | |
+
+How the opener was found: a PC watch on the list's window store
+(`0x4007920c`, in the handler at `0x40077b00` that draws `« MACHINE:%s`)
+under a pumpless `ot_emu --interactive` on the empty card, then every
+key alone, held 1.2 s, twice, and under 20 held modifiers — only the
+double tap of T1–T8 hit. KEYMAP.md's "UP held + track key" (E3) was two
+T2 taps that happened to fall inside the window.
 
 ## No unit to hand? Real projects from public test fixtures
 

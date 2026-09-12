@@ -27,6 +27,12 @@ Two emulator backends (12 Sep 2026), the same Panel code over either:
     .venv/bin/python3 tools/panel/panel_server.py --image out/raw/section_3_MAIN_OS.bin
     .venv/bin/python3 tools/panel/panel_server.py --project <dir> [--set S] [--name N]
     .venv/bin/python3 tools/panel/panel_server.py --backend routea   # the Python oracle
+    .venv/bin/python3 tools/panel/panel_server.py --project <dir> --audio ~/samples   # seed the pool
+
+Samples (12 Sep 2026): the card's AUDIO folder is a per-port pool
+(SamplePool, out/_panel_pool_<port>/) -- /samples/add, /samples/upload
+and /samples/remove change it, /samples/commit rebuilds the card and
+reboots the unit on it (there is no hot-plug: Panel.commit_card).
 
 Then open http://localhost:8563/. Unmapped keys: the MAP drawer lists every
 table entry; click one, watch the screen, name it. The mapping lives in the
@@ -35,16 +41,19 @@ a PR to key_map.json.
 """
 import argparse
 import collections
+import filecmp
 import json
 import os
 import pathlib
 import queue
 import re
+import shutil
 import struct
 import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -83,6 +92,19 @@ POPUP = 0x46c7d34c          # the popup record: +0x08 x0, +0x0c y0, +0x18 x1, +0
                             # KEYMAP.md). The record keeps its last geometry after a
                             # close, hence the slot check as well.
 SETUP_GEOMETRY = (7, 0, 0xf4, 0x40)
+CLOCK_GEOMETRY = (0xf, 7, 0xe6, 0x32)     # the boot SET DATE/TIME dialog (KEYMAP.md)
+
+
+def popup_geometry(uc):
+    """(x0, y0, x1, rows) of the popup on screen, or None when the popup
+    slot is empty or the record's flags say closed."""
+    if int.from_bytes(uc.mem_read(UI_WINDOW, 4), "big") != POPUP:
+        return None
+    rec = bytes(uc.mem_read(POPUP, 0x2c))
+    word = lambda off: int.from_bytes(rec[off:off + 4], "big")  # noqa: E731
+    if not (word(0x20) & 0x20):
+        return None
+    return (word(0x08), word(0x0c), word(0x18), word(0x28))
 
 
 def setup_window_open(uc):
@@ -470,15 +492,310 @@ def port_available(port_bin=PORT_BIN, build=True, log=print):
     return True, note.rstrip("; ")
 
 
+# -- the sample pool: the set's AUDIO folder, one per server port --------------
+#
+# On the unit samples live on the CF card in the set's AUDIO folder; the
+# user copies files there (USB disk mode) and loads them into slots from the
+# firmware's own file browser. Here the card is a FAT image built from a
+# staged tree at boot and there is no hot-plug, so the pool below is the
+# AUDIO folder the card is built FROM: /samples/add and /upload put files in
+# it, /samples/commit rebuilds the image with every file in it and reboots
+# the child on the new image -- re-inserting the card. One pool per server
+# port (out/_panel_pool_<port>/), wiped and re-seeded at start from the
+# project's sibling AUDIO and --audio, so nothing a running server adds
+# lands in the fixture folder. 12 Sep 2026.
+
+AFCONVERT = "/usr/bin/afconvert"
+SAMPLE_EXTS = (".wav", ".aif", ".aiff")
+_NAME_BAD = re.compile(r"[^A-Za-z0-9._ -]")      # the card is VFAT with long names: keep the
+                                                 # name, replace what is outside this set
+
+
+def _ext80(b):
+    """The 80-bit extended float an AIFF COMM chunk keeps its sample rate in."""
+    se = int.from_bytes(b[:2], "big")
+    mant = int.from_bytes(b[2:10], "big")
+    if (se & 0x7fff) == 0 and mant == 0:
+        return 0.0
+    val = mant * 2.0 ** ((se & 0x7fff) - 16383 - 63)
+    return -val if se & 0x8000 else val
+
+
+def sample_header(path):
+    """What the file's own header says, stdlib only: {"kind": "WAV" | "AIFF" |
+    "AIFC", "channels", "rate", "bits", "pcm", "tag"} from the RIFF/WAVE fmt
+    chunk or the FORM/AIFF COMM chunk; None for anything else (mp3, flac,
+    aac, a truncated file). "pcm": integer PCM (WAV format tag 1, or 0xfffe
+    with a PCM SubFormat; AIFF, or AIFC with NONE/twos); "tag": the WAV format
+    tag as written (0xfffe = WAVE_FORMAT_EXTENSIBLE, which the unit reads
+    when its SubFormat is PCM -- measured 12 Sep 2026: a 16-bit 44.1 kHz
+    stereo extensible WAV listed with footer `44.1k 16b 2Ch` and loaded
+    into STATIC 6; afconvert keeps such a header anyway, so converting it
+    changed nothing), the AIFC compression code for an AIFC, None for AIFF."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(12)
+            if len(head) < 12:
+                return None
+            if head[:4] == b"RIFF" and head[8:12] == b"WAVE":
+                while True:
+                    ch = f.read(8)
+                    if len(ch) < 8:
+                        return None
+                    tag, size = ch[:4], struct.unpack("<I", ch[4:])[0]
+                    if tag == b"fmt ":
+                        fmt = f.read(min(size, 40))
+                        if len(fmt) < 16:
+                            return None
+                        code, chans, rate, _, _, bits = struct.unpack("<HHIIHH", fmt[:16])
+                        tag = code
+                        if code == 0xfffe and len(fmt) >= 26:
+                            code = struct.unpack("<H", fmt[24:26])[0]   # SubFormat GUID, leading word
+                        return {"kind": "WAV", "channels": chans, "rate": rate, "bits": bits,
+                                "pcm": code == 1, "tag": tag}
+                    f.seek(size + (size & 1), 1)
+            if head[:4] == b"FORM" and head[8:12] in (b"AIFF", b"AIFC"):
+                kind = head[8:12].decode()
+                while True:
+                    ch = f.read(8)
+                    if len(ch) < 8:
+                        return None
+                    tag, size = ch[:4], struct.unpack(">I", ch[4:])[0]
+                    if tag == b"COMM":
+                        comm = f.read(min(size, 22))
+                        if len(comm) < 18:
+                            return None
+                        chans, _, bits = struct.unpack(">hIh", comm[:8])
+                        comp = comm[18:22] if kind == "AIFC" else b"NONE"
+                        # "twos" is what afconvert -f AIFC -d BEI16 writes: big-endian
+                        # integer PCM, the same bytes as NONE (12 Sep 2026)
+                        return {"kind": kind, "channels": chans, "rate": int(round(_ext80(comm[8:18]))),
+                                "bits": bits, "pcm": comp in (b"NONE", b"twos"),
+                                "tag": comp.decode("latin-1") if kind == "AIFC" else None}
+                    f.seek(size + (size & 1), 1)
+    except OSError:
+        return None
+    return None
+
+
+def sample_format(info, path=None):
+    """'16-bit 44.1 kHz stereo WAV' from sample_header's dict (or the suffix
+    of an unparsed file: 'MP3 (not WAV/AIFF)')."""
+    if not info:
+        ext = pathlib.Path(path).suffix.lstrip(".").upper() if path else ""
+        return f"{ext or '?'} (not WAV/AIFF)"
+    chans = {1: "mono", 2: "stereo"}.get(info["channels"], f"{info['channels']}-channel")
+    kind = info["kind"]
+    if info["kind"] == "WAV" and info["tag"] == 0xfffe:
+        kind += " (extensible)"                     # only a 0xfffe tag, whatever its SubFormat
+    if not info["pcm"]:
+        kind += " (not integer PCM)"
+    return f"{info['bits']}-bit {info['rate'] / 1000:g} kHz {chans} {kind}"
+
+
+def sample_ok_as_is(info):
+    """The unit's own rule: WAV or AIFF, integer PCM, 16 or 24 bit, 44.1 kHz,
+    mono or stereo. An extensible WAV with a PCM SubFormat passes (the unit
+    reads it, sample_header); AIFC does not (afconvert makes a WAV of it)."""
+    return bool(info) and info["kind"] in ("WAV", "AIFF") and info["pcm"] \
+        and info["bits"] in (16, 24) and info["rate"] == 44100 and info["channels"] in (1, 2)
+
+
+class SamplePool:
+    """out/_panel_pool_<port>/: the files the card's AUDIO folder is built from.
+
+    add() is the one path for /samples/add, /samples/upload and --audio:
+    read the header, convert with afconvert when the unit would not read
+    the file as it is (`afconvert -f WAVE -d LEI16@44100 in out`, channels
+    kept; the exact command goes into the reply note), write into the
+    folder under the original basename with the extension normalised and
+    characters outside [A-Za-z0-9._ -] replaced. A name already in the pool
+    (case-insensitively) is refused unless the bytes are identical."""
+
+    def __init__(self, path):
+        self.path = pathlib.Path(path)
+        if self.path.exists():
+            shutil.rmtree(self.path)
+        self.path.mkdir(parents=True)
+        self.lock = threading.Lock()
+
+    def names(self):
+        return sorted((p.name for p in self.path.iterdir() if p.is_file() and not p.name.startswith(".")),
+                      key=str.lower)
+
+    def find(self, name):
+        """The pool file called `name`, case-insensitively, or None."""
+        low = name.lower()
+        for n in self.names():
+            if n.lower() == low:
+                return self.path / n
+        return None
+
+    def files(self):
+        out = []
+        for n in self.names():
+            p = self.path / n
+            out.append({"name": n, "bytes": p.stat().st_size, "format": sample_format(sample_header(p), p)})
+        return out
+
+    def manifest(self):
+        """{name: (size, mtime_ns)}: what the card was (or would be) built from."""
+        return {n: (st.st_size, st.st_mtime_ns) for n in self.names() for st in (os.stat(self.path / n),)}
+
+    def total_bytes(self):
+        return sum(os.stat(self.path / n).st_size for n in self.names())
+
+    def audio_specs(self):
+        """stage_project's audio list: every pool file as AUDIO/<name>."""
+        return [f"{self.path / n}:AUDIO/{n}" for n in self.names()]
+
+    def seed(self, src_dir, convert=True, log=print):
+        """Every WAV/AIFF in src_dir through add() (convert=False copies the
+        project's own pool as it was saved). Returns the names added."""
+        src_dir = pathlib.Path(src_dir).expanduser()
+        added = []
+        if not src_dir.is_dir():
+            log(f"samples: {src_dir}: not a directory, nothing seeded")
+            return added
+        for p in sorted(src_dir.iterdir(), key=lambda q: q.name.lower()):
+            if p.is_file() and p.suffix.lower() in SAMPLE_EXTS and not p.name.startswith("."):
+                r = self.add(p) if convert else self._copy_verbatim(p)
+                if r["ok"]:
+                    added.append(r["name"])
+                else:
+                    log(f"samples: {p.name}: {r['error']}")
+        return added
+
+    def _copy_verbatim(self, src):
+        dst = self.path / src.name
+        if dst.exists() and not filecmp.cmp(src, dst, shallow=False):
+            return {"ok": False, "error": f"{src.name}: a different file of that name is in the pool"}
+        shutil.copyfile(src, dst)
+        return {"ok": True, "name": src.name, "converted": False, "note": "the project's own pool, copied as is"}
+
+    @staticmethod
+    def card_name(raw, info, convert):
+        """The name on the card: basename, extension normalised (.wav for a
+        WAV or anything converted, .aif/.aiff kept for an AIFF), the rest
+        VFAT-safe ASCII."""
+        raw = pathlib.Path(raw).name.strip().lstrip(".")
+        stem, dot, ext = raw.rpartition(".")
+        if not dot:
+            stem, ext = raw, ""
+        ext = "." + ext.lower() if ext else ""
+        if convert or (info and info["kind"] == "WAV"):
+            ext = ".wav"
+        elif info and info["kind"] == "AIFF" and ext not in (".aif", ".aiff"):
+            ext = ".aif"
+        stem = _NAME_BAD.sub("_", stem).strip() or "sample"
+        return stem + ext
+
+    def add(self, src, name=None, timeout=600, shown=None):
+        """Validate -> convert if needed -> write into the pool. Returns the
+        /samples/add reply dict. The note names the source as the caller
+        knows it (`shown`: an upload's own name, not the dot-temporary its
+        bytes landed in) and the pool file it became; "cmd" is afconvert's
+        argv exactly as run, temporaries included."""
+        src = pathlib.Path(src).expanduser()
+        shown = shown or str(src)
+        if not src.is_file():
+            return {"ok": False, "error": f"{shown}: not a file"}
+        if src.stat().st_size == 0:
+            return {"ok": False, "error": f"{pathlib.Path(shown).name}: empty file"}
+        info = sample_header(src)
+        convert = not sample_ok_as_is(info)
+        name = self.card_name(name or src.name, info, convert)
+        was = sample_format(info, src)
+        cmd = None
+        with self.lock:
+            tmp = self.path / f".incoming-{os.getpid()}-{name}"
+            try:
+                if convert:
+                    cmd = [AFCONVERT, "-f", "WAVE", "-d", "LEI16@44100"]
+                    if info and info["channels"] > 2:
+                        cmd += ["-c", "2"]              # the unit reads mono or stereo only
+                    said = " ".join(cmd + [shown, str(self.path / name)])
+                    cmd += [str(src), str(tmp)]
+                    try:
+                        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+                    except (OSError, subprocess.TimeoutExpired) as e:
+                        return {"ok": False, "error": f"afconvert: {type(e).__name__}: {e}", "cmd": " ".join(cmd)}
+                    if r.returncode or not tmp.exists():
+                        tail = " | ".join((r.stderr or r.stdout).strip().splitlines()[-4:]) or "(no output)"
+                        return {"ok": False, "error": f"afconvert failed (rc {r.returncode}): {tail}",
+                                "cmd": " ".join(cmd), "was": was}
+                    note = f"converted from {was}: {said}"
+                else:
+                    shutil.copyfile(src, tmp)
+                    note = f"{was}, copied as is"
+                have = self.find(name)
+                if have is not None:
+                    if filecmp.cmp(have, tmp, shallow=False):
+                        return self._added(have, convert, note + f"; already in the pool as {have.name}"
+                                           " (identical bytes)", cmd)
+                    return {"ok": False, "error": f"{have.name} is already in the pool with different"
+                                                  " content: remove it first, or rename the file",
+                            "was": was}
+                tmp.replace(self.path / name)
+            finally:
+                if tmp.exists():
+                    tmp.unlink()
+        return self._added(self.path / name, convert, note, cmd)
+
+    @staticmethod
+    def _added(out, convert, note, cmd):
+        r = {"ok": True, "name": out.name, "converted": convert, "note": note,
+             "bytes": out.stat().st_size, "format": sample_format(sample_header(out), out)}
+        if cmd:
+            r["cmd"] = " ".join(cmd)
+        return r
+
+    def remove(self, name):
+        have = self.find(name)
+        if have is None:
+            return {"ok": False, "error": f"{name}: not in the pool"}
+        have.unlink()
+        return {"ok": True, "name": have.name}
+
+
+def build_card(project, set_name, name, tree, pool):
+    """The card image: the project dir (when given) plus EVERY pool file as
+    AUDIO/<name>, staged under `tree` (wiped and remade) and sized to fit.
+    Returns (image bytes, staged project name or None, staged AUDIO dir).
+    Measured 12 Sep 2026: the OTLIVE fixture with its 37 files, 64 MB image,
+    in about a second."""
+    tree = pathlib.Path(tree)
+    audio = pool.audio_specs()
+    size_mb = max(64, 16 + pool.total_bytes() // 2**20)
+    if project:
+        card, staged = er.stage_project(project, set_name, name, audio=audio, tree=str(tree), image_mb=size_mb)
+    else:
+        if tree.exists():
+            shutil.rmtree(tree)
+        (tree / set_name / "AUDIO").mkdir(parents=True)
+        for spec in audio:
+            f, rel = spec.split(":", 1)
+            shutil.copy2(f, tree / set_name / rel)
+        card, staged = ec.build_image(str(tree), size_mb=size_mb), None
+    return card, staged, tree / set_name / "AUDIO"
+
+
 class Panel:
     """Owns the emulator thread; everything Unicorn happens on it."""
 
     def __init__(self, image, card, pump_ms=25.0, project=None, internal_clock=True,
                  play_pump_ms=10.0, backend="routea", port_bin=PORT_BIN, port_args=(),
-                 card_file=None, backend_note="", auto=False):
+                 card_file=None, backend_note="", auto=False, pool=None, card_builder=None,
+                 staged_audio=None):
         self.image = image
         self.card = card                  # the FAT16 card image, bytes (route A takes it as is)
         self.card_file = card_file        # ... and the port reads it from this file
+        self.pool = pool                  # SamplePool the card's AUDIO was built from
+        self.card_builder = card_builder  # () -> (card bytes, staged name, staged AUDIO dir): commit_card
+        self.staged_audio = staged_audio  # the AUDIO dir inside the staging tree (what is on the card)
+        self.card_manifest = pool.manifest() if pool is not None else {}   # the pool as the card has it
+        self.card_busy = False            # a re-insert (rebuild + reboot) is in progress
+        self.reinserts = 0
         self.pump_ms = pump_ms
         self.play_pump_ms = play_pump_ms   # the pump while frame mode is on (see _loop)
         self.project = project            # (set_name, project_name) to load at boot
@@ -517,6 +834,11 @@ class Panel:
         self._link_pos = 0
         self._led_pos = 0
         self.row_state = None
+        self.clock_note = None       # what _dismiss_clock found (in /status)
+        # After a track key is released the idle pump slows down for a
+        # moment so a second press from the page lands inside the
+        # firmware's double-tap window (the sample slot list): see _loop.
+        self.slow_until = 0.0
 
     @staticmethod
     def _read_table(image):
@@ -596,11 +918,32 @@ class Panel:
         # dialog is certainly up. Same under the port (its DSPI has no
         # RTC model: the dialog shows 2000-00-00, and YES still closes it).
         self.phase = "closing the clock dialog"
-        rt.run(ms=400)
+        # Wait for the dialog itself: on an empty card (no --project) it
+        # came up later than 400 ms after `ready` and a blind YES landed
+        # on the main screen instead (ARM ALL, then the dialog on top of
+        # it; 12 Sep 2026). Bounded: a firmware that never shows it must
+        # not be sent a stray YES.
+        uc = self._uc()
+        for _ in range(60):                      # up to 6 s of firmware
+            if popup_geometry(uc) == CLOCK_GEOMETRY:
+                break
+            rt.run(ms=100)
+        else:
+            self.clock_note = "clock dialog never appeared (no YES sent)"
+            self._poll(rt)
+            self._snapshot(uc)
+            return
         rt.uart64.rx.extend([0x26, 0x02]); rt.run(ms=60)
         rt.uart64.rx.extend([0x26, 0x00]); rt.run(ms=300)
+        for _ in range(10):                      # it closes within a few frames
+            if popup_geometry(uc) != CLOCK_GEOMETRY:
+                break
+            rt.run(ms=100)
+        g = popup_geometry(uc)
+        self.clock_note = ("clock dialog closed" if g is None
+                           else f"popup still open after YES: {tuple(hex(v) for v in g)}")
         self._poll(rt)
-        self._snapshot(self._uc())
+        self._snapshot(uc)
 
     def _boot_routea(self):
         r, rt = er.attach(self.image if self.image != "raw" else None, self.card)
@@ -636,9 +979,10 @@ class Panel:
                 argv.append("--internal-clock")
         return argv + self.port_args
 
-    def _boot_port(self):
-        """Spawn the child, wait for `ready`, close the clock dialog."""
-        self.phase = ("booting the port" + (" (boot + project load, ~1 min)" if self.project else ""))
+    def _boot_port(self, phase=None):
+        """Spawn the child, wait for `ready`, close the clock dialog. `phase`
+        overrides the boot text (the card re-insert keeps its own)."""
+        self.phase = phase or ("booting the port" + (" (boot + project load, ~1 min)" if self.project else ""))
         log = pathlib.Path(str(self.card_file)).with_suffix(".port.log") if self.card_file else None
         proc = PortProc(self._port_argv(), log_path=log)
         self.proc = proc
@@ -696,16 +1040,25 @@ class Panel:
         run against the new child once it is ready."""
         self.restarts += 1
         self.fault = f"port: {why}; respawned ({self.restarts})"
-        self.phase = f"restarting the port ({why})"
+        return self._reboot_port(f"restarting the port ({why})")
+
+    def _reboot_port(self, phase):
+        """Kill the child and boot a fresh one on self.card_file (the
+        respawn above and the card re-insert share this): a new decoder,
+        blank LEDs and screen, three boot attempts, `phase` shown until the
+        clock dialog is closed; /status "booted" is false meanwhile (it
+        read true through a re-insert with the screen blank, 12 Sep 2026).
+        True when the port is up again."""
         if self.proc is not None:
             self.proc.kill()
+        self.booted = False
         self._new_link()
         self.led_bits = bytearray(64); self.led_ids = {}
         with self.lock:
             self.frame = b""; self.screen_txt = ""
         for attempt in range(3):
             try:
-                self._boot_port()
+                self._boot_port(phase)
                 self.phase = "ready"
                 return True
             except PortDied as e:
@@ -713,6 +1066,74 @@ class Panel:
                 time.sleep(2.0)
         self.phase = "failed"
         return False
+
+    REINSERT_PHASE = "re-inserting the card (reboot, ~40 s)"
+
+    def pending(self):
+        """(added, removed): pool files not on the card as they are, and card
+        files no longer in the pool -- what the next commit changes."""
+        if self.pool is None:
+            return [], []
+        now = self.pool.manifest()
+        added = [n for n, st in now.items() if self.card_manifest.get(n) != st]
+        removed = [n for n in self.card_manifest if n not in now]
+        return added, removed
+
+    def commit_card(self):
+        """Re-insert the card: rebuild the image from the pool (every file)
+        and reboot the unit on it -- the emulator has no hot-plug, and the
+        firmware scans AUDIO/ at mount. Answers at once (ok, phase); the
+        work runs as one action on the emu thread, /status "phase" shows
+        REINSERT_PHASE, then the clock dialog, then ready. Under the port
+        it is the watchdog's respawn path on the new image (_reboot_port);
+        under route A a fresh attach on the new bytes and the same boot
+        preamble. Adds, removes and a second commit are refused meanwhile
+        (card_busy)."""
+        if self.pool is None or self.card_builder is None:
+            return False, "no sample pool"
+        if self.card_busy:
+            return False, "a re-insert is already in progress"
+        if not self.booted:
+            return False, f"the unit is still booting ({self.phase})"
+        self.card_busy = True
+        self.phase = self.REINSERT_PHASE
+
+        def act():
+            # Not an action the watchdog may time: the fresh child boots
+            # for ~40 s and ACTION_LIMIT is 20 (it would kill it mid-boot).
+            self.busy_since = None
+            t0 = time.perf_counter()
+            try:
+                card, staged, audio_dir = self.card_builder()
+                self.card, self.staged_audio = card, audio_dir
+                if staged is not None and self.project:
+                    self.project = (self.project[0], staged)
+                self.card_manifest = self.pool.manifest()
+                self.reinserts += 1
+                if self.backend == "port":
+                    self.card_file.write_bytes(card)
+                    self._reboot_port(self.REINSERT_PHASE)
+                else:
+                    self.booted = False
+                    self._new_link()
+                    self.led_bits = bytearray(64); self.led_ids = {}
+                    with self.lock:
+                        self.frame = b""; self.screen_txt = ""
+                    self._boot_routea()
+                    self.phase = "ready"
+                self.fault = None
+                print(f"panel: card re-inserted with {len(self.card_manifest)} files in"
+                      f" {time.perf_counter() - t0:.1f} s ({self.backend})")
+            except Exception as e:
+                # a build that failed leaves the old child running; a boot
+                # that failed has said "failed" itself (_reboot_port)
+                self.fault = f"card re-insert: {type(e).__name__}: {e}"
+                alive = self.backend != "port" or (self.proc is not None and self.proc.alive())
+                self.phase = "ready" if alive else "failed"
+            finally:
+                self.card_busy = False
+        self.actions.put(act)
+        return True, self.REINSERT_PHASE
 
     def _instrument(self, rt):
         """Route A: time every rt.run(ms=...) for the speed meter (the port's
@@ -742,7 +1163,6 @@ class Panel:
             return
         threading.Thread(target=self._watchdog, daemon=True, name="watchdog").start()
         while True:
-            rt = self.rt
             try:
                 while True:
                     try:
@@ -754,6 +1174,7 @@ class Panel:
                         act()
                     finally:
                         self.busy_since = None
+                rt = self.rt        # after the actions: a card re-insert replaces it
                 t = time.perf_counter()
                 self.busy_since = t
                 # Shorter pumps while the sequencer runs: in frame mode 25 ms
@@ -768,7 +1189,24 @@ class Panel:
                 # 515k EMAC + 564k ISA-C shims (cProfile, 12 Sep 2026) --
                 # all in tools/emu, nothing of it in this file. Under the
                 # port the pump stays 25 ms (its own play_pump_ms).
-                rt.run(ms=self.pump_ms if not rt.frame else min(self.pump_ms, self.play_pump_ms))
+                # The double-tap window: a track key pressed twice opens its
+                # sample slot list, and the firmware measures the gap in ITS
+                # time. Two page clicks are two actions with idle pumps
+                # between them (25 ms each, ~30 ms wall), so a double-click
+                # 0.3 s of wall apart reached the firmware ~350 emulated ms
+                # press to press and missed the window (200 ms lands, 375
+                # does not; measured 12 Sep 2026). For SLOW_WALL_S after a
+                # track key goes up the pump is SLOW_PUMP_MS: the same
+                # double-click is then ~170 emulated ms press to press.
+                # Nothing else changes -- the firmware still runs, just less
+                # of it per wall second, and only for that moment.
+                if rt.frame:
+                    pump = min(self.pump_ms, self.play_pump_ms)
+                elif t < self.slow_until:
+                    pump = min(self.pump_ms, self.SLOW_PUMP_MS)
+                else:
+                    pump = self.pump_ms
+                rt.run(ms=pump)
                 self._poll(rt)
                 self.busy_since = None
                 self.ran_ms = rt.sample / er.SAMPLE_HZ * 1000.0
@@ -986,6 +1424,9 @@ class Panel:
     busy_since = None
     ACTION_LIMIT = 20.0      # wall seconds an action may hold the emulator
     RUN_SLICE_MS = 5.0       # emulated ms per slice of run_ms() (5 ms wall idle, ~0.1 s playing)
+    SLOW_PUMP_MS = 6.0       # the idle pump for SLOW_WALL_S after a track key is released
+    SLOW_WALL_S = 0.5        # (the double-tap window, see _loop)
+    TRACK_ROW = 0x22         # the track keys T1-T8 (KEYMAP.md)
 
     def _watchdog(self):
         """Flag an action that holds the emulator too long (self.abort);
@@ -1100,9 +1541,38 @@ class Panel:
             return False, "bad row/bit"
         return self.do(lambda rt: self._key_act(rt, row, bit, down), timeout=120)
 
-    def _key_act(self, rt, row, bit, down):
+    def tap(self, row, bit, n=1, hold=50, gap=150):
+        """`n` presses of one key as ONE action: `hold` ms down, `gap` ms
+        up between presses. Needed for the firmware's double-tap chords --
+        a track key pressed twice opens the sample slot list (found 12 Sep
+        2026 by a PC watch on the list's window store 0x4007920c under a
+        pumpless ot_emu: every T1-T8 double-tapped, nothing else in 47
+        keys x {alone, held 1.2 s, under 20 modifiers}). Two /key taps
+        may or may not qualify: the firmware's window is short in ITS
+        time, and the idle pump runs between separate actions -- four
+        back-to-back curl /key edges (225 emulated ms over the two
+        presses) opened it, the same two taps 0.2 s of wall apart (375
+        emulated ms press to press) or 0.5/1/2 s apart did not (measured
+        12 Sep 2026, port, OTLIVE). Inside one action the gap is exactly
+        `gap` (200 ms press to press by default), so this is the reliable
+        way; page clicks are separate actions and may not land."""
+        if not (0x20 <= row < 0x30 and 0 <= bit < 8):
+            return False, "bad row/bit"
+        n = max(1, min(int(n), 8))
+        hold = max(10.0, min(float(hold), 2000.0))
+        gap = max(10.0, min(float(gap), 2000.0))
+        def act(rt):
+            out = []
+            for i in range(n):
+                out.append(self._key_act(rt, row, bit, True, run_ms=hold))
+                out.append(self._key_act(rt, row, bit, False, run_ms=gap if i < n - 1 else 50.0))
+            return f"{n} x ({hold:g} ms down, {gap:g} ms up): " + "; ".join(out)
+        return self.do(act, timeout=120)
+
+    def _key_act(self, rt, row, bit, down, run_ms=50.0):
         """One key edge on the emu thread (key() queues it; transport() on
-        the port taps down+up through it)."""
+        the port taps down+up through it; tap() chains them), then
+        `run_ms` of firmware."""
         if self.row_state is None:
             self.row_state = {}
         if down:
@@ -1123,10 +1593,12 @@ class Panel:
         if play:
             note = f" (play: active={self._before_play(rt)}, frame mode on)"
         rt.uart64.rx.extend([row, state])
-        rt.run(ms=50)
+        rt.run(ms=run_ms)
         if stop:
             self._after_stop(rt)
             note = " (stop: frame mode off)"
+        if not down and row == self.TRACK_ROW:
+            self.slow_until = time.perf_counter() + self.SLOW_WALL_S
         return f"row {row:#04x} = {state:#04x}{note}"
 
 
@@ -1147,6 +1619,75 @@ class Handler(BaseHTTPRequestHandler):
 
     def _json(self, obj, code=200):
         self._send(code, json.dumps(obj).encode())
+
+    # The sample pool (SamplePool, Panel.commit_card): the set's AUDIO folder
+    # the card is built from. Query values are URL-encoded (a Mac path with
+    # spaces arrives as %20 or +). Adds and removes change the pool only;
+    # the unit sees them after /samples/commit re-inserts the card (~40 s,
+    # /status "phase"); while that runs every one of these answers ok:false.
+    def _samples(self, path, args, body=None):
+        p = self.panel
+        arg = lambda k: urllib.parse.unquote_plus(args.get(k, ""))  # noqa: E731
+        if p.pool is None:
+            self._json({"ok": False, "error": "no sample pool"}, 500)
+            return
+        if path == "/samples":
+            added, removed = p.pending()
+            self._json({"pool": str(p.pool.path), "staged": str(p.staged_audio) if p.staged_audio else None,
+                        "files": p.pool.files(), "pending": added, "removed": removed,
+                        "busy": p.card_busy, "phase": p.phase})
+            return
+        if p.card_busy:
+            self._json({"ok": False, "error": "the card is being re-inserted (reboot in progress)",
+                        "note": f"try again when /status phase is ready (now: {p.phase})"})
+            return
+        if path == "/samples/add":
+            src = arg("path")
+            if not src.startswith("/") and not src.startswith("~"):
+                self._json({"ok": False, "error": "path must be absolute"})
+                return
+            r = p.pool.add(src)
+        elif path == "/samples/upload":
+            name = arg("name")
+            if not name:
+                self._json({"ok": False, "error": "name= is required"})
+                return
+            if not body:
+                self._json({"ok": False, "error": "empty body (POST the raw file bytes)"})
+                return
+            # afconvert and the header parse want a file: the body lands in
+            # the pool folder under a dot name and goes through add() as
+            # /samples/add would (the reply names the upload, not the
+            # temporary), then the temporary is removed.
+            tmp = p.pool.path / f".upload-{os.getpid()}-{threading.get_ident()}-{SamplePool.card_name(name, None, False)}"
+            try:
+                tmp.write_bytes(body)
+                r = p.pool.add(tmp, name=name, shown=name)
+            finally:
+                if tmp.exists():
+                    tmp.unlink()
+        elif path == "/samples/remove":
+            r = p.pool.remove(arg("name"))
+        elif path == "/samples/commit":
+            ok, res = p.commit_card()
+            self._json({"ok": ok, "phase": res} if ok else {"ok": False, "error": res, "phase": p.phase})
+            return
+        else:
+            self._send(404, b"?", "text/plain")
+            return
+        if r.get("ok"):
+            r["pending"] = p.pending()[0]
+        self._json(r)
+
+    def do_POST(self):
+        path, _, q = self.path.partition("?")
+        args = dict(kv.split("=", 1) for kv in q.split("&") if "=" in kv)
+        if path == "/samples/upload":
+            n = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(n) if n > 0 else b""
+            self._samples(path, args, body)
+        else:
+            self._send(404, b"?", "text/plain")
 
     def do_GET(self):
         p = self.panel
@@ -1172,7 +1713,11 @@ class Handler(BaseHTTPRequestHandler):
                             # emulated ms per wall s over the last 5 s of run() calls;
                             # idle runs skip to the next timer, so idle reads high
                             "speed": p.meter.value,
-                            "restarts": p.restarts})
+                            "restarts": p.restarts,
+                            "card_busy": p.card_busy,       # a /samples/commit re-insert in progress
+                            "clock": p.clock_note})         # what the boot-time YES found
+        elif path.startswith("/samples"):
+            self._samples(path, args)
         elif path == "/peek":
             # read-only memory, either backend (Unicorn / the port's peek): what a
             # record holds right now, e.g. the popup slot 0x460d175c
@@ -1202,6 +1747,13 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": ok, "result": str(res)})
         elif path == "/knob":
             ok, res = p.knob(int(args.get("row", "-1"), 0), int(args.get("delta", "0")))
+            self._json({"ok": ok, "result": str(res)})
+        elif path == "/tap":
+            # n presses of one key inside one action (the double-tap chords:
+            # /tap?row=0x22&bit=0&n=2 opens track 1's sample slot list)
+            ok, res = p.tap(int(args.get("row", "-1"), 0), int(args.get("bit", "-1")),
+                            n=int(args.get("n", "1")), hold=float(args.get("hold", "50")),
+                            gap=float(args.get("gap", "150")))
             self._json({"ok": ok, "result": str(res)})
         elif path == "/map":
             # the identified panel map (keys, knobs, leds): tools/panel/key_map.json
@@ -1272,6 +1824,9 @@ def main():
                     help="the port binary (a .py stand-in runs under this Python)")
     ap.add_argument("--port-arg", action="append", default=[],
                     help="an extra flag for the port child, repeatable (e.g. --port-arg=--dsp)")
+    ap.add_argument("--audio", action="append", default=[], metavar="DIR",
+                    help="seed the sample pool with every WAV/AIFF in DIR (converted when the unit "
+                         "would not read it), in addition to the project's sibling AUDIO; repeatable")
     a = ap.parse_args()
 
     # Default to the STOCK image: out/mainos_bus.bin is whatever the last
@@ -1280,27 +1835,44 @@ def main():
     # a built remix deliberately.
     image = a.image or str(ROOT / "out/raw/section_3_MAIN_OS.bin")
 
-    project = None
+    # Bind FIRST, before anything below touches the port's files: the pool
+    # wipe, the staging tree and the card image are all keyed by port, and a
+    # second `panel_server.py --port <busy>` (the app on 8563 up while the
+    # README's default CLI is run, a relaunch over a lingering server) used
+    # to wipe the running server's pool back to the fixture, rebuild its
+    # staging tree and overwrite its card image, THEN exit on the bind --
+    # the next respawn booted without the user's samples (verifier, 12 Sep
+    # 2026: 50 pool files -> 37). Nothing is served until serve_forever.
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)
+    except OSError as e:
+        sys.exit(f"panel: port {a.port}: {e}")
+
+    # The sample pool (SamplePool): the set's AUDIO folder the card is built
+    # from, one per server port. The project's own samples seed it as they
+    # were saved: project.work references them as ../AUDIO/<file>, so the
+    # sibling AUDIO/ next to the project dir is the set's pool, and without
+    # them every sample slot stays invalid (RTOS_FORK section 10.12) -- the
+    # UI still works, the audio does not. --audio dirs go through add()
+    # (converted when the unit would not read them).
+    pool = SamplePool(ROOT / "out" / f"_panel_pool_{a.port}")
+    project_dir = pathlib.Path(a.project).resolve() if a.project else None
+    if project_dir is not None:
+        pool.seed(project_dir.parent / "AUDIO", convert=False)
+    for d in a.audio:
+        pool.seed(d, convert=True)
+    # One staging tree per server port: stage_project wipes and remakes its
+    # tree, and two panels started together on the shared default raced on
+    # it (FileExistsError in mkdir, 12 Sep 2026). The same builder rebuilds
+    # the card for /samples/commit.
+    tree = ROOT / "out" / f"_panel_stage_{a.port}"
+    builder = lambda: build_card(a.project, a.set, a.name, tree, pool)  # noqa: E731
+    card, staged, staged_audio = builder()
+    project = (a.set, staged) if a.project else None
     if a.project:
-        # Stage the project's own samples too: project.work references them
-        # as ../AUDIO/<file>, so a sibling AUDIO/ next to the project dir is
-        # the set's pool. Without them every sample slot stays invalid
-        # (RTOS_FORK section 10.12) -- the UI still works, the audio does not.
-        pdir = pathlib.Path(a.project).resolve()
-        pool = pdir.parent / "AUDIO"
-        audio = [f"{w}:AUDIO/{w.name}" for w in sorted(pool.glob("*.wav"))] if pool.is_dir() else []
-        # One staging tree per server port: stage_project wipes and remakes
-        # its tree, and two panels started together on the shared default
-        # raced on it (FileExistsError in mkdir, 12 Sep 2026).
-        card, staged = er.stage_project(a.project, a.set, a.name, audio=audio,
-                                        tree=str(ROOT / "out" / f"_panel_stage_{a.port}"),
-                                        image_mb=max(64, 16 + sum(w.stat().st_size for w in pool.glob("*.wav")) // 2**20 if pool.is_dir() else 64))
-        project = (a.set, staged)
-        print(f"staged {pdir.name} as {a.set}/{staged} with {len(audio)} samples")
+        print(f"staged {project_dir.name} as {a.set}/{staged} with {len(pool.names())} samples (pool {pool.path})")
     else:
-        tree = ROOT / "out/_panel_tree"
-        (tree / a.set / "AUDIO").mkdir(parents=True, exist_ok=True)
-        card = ec.build_image(str(tree), size_mb=64)
+        print(f"empty project card with {len(pool.names())} samples (pool {pool.path})")
 
     if not a.no_rtc:
         install_rtc()           # route A only; the port's DSPI answers 0 (the 2000-00-00 dialog)
@@ -1327,9 +1899,9 @@ def main():
     Handler.panel = Panel(image, card, project=project, internal_clock=not a.midi_clock,
                           backend=backend, port_bin=a.port_bin, port_args=a.port_arg,
                           card_file=card_file, backend_note=note, auto=a.backend == "auto",
-                          play_pump_ms=25.0 if backend == "port" else 10.0)
+                          play_pump_ms=25.0 if backend == "port" else 10.0,
+                          pool=pool, card_builder=builder, staged_audio=staged_audio)
     Handler.html = (pathlib.Path(__file__).parent / "panel.html").read_bytes()
-    srv = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)
     print(f"panel: http://localhost:{a.port}/   image={image}   backend={backend}")
     try:
         srv.serve_forever()
