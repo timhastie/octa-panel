@@ -341,10 +341,24 @@ class Panel:
             return False, "encoder rows are 0x30-0x36"
         delta = max(-127, min(127, int(delta)))
         def act(rt):
-            rt.uart64.rx.extend([row, delta & 0xff])
-            rt.run(ms=30)
+            on_setup = row < 0x36 and setup_window_open(rt.uc)
+            if on_setup and abs(delta) > 7:
+                # The SETUP-page enum editor accumulates and, past about +-9
+                # per report, steps the wrong way (PMTR 15 -> 6 on +12,
+                # measured 12 Sep 2026); a big coalesced wheel turn from the
+                # page would otherwise scramble the field. Deliver it as
+                # +-7 reports instead.
+                left = delta
+                while left:
+                    part = max(-7, min(7, left))
+                    rt.uart64.rx.extend([row, part & 0xff])
+                    rt.run(ms=30)
+                    left -= part
+            else:
+                rt.uart64.rx.extend([row, delta & 0xff])
+                rt.run(ms=30)
             note = ""
-            if row < 0x36 and setup_window_open(rt.uc):
+            if on_setup:
                 # A-F on a SETUP page (AMP/LFO/PLAYBACK/FX SETUP, the second
                 # press of a page key): the Part byte changes and the box is
                 # drawn into RAM, but the firmware sends no LCD block for the
