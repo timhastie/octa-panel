@@ -3864,3 +3864,177 @@ without the cores, 57.1 / 25.7, 24.6 / 17.8, 18.4 s with.
   (`m68k_execute(N)` with an instruction hook) is in reserve for the
   ColdFire side, and nothing exact reaches the cores' ceiling (plan:
   <= 0.4-0.55x).
+
+## Milestone O15e — bursts under the gate, the borrowed calls and the waits: `ready` 7.4 → 5.5 s, `test_rtos` 3.7x, bit for bit ✅ (12 Sep 2026, branch `panel-ui`)
+
+Step 5 of this run of the speed plan (the architect's step 6); `rtos.cpp`,
+`rtos.h`, `main.cpp`; no CLI change, no vendored change. O15a left five
+loops stepping exactly, one `stepOnce()` -- `tickTimers()` + `deliver()`
+-- per instruction: `run(_ms, true)` (the M6a gate: the batch's and
+`test_rtos`'s first second), `runUntil` (the render's frame predicates,
+`runToPc`), `runToMainSpin`, `callAsMain` (the borrowed slot: LOAD PROJECT's
+post, SET MAIN LEVEL, the transport start) and the memory waits inside
+`loadProjectLive` (card ready), `selectBankLive` (the bank byte) and
+`setMainLevelLive` (the gain table). Measured on the Step 4 state before
+this change (`OT_BURST_STATS=1`, `out/_agents/impl-5-bootbursts/`): the
+OTLIVE boot to `ready` executes 787,138,663 instructions, of which
+725,319,505 were in bursts and 10,170,953 in the boot before the handoff;
+the other **51.6 M** (6.6 %) went through the exact loops -- 35.8 M in the
+gated run to 205.96 ms and ~16 M in the load's borrowed calls and waits --
+at roughly a quarter of the burst rate, so they cost about a quarter of
+the wall. `test_rtos` was the extreme: its negative-control machine runs
+the full 1000 ms with the transmit interrupt storming (186 M instructions,
+bursts of ~10 between acknowledgements) and every one of its 232 M
+instructions was exact.
+
+### What changed (`rtos.cpp/.h`, `main.cpp`)
+
+- **One loop.** `runInternal` is now `Rtos::runLoop(const RunSpec&)`, and
+  every way the machine is run is a `RunSpec`: a sample budget (`ms`,
+  `hasEnd`), an instruction budget (`budget`, `callAsMain`'s `n <
+  _budget`), the gate (`untilGate`), a PC to stop BEFORE (`pc`, `pcArmed`),
+  a caller's condition (`stop`) with whether it changes only on an event
+  (`stopOnEvent`), the idle skip (`idleSkip`), the install check
+  (`needInstall`, the public `run`/`runUntil` only, as before) and the two
+  `m_why` strings each old loop set (`whyGate`, `whyTime`; null = leave
+  it). The loop's top asks, in the old order, time/budget, the gate (only
+  when `m_gateDirty`), the PC, the condition, then the idle skip; the
+  stepping is O15a's burst body, the exact entry step and the exact tail
+  across the horizon, unchanged. So what O15a proved for the plain run --
+  the same `m_sample += 1/ips` in the same order, the pair called only
+  where the old loop called it -- holds for all of them.
+- **The gate ends a burst** (`endGate`): a create (`recordCreate` at
+  `g_create`) and a dispatch (the record after the scheduler's `rte`) are
+  the only writers of `m_gateDirty`, both are already detected per
+  instruction inside the burst, and the burst now breaks on the flag after
+  that instruction -- the pair, then the loop's top asks `gate()` exactly
+  where the old loop asked it (once per create/dispatch: 61 evaluations in
+  the boot, as before). `Stop::Gate` lands on the same instruction and the
+  same sample: `gate_ms` 205.965 in the stock golden, 6296.63 in the card
+  golden, `test_rtos`'s "205.964903 ms".
+- **A PC condition is compared inside the burst** (`endPc`): `runToPc`,
+  `runToMainSpin` and `callAsMain`'s return (the return address IS main's
+  park) stop before the instruction at the address, where the old loops
+  asked their predicate -- after the previous instruction's pair, which
+  runs at the break. `callAsMain` counts instructions as its old `n` did
+  (a burst is cut to the remaining budget; the budget is checked before
+  the PC, so a call that returns on its last permitted instruction is
+  still "did not return", as before).
+- **A memory condition gets a write watch that wakes** (`wakeOnWrite`):
+  `loadProjectLive`'s card-ready word, `selectBankLive`'s bank byte and
+  `setMainLevelLive`'s gain-table longword are watched (once each, at
+  first use; `Machine` watches are never removed) with a callback that
+  sets `m_wake`, so the store that satisfies the condition ends its
+  burst on that instruction and the condition is asked there. `runUntil`
+  gained `Changes` -- `Anything` (the default: asked before every
+  instruction, no bursts, the pre-O15e loop) or `OnEvent` (the condition
+  can change only on a burst-ending instruction: an acknowledged vector,
+  a peripheral access, a watched write) -- and the caller is answerable
+  for the classification; `main.cpp`'s two frame-count predicates
+  (`--pre-roll`, `--frames`) pass `OnEvent` because `m_frameCount` moves
+  only in the ack hook, which wakes. A condition on unwatched memory
+  stays `Anything`.
+- **No idle skip where there was none.** The borrowed calls and the
+  waits stepped through main's park (`bras .`) between the ATA
+  interrupts; a skip would land the clock ON the expiry where stepping
+  lands it a fraction of a sample past, and every later stamp would
+  move. `idleSkip` is off for them, and without it the burst does not
+  break at the park either (it would be a burst of one instruction): the
+  spin runs to the horizon in bursts of 4096, the exact tail takes the
+  timer on the same instruction.
+- The per-instruction cost added to the burst body is three predictable
+  compares (the PC target -- an odd sentinel when none is armed --, the
+  gate flag under the gated run, the spin under the idle skip), hoisted
+  as constants; the loop's top reads the PC through `pcFast()`. `OT_BURST=0`
+  is still the exact loop for all of them (the card batch under it: golden
+  byte-identical, 31.9 s). `OT_BURST_STATS=1` prints two more counters,
+  `endGate` and `endPc`; `BurstStats` gained the same two fields.
+
+### Measured (12 Sep 2026, the same M5 Mac, macOS 26.5, AppleClang 21.0.0; logs under `out/_agents/impl-5-bootbursts/`)
+
+Same session, interleaved, nothing else running (`pgrep -x ot_emu` = 0
+before each series). **LTO pair**: `build-base` = the Step 4 state at HEAD,
+default configure (= O15c's binary, sha `e298c877…`) vs `build-cand` = this
+tree, default configure. **PGO pair**: `out/emu/ot_emu` as O15d's `pgo.sh`
+left it (sha `1634501f…`) vs `emu-pgo/ot_emu` = this tree through
+`pgo.sh --dest/--gen/--prof` into the log dir (`pgo_run.log`). `bench.py`
+unless said otherwise; `ready.py` = boot to `ready` with `--rtc
+1000000000` and the burst stats.
+
+| measurement | Step 4, LTO | **this step, LTO** | ratio | Step 4, PGO | **this step, PGO** | ratio |
+|---|---|---|---|---|---|---|
+| boot + fixture load to `ready`, no `--dsp` | 7.5, 7.3, 7.28 s | **5.5, 5.4, 5.62 s** | **1.34x** | 6.6, 6.6 s | **5.7, 5.3 s** | 1.20x |
+| … `--dsp` | 25.4, 25.09 s | **23.4, 23.38 s** | 1.08x | 18.8 s | **17.4 s** | 1.08x |
+| play, no `--dsp` (emulated ms per wall s) | 1341, 1387 | 1402, 1460 | 1.05x | 1714, 1720 | 1679, 1671 | 0.98x |
+| play, `--dsp` | 153 | 151 | 0.99x | 174 | 175 | 1.01x |
+| `card` batch (`--mount … --ms 1000 --golden`, standalone) | 7.36 s | **5.48 s** | **1.34x** | 6.57 s | **5.42 s** | 1.21x |
+| `stock` batch (`--ms 1000 --golden`) | 1.62 s | **0.82 s** | **2.0x** | | | |
+| `--sequencer --golden --bank 1 --frames 400` (no `--dsp`) | 7.85 s | **5.66 s** | 1.39x | | | |
+| `test_rtos` (two boots, the gate, the negative control's full second) | 8.62 s | **2.32 s** | **3.7x** | 7.70 s | **2.78 s** | 2.8x |
+
+The play rate is the untouched path (`run(_ms, false)`): 1.05x and 0.98x
+are the LTO series' noise and the profile-to-profile variance O15d
+measured (1652 vs 1665 on two profiles). The gains are where the exact
+loops were: `ready` from 7.36 s (mean) to 5.51 s, `test_rtos` 3.7x, the
+stock batch 2.0x. The `card` batch's 1.34x is what its instruction
+accounting allows -- 52 M of its 787 M instructions were exact at Step 4
+and the rest already burst -- so the plan's "3-4x" for it (estimated
+before Steps 2-4 shrank everything else) was never on the table; 3.7x
+on `test_rtos`, the plan's other case, is. Acceptance: `ready` <= 9 s
+(5.5 s), `gate_ms` unchanged (205.964903 in `test_rtos`, 205.965 /
+6296.63 in the goldens), oracle 28 PASS, ctest 7/7.
+
+**What the bursts do now** (`OT_BURST_STATS=1`): the OTLIVE boot to
+`ready`, 787,138,663 instructions as before (the same instructions --
+the count is unchanged in every run below): 776,958,966 in 11,618,842
+bursts (98.7 %; Step 4: 725.3 M in 11.42 M), 8,744 exact (Step 4:
+6,965), the rest the boot before the handoff; bursts ended on a
+peripheral access 11,330,746 times, a wake 65,421, the horizon 180,587,
+main's spin 42,021, **the gate 61, a PC 6** (5 in the card batch: the
+load's borrowed calls and PC waits; the sixth is SET MAIN LEVEL's, which
+`--interactive` posts by default -- a PC wait that finds the PC already
+there at its top, or on its exact entry step, is not a burst end and is
+not counted). `test_rtos`: the first
+machine 43,931 bursts / 35,830,945 instructions / 121 exact, 61 gate
+ends; the negative control 17,595,901 bursts / 175,958,997 instructions,
+17,595,900 of them ended by a wake -- the transmit interrupt it was
+built to leave storming, ten instructions apart, and still 3.7x faster
+than a pair per instruction.
+
+**The gate: 28 PASS, 0 FAIL, twice** -- the LTO candidate
+(`out/_agents/speed-oracle/reports/20260912-104149-impl5-bootbursts.txt`,
+copy `oracle1.txt`, 53 s wall) and the PGO candidate
+(`…-105258-impl5-bootbursts-pgo.txt`, `oracle_pgo.txt`, 43 s): boot logs
+identical, `serial_a` 5731 / 9257 bytes identical, goldens 12,757 /
+26,367 bytes identical, `run3_core0.wav` 7,936,292 bytes identical, the
+UART A stream 18,297 / 18,309 bytes identical step by step, 109 peeks
+identical, 47 run stamps with max |dsample| = 0 and |dframes| = 0,
+`interdsp.pcm` 497,788 bytes identical, ctest 7 / 7 in `build-cand` /
+`emu-pgo`. Under the battery the LTO candidate's jobs took: `stock`
+0.60 s (reference 2.37), `card` 6.34 s (44.19), `render` 31.6 s (75.3),
+`inter` boot 6.35 s + 3.0 s of `run` (44.1 + 19.8), `interdsp` 24.7 s +
+27.6 s (66.0 + 42.4); the PGO candidate: `card` 6.41, `render` 25.0,
+`inter` 6.36 + 2.68, `interdsp` 18.6 + 23.8. Beyond the gate, standalone
+against the Step 4 binary: the `stock`, `card` and `--sequencer --bank 1
+--frames 400 --main-level 64` goldens and batch logs byte-identical
+(`selectBankLive` exercised: saved bank 0, played bank 1), and the card
+batch under `OT_BURST=0` byte-identical to both.
+
+### What it does not do
+
+- A `runUntil` condition on memory nobody watches, or any condition a
+  caller does not classify, runs the exact loop as before (`Changes::
+  Anything` is the default); the three watched words are the only memory
+  conditions in the tree. Watches cost: every write takes `Machine`'s
+  slow body once one is armed (O15c), and the card-ready watch arms it
+  at the mount rather than at the PART_PTR watch a few hundred ms later
+  -- the same state every card session was already in for the whole of
+  its play.
+- The `--dsp` `ready` gains 8 %: the DSP boot and the sample load are
+  the cores' work, ticked per instruction inside a burst as outside it.
+- The stock path's remaining cost is not the loop: 17.5 M of its 46 M
+  instructions write into the 0x42000000 span the stock run never maps
+  (auto-mapped, the slow body); a mapped span there is `machine.*`'s
+  business, not this step's.
+- Nothing paces anything (plan step 7); the plan's step 5 (`m68k_execute
+  (N)` with an instruction hook) stays in reserve.

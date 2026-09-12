@@ -163,7 +163,20 @@ namespace ot
 		// The same loop -- idle skip included, which is what makes a frame
 		// run cheap -- stopping on a caller's condition instead of the gate.
 		// Returns Stop::Gate when the condition came true.
-		Stop runUntil(double _ms, const std::function<bool()>& _stop);
+		//
+		// O15e: `_changes` says WHAT CAN CHANGE THE CONDITION, and the caller
+		// is answerable for it. `Anything`: the condition is asked before
+		// every instruction, no bursts (the pre-O15e loop). `OnEvent`: it can
+		// only change on an instruction that ends a burst anyway -- the CPU
+		// acknowledging a vector (the frame count, the tick count, the ATA
+		// count: the ack hook wakes), a peripheral access (touched), or a
+		// write the Rtos watches for the purpose (`wakeOnWrite`) -- so it is
+		// asked at every burst end and comes true on the same instruction,
+		// at the same sample, as it did per instruction. A condition on plain
+		// memory nobody watches is NOT an event: pass `Anything` or add the
+		// watch first.
+		enum class Changes { Anything, OnEvent };
+		Stop runUntil(double _ms, const std::function<bool()>& _stop, Changes _changes = Changes::Anything);
 
 		// Run until the PC is parked at main's spin -- what `callAsMain`
 		// needs before it can borrow the slot.
@@ -404,8 +417,11 @@ namespace ot
 		// stepOnce (the entry step, the horizon tails, the gated/untilGate
 		// runs); a burst ended on a peripheral access, a wake (ack, host word),
 		// the horizon, or the PC landing on main's spin.
+		// O15e adds two ends: the M6a gate went dirty (a create or a dispatch
+		// under `run(_ms, true)`), and the PC reached a caller's address
+		// (`runToPc`, `runToMainSpin`, `callAsMain`'s return).
 		struct BurstStats { uint64_t bursts = 0, burstInstr = 0, exactInstr = 0,
-			endPeriph = 0, endWake = 0, endHorizon = 0, endSpin = 0; };
+			endPeriph = 0, endWake = 0, endHorizon = 0, endSpin = 0, endGate = 0, endPc = 0; };
 		const BurstStats& burstStats() const { return m_burstStats; }
 		// The knobs, read once from the environment: OT_BURST = the quantum
 		// (default 4096; 0 = every instruction exact, the pre-O15a loop),
@@ -461,7 +477,38 @@ namespace ot
 		uint32_t curTcb();
 		bool peripheralRead(uint32_t _addr, uint8_t _size, uint32_t& _out);
 		void peripheralWrite(uint32_t _addr, uint8_t _size, uint32_t _val, bool _replay);
-		Stop runInternal(double _ms, bool _untilGate, const std::function<bool()>* _stop);
+		// O15e: ONE loop for every way the machine is run. Before it, the
+		// plain run had the bursts (O15a) and the five other loops -- the
+		// gated run, runUntil, runToMainSpin, callAsMain, and the waits in
+		// loadProjectLive / selectBankLive / setMainLevelLive -- each stepped
+		// exactly, one stepOnce per instruction. They differ only in WHEN THEY
+		// STOP, which a RunSpec spells out; the stepping, the idle skip and
+		// the bursts are the same code, so what O15a proved for the plain run
+		// holds for all of them. Stop::Gate = a condition came true, Stop::
+		// Time = the sample or instruction budget ran out, Illegal/Fault as
+		// before. `m_why` is set only where the old loop set it (`whyGate`,
+		// `whyTime`; null = leave it).
+		struct RunSpec
+		{
+			double ms = 0.0;						// the sample budget from entry (hasEnd)
+			bool hasEnd = true;
+			uint64_t budget = 0;					// an instruction budget (0 = none): callAsMain
+			bool untilGate = false;					// the M6a gate, asked when m_gateDirty
+			uint32_t pc = 0;						// stop BEFORE executing this address (pcArmed)
+			bool pcArmed = false;
+			const std::function<bool()>* stop = nullptr;	// the caller's condition, asked before each instruction
+			bool stopOnEvent = false;				// ... and it can only change on a burst-ending instruction: bursts stay on
+			bool idleSkip = true;					// advance the clock over main's idle park
+			bool needInstall = true;				// the public entry points refuse an uninstalled Rtos
+			const char* whyGate = nullptr;
+			const char* whyTime = nullptr;
+		};
+		Stop runLoop(const RunSpec& _s);
+		// Arm a write watch that wakes the burst loop (`m_wake`) on any store
+		// into [addr, addr+len): a memory condition then changes only on an
+		// instruction that ends its burst, and `Changes::OnEvent` is honest
+		// for it. Once, per range (`_armed`); watches are never removed.
+		void wakeOnWrite(uint32_t _addr, uint32_t _len, bool& _armed);
 		void tickTimers();
 		// One instruction plus everything the run loop does around it, so a
 		// borrowed call runs against the same live machine the loop does.
@@ -540,6 +587,9 @@ namespace ot
 		std::vector<MemWrite> m_memWrites;
 		bool m_trigLogInstalled = false;
 		bool m_partPtrWatched = false;
+		// O15e: the wake watches behind the memory conditions (card ready,
+		// the bank byte, the main gain table); armed once, at first use.
+		bool m_cardReadyWatched = false, m_curBankWatched = false, m_gainTableWatched = false;
 		int m_savedBank = -1;
 		bool m_frame = false;
 		bool m_framePending = false;

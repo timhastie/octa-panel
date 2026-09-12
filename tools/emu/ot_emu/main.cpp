@@ -1123,8 +1123,10 @@ int main(int _argc, char** _argv)
 				if(preRoll > 0)
 				{
 					const auto f0 = rtos.frameCount();
+					// O15e: the frame count moves only in the ack hook, which
+					// wakes the burst loop -- an event condition.
 					const auto rsp = rtos.runUntil(preRoll * ot::g_framePeriod / ot::g_sampleHz * 1000.0 * 5 + 2000.0,
-						[&] { return rtos.frameCount() >= f0 + static_cast<uint64_t>(preRoll); });
+						[&] { return rtos.frameCount() >= f0 + static_cast<uint64_t>(preRoll); }, ot::Rtos::Changes::OnEvent);
 					std::printf("pre-roll   : %llu frame(s) of the frame engine before the transport start (%s)\n",
 						static_cast<unsigned long long>(rtos.frameCount() - f0),
 						rsp == ot::Rtos::Stop::Gate ? "REACHED" : rtos.why().c_str());
@@ -1161,7 +1163,7 @@ int main(int _argc, char** _argv)
 					rtos.armPcRingNow(pcRing);
 				const auto target = frame0 + static_cast<uint64_t>(frames);
 				const auto rs2 = rtos.runUntil(frames * ot::g_framePeriod / ot::g_sampleHz * 1000.0 * 5 + 2000.0,
-					[&] { return rtos.frameCount() >= target; });
+					[&] { return rtos.frameCount() >= target; }, ot::Rtos::Changes::OnEvent);	// O15e: the ack hook wakes
 				static const char* const g_seqStop[] = {"REACHED", "TIME", "FAULT", "ILLEGAL"};
 				std::printf("sequencer  : playing bank %u pattern %u "
 					"(re-selected through the load's own last step)\n", seq.first, seq.second);

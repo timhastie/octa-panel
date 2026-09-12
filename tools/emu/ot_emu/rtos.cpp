@@ -105,11 +105,12 @@ namespace ot
 		{
 			const auto& s = m_burstStats;
 			std::fprintf(stderr, "burst stats: bursts=%llu burstInstr=%llu exactInstr=%llu "
-				"endPeriph=%llu endWake=%llu endHorizon=%llu endSpin=%llu idleSkips=%llu instructions=%llu quantum=%d stepfast=%d\n",
+				"endPeriph=%llu endWake=%llu endHorizon=%llu endSpin=%llu endGate=%llu endPc=%llu idleSkips=%llu instructions=%llu quantum=%d stepfast=%d\n",
 				static_cast<unsigned long long>(s.bursts), static_cast<unsigned long long>(s.burstInstr),
 				static_cast<unsigned long long>(s.exactInstr), static_cast<unsigned long long>(s.endPeriph),
 				static_cast<unsigned long long>(s.endWake), static_cast<unsigned long long>(s.endHorizon),
-				static_cast<unsigned long long>(s.endSpin), static_cast<unsigned long long>(m_idleSkips),
+				static_cast<unsigned long long>(s.endSpin), static_cast<unsigned long long>(s.endGate),
+				static_cast<unsigned long long>(s.endPc), static_cast<unsigned long long>(m_idleSkips),
 				static_cast<unsigned long long>(m_machine.instructions()), burstQuantum(), burstStepFast() ? 1 : 0);
 		}
 	}
@@ -515,7 +516,7 @@ namespace ot
 	//   * the DSP raising its bank word (setFrameFromDsp's hook: the frame
 	//     edge and m_nextFrame): m_wake;
 	//   * the outside world between runs (rxPush from the panel, pokes,
-	//     setFrame, setNames): m_wake at runInternal entry;
+	//     setFrame, setNames): m_wake at runLoop entry;
 	//   * TIME: an armed PIT expiring (PIF; PIE or not -- PCSR reads back),
 	//     an armed DTIM reaching its reference (DTER.REF; ORRI or not), the
 	//     frame timer's edge and the latched DSP edge (both at m_nextFrame,
@@ -655,30 +656,75 @@ namespace ot
 
 	Rtos::Stop Rtos::run(const double _ms, const bool _untilGate)
 	{
-		return runInternal(_ms, _untilGate, nullptr);
+		RunSpec s;
+		s.ms = _ms;
+		s.untilGate = _untilGate;
+		s.whyGate = "the M6a gate passed";
+		s.whyTime = "time";
+		return runLoop(s);
 	}
 
-	Rtos::Stop Rtos::runUntil(const double _ms, const std::function<bool()>& _stop)
+	Rtos::Stop Rtos::runUntil(const double _ms, const std::function<bool()>& _stop, const Changes _changes)
 	{
-		return runInternal(_ms, false, &_stop);
+		RunSpec s;
+		s.ms = _ms;
+		s.stop = &_stop;
+		s.stopOnEvent = _changes == Changes::OnEvent;
+		s.whyGate = "the caller's condition came true";
+		s.whyTime = "time";
+		return runLoop(s);
 	}
 
-	Rtos::Stop Rtos::runInternal(const double _ms, const bool _untilGate, const std::function<bool()>* _stop)
+	Rtos::Stop Rtos::runToPc(const uint32_t _pc, const double _ms)
 	{
-		if(!m_installed)
+		// O15e: a PC condition is compared inside the burst, before each
+		// instruction, where the old predicate was asked -- same instruction,
+		// same sample, and the pair has run for the instruction before it.
+		RunSpec s;
+		s.ms = _ms;
+		s.pc = _pc;
+		s.pcArmed = true;
+		s.whyGate = "the caller's condition came true";
+		s.whyTime = "time";
+		return runLoop(s);
+	}
+
+	void Rtos::wakeOnWrite(const uint32_t _addr, const uint32_t _len, bool& _armed)
+	{
+		if(_armed)
+			return;
+		_armed = true;
+		m_machine.addWriteWatch(_addr, _addr + _len - 1,
+			[this](uint32_t, uint8_t, uint32_t, uint32_t) { m_wake = true; });
+	}
+
+	Rtos::Stop Rtos::runLoop(const RunSpec& _s)
+	{
+		if(_s.needInstall && !m_installed)
 		{
 			if(m_why.empty())
 				m_why = "install() was not called";
 			return Stop::Fault;
 		}
-		const double end = m_sample + _ms * g_sampleHz / 1000.0;
-		uint64_t idleRuns = 0;
-		// O15a: bursts only on the plain run. The gate and a caller's predicate
-		// are evaluated before every instruction and stay that way (plan step
-		// 6 extends them); the pre-O15a loop is OT_BURST=0.
+		const double end = _s.hasEnd ? m_sample + _s.ms * g_sampleHz / 1000.0 : 1e300;
+		uint64_t idleRuns = 0, executed = 0;
+		// O15a: bursts on the plain run. O15e: on the gated run too (a burst
+		// ends the instruction the gate goes dirty), on a PC condition (the
+		// compare is inside the burst) and on a condition that changes only
+		// on an event; a condition on anything else keeps the pre-O15a loop.
+		// The pre-O15a loop for all of them is OT_BURST=0.
 		const int quantum = burstQuantum();
-		const bool bursts = quantum > 0 && !_untilGate && !_stop;
+		const bool bursts = quantum > 0 && (!_s.stop || _s.stopOnEvent);
 		const bool fast = burstStepFast();
+		// The three per-instruction compares the spec adds to the burst loop,
+		// hoisted: a PC that never matches (odd) when none is armed; the gate
+		// only under the gated run; the spin only while the idle skip wants
+		// its look (without the skip, main's park is stepped through like
+		// the old stepOnce loops stepped it, and breaking on it would make a
+		// burst of one instruction).
+		const uint32_t pcStop = _s.pcArmed ? _s.pc : 1u;
+		const bool gateEnds = _s.untilGate;
+		const bool spinEnds = _s.idleSkip;
 		m_wake = true;
 
 		while(m_sample < end)
@@ -688,29 +734,45 @@ namespace ot
 			// instruction costs more than the emulator itself -- the first
 			// version of this loop did exactly that and looked like a hang.
 			// A create or a dispatch is the only thing that can move it.
-			if(_untilGate && m_gateDirty)
+			if(_s.untilGate && m_gateDirty)
 			{
 				m_gateDirty = false;
 				if(gate())
 				{
-					m_why = "the M6a gate passed";
+					if(_s.whyGate)
+						m_why = _s.whyGate;
 					return Stop::Gate;
 				}
 			}
-			if(_stop && (*_stop)())
+			// callAsMain's budget: the old loop checked it before the PC, so
+			// a call that returns on its very last permitted instruction is
+			// still "did not return" -- kept, for the stamps' sake.
+			if(_s.budget && executed >= _s.budget)
+				return Stop::Time;
+			if(_s.pcArmed && m_machine.pcFast() == _s.pc)
 			{
-				m_why = "the caller's condition came true";
+				if(_s.whyGate)
+					m_why = _s.whyGate;
+				return Stop::Gate;
+			}
+			if(_s.stop && (*_s.stop)())
+			{
+				if(_s.whyGate)
+					m_why = _s.whyGate;
 				return Stop::Gate;
 			}
 
-			const auto pc = m_machine.pc();
+			const auto pc = m_machine.pcFast();
 
 			// IDLE. Main parks in `bras .` and never blocks, so level 0 is
 			// never empty and there is no idle path in the kernel to model:
 			// a PC sitting there with nothing deliverable means the machine
 			// is waiting for a timer, and the clock can simply be advanced to
-			// it (route A's "idle skips").
-			if(pc == g_mainSpin && !anyPending())
+			// it (route A's "idle skips"). ⚠️ Not in the borrowed-call and
+			// wait loops (`idleSkip` false): they never skipped, and a skip
+			// lands the clock ON the expiry where stepping lands it a
+			// fraction of a sample past -- every later stamp would move.
+			if(_s.idleSkip && pc == g_mainSpin && !anyPending())
 			{
 				double ex;
 				if(!nextExpiry(ex))
@@ -756,6 +818,8 @@ namespace ot
 				double nd = (lim - m_sample) * m_ips - 2.0;
 				if(nd > static_cast<double>(quantum))
 					nd = static_cast<double>(quantum);
+				if(_s.budget && nd > static_cast<double>(_s.budget - executed))
+					nd = static_cast<double>(_s.budget - executed);
 				if(m_wake || nd < 2.0)
 				{
 					// The exact step: the run's first instruction (whatever
@@ -766,6 +830,7 @@ namespace ot
 					m_wake = false;
 					if(!stepOnce())
 						return Stop::Illegal;
+					++executed;
 					m_machine.takePeriphTouched();		// stepOnce handled that instruction in full
 					continue;
 				}
@@ -780,11 +845,15 @@ namespace ot
 				{
 					// stepOnce's per-instruction work, verbatim, minus the pair.
 					const uint32_t ipc = m_machine.pcFast();
+					// O15e: the caller's address, BEFORE the instruction -- the
+					// old loop asked its predicate at the top, after the
+					// previous instruction's pair; the pair runs at the break.
+					if(ipc == pcStop) { ++m_burstStats.endPc; break; }
 					// Main's park: the idle skip must get its look at it before
 					// the spin is executed (the old loop checked before every
 					// instruction) -- after at least one instruction, so a park
 					// with something pending but masked still makes progress.
-					if(i > 0 && ipc == g_mainSpin) { ++m_burstStats.endSpin; break; }
+					if(spinEnds && i > 0 && ipc == g_mainSpin) { ++m_burstStats.endSpin; break; }
 					if(ring)
 					{
 						m_pcRing[m_pcRingPos % m_pcRing.size()] = ipc;
@@ -812,9 +881,13 @@ namespace ot
 					++i;		// once per instruction (the prototype counted twice)
 					if(m_machine.takePeriphTouched()) { ++m_burstStats.endPeriph; break; }
 					if(m_wake) { ++m_burstStats.endWake; break; }
+					// O15e: the gate went dirty on this instruction (a create
+					// or a dispatch): the pair, then the loop's top asks it.
+					if(gateEnds && m_gateDirty) { ++m_burstStats.endGate; break; }
 					if(i >= n) { ++m_burstStats.endHorizon; break; }
 				}
 				m_burstStats.burstInstr += static_cast<uint64_t>(i);
+				executed += static_cast<uint64_t>(i);
 				m_wake = false;		// before the pair: a wake raised inside them forces an exact step next
 				tickTimers();
 				deliver();
@@ -823,15 +896,17 @@ namespace ot
 
 			if(!stepOnce())
 				return Stop::Illegal;
+			++executed;
 		}
-		m_why = "time";
+		if(_s.whyTime)
+			m_why = _s.whyTime;
 		return Stop::Time;
 	}
 
-	// One instruction and everything the loop does around it. Factored out so
-	// `callAsMain` runs against the SAME live machine -- the whole point of
-	// borrowing main rather than detouring is that interrupts and the other
-	// tasks keep running underneath the call.
+	// One instruction and everything the loop does around it: the exact step
+	// (a run's first instruction, the tail across an event, OT_BURST=0). Until
+	// O15e it was also the whole of the borrowed-call and wait loops; those
+	// now go through runLoop, whose burst body is this work minus the pair.
 	bool Rtos::stepOnce()
 	{
 		const auto pc = m_machine.pc();
@@ -881,20 +956,20 @@ namespace ot
 
 	Rtos::Stop Rtos::runToMainSpin(const double _ms)
 	{
-		const double end = m_sample + _ms * g_sampleHz / 1000.0;
-		while(m_sample < end)
-		{
-			// ⚠️ THE PC ALONE, as route A's `until=lambda r: r.pc == MAIN_SPIN`.
-			// Requiring nothing to be pending as well never comes true once
-			// the card is live: the ATA and serial lines assert constantly,
-			// so the park never returned and the load never started.
-			if(m_machine.pc() == g_mainSpin)
-				return Stop::Gate;
-			if(!stepOnce())
-				return Stop::Illegal;
-		}
-		m_why = "never reached main's spin";
-		return Stop::Time;
+		// ⚠️ THE PC ALONE, as route A's `until=lambda r: r.pc == MAIN_SPIN`.
+		// Requiring nothing to be pending as well never comes true once
+		// the card is live: the ATA and serial lines assert constantly,
+		// so the park never returned and the load never started.
+		// O15e: the same loop, in bursts, no idle skip (it never had one:
+		// the PC at the park IS the condition), no install check (as before).
+		RunSpec s;
+		s.ms = _ms;
+		s.pc = g_mainSpin;
+		s.pcArmed = true;
+		s.idleSkip = false;
+		s.needInstall = false;
+		s.whyTime = "never reached main's spin";
+		return runLoop(s);
 	}
 
 	void Rtos::mapCardMemory()
@@ -959,16 +1034,26 @@ namespace ot
 		m_machine.setA7(sp);
 		m_machine.setPC(_addr);
 
-		for(uint64_t n = 0; n < _budget; ++n)
+		// O15e: the return is the PC condition (the return address IS the
+		// park), the budget counts instructions as the old loop's `n` did,
+		// no idle skip, no sample end. With the card live the call is
+		// preempted constantly and the bursts run the other tasks' code
+		// underneath it exactly as the plain run would.
+		RunSpec s;
+		s.hasEnd = false;
+		s.budget = _budget;
+		s.pc = g_mainSpin;
+		s.pcArmed = true;
+		s.idleSkip = false;
+		s.needInstall = false;
+		const auto st = runLoop(s);
+		if(st == Stop::Gate)
 		{
-			if(m_machine.pc() == g_mainSpin)
-			{
-				_d0 = m_machine.getD0();
-				return true;
-			}
-			if(!stepOnce())
-				return false;
+			_d0 = m_machine.getD0();
+			return true;
 		}
+		if(st != Stop::Time)
+			return false;		// Illegal: m_why is the machine's, as stepOnce left it
 		char msg[160];
 		std::snprintf(msg, sizeof msg, "callAsMain(%#x) did not return in %llu steps",
 			_addr, static_cast<unsigned long long>(_budget));
@@ -993,11 +1078,6 @@ namespace ot
 		write(g_projectName, _project);
 	}
 
-	Rtos::Stop Rtos::runToPc(const uint32_t _pc, const double _ms)
-	{
-		return runUntil(_ms, [this, _pc] { return m_machine.pc() == _pc; });
-	}
-
 	Rtos::LoadResult Rtos::loadProjectLive(const std::string& _set, const std::string& _project,
 		const double _runMs, const double _mountMs, const bool _namesEarly)
 	{
@@ -1014,10 +1094,23 @@ namespace ot
 		// Wait for the card to come READY rather than for a fixed time: the
 		// mount runs in the SYS task against real ATA commands completed
 		// through vector 0xb6.
-		const double mountEnd = m_sample + _mountMs * g_sampleHz / 1000.0;
-		while(m_sample < mountEnd && m_machine.peek32(g_cardReady) == 0)
-			if(!stepOnce())
+		// O15e: a memory condition, so the word is watched -- the store that
+		// sets it wakes the burst loop on that instruction, and the condition
+		// is asked there, as it was before every instruction. No idle skip
+		// (the old loop had none: main parks between the ATA interrupts and
+		// was stepped through), no sample stamp moves.
+		{
+			wakeOnWrite(g_cardReady, 4, m_cardReadyWatched);
+			const std::function<bool()> ready = [this] { return m_machine.peek32(g_cardReady) != 0; };
+			RunSpec s;
+			s.ms = _mountMs;
+			s.stop = &ready;
+			s.stopOnEvent = true;
+			s.idleSkip = false;
+			s.needInstall = false;
+			if(runLoop(s) == Stop::Illegal)
 				return out;
+		}
 		out.ready = m_machine.peek32(g_cardReady);
 
 		// ⚠️ WAIT FOR `sys`'S MEDIA CASE TO PASS BEFORE NAMING THE PROJECT,
@@ -1128,10 +1221,16 @@ namespace ot
 		uint32_t d0 = 0;
 		if(!postMessage(g_sysQueue, g_sysMsgScratch, d0))
 			return m_machine.read8(g_curBank);
-		const double end = m_sample + _ms * g_sampleHz / 1000.0;
-		while(m_sample < end && m_machine.read8(g_curBank) != (_bank & 0xff))
-			if(!stepOnce())
-				break;
+		// O15e: watched, in bursts, no idle skip -- see loadProjectLive's wait.
+		wakeOnWrite(g_curBank, 1, m_curBankWatched);
+		const std::function<bool()> switched = [this, _bank] { return m_machine.read8(g_curBank) == (_bank & 0xff); };
+		RunSpec s;
+		s.ms = _ms;
+		s.stop = &switched;
+		s.stopOnEvent = true;
+		s.idleSkip = false;
+		s.needInstall = false;
+		runLoop(s);
 		return m_machine.read8(g_curBank);
 	}
 
@@ -1233,10 +1332,16 @@ namespace ot
 		uint32_t d0 = 0;
 		if(!postMessage(g_sysQueue, g_sysMsgScratch, d0))
 			return m_machine.peek32(g_mainGainTable);
-		const double end = m_sample + _ms * g_sampleHz / 1000.0;
-		while(m_sample < end && m_machine.peek32(g_mainGainTable) == 0)
-			if(!stepOnce())
-				break;
+		// O15e: watched, in bursts, no idle skip -- see loadProjectLive's wait.
+		wakeOnWrite(g_mainGainTable, 4, m_gainTableWatched);
+		const std::function<bool()> filled = [this] { return m_machine.peek32(g_mainGainTable) != 0; };
+		RunSpec s;
+		s.ms = _ms;
+		s.stop = &filled;
+		s.stopOnEvent = true;
+		s.idleSkip = false;
+		s.needInstall = false;
+		runLoop(s);
 		runToMainSpin();
 		return m_machine.peek32(g_mainGainTable);
 	}
