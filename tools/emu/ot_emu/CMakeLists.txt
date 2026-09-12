@@ -44,6 +44,78 @@ if(OT_LTO)
 	endif()
 endif()
 
+# O15d: profile-guided optimisation, opt-in. Two knobs, both OFF by default
+# (a default configure builds exactly as before: LTO only):
+#   -DOT_PGO_GENERATE=ON        the instrumented build (-fprofile-instr-generate
+#                               on every compile and link line, the cores
+#                               included); running it writes an LLVM .profraw
+#                               to $LLVM_PROFILE_FILE at exit (`quit` / EOF /
+#                               end of batch -- main returns, atexit runs).
+#   -DOT_PGO_PROFILE=<.profdata> the optimised build (-fprofile-instr-use=<path>
+#                               on every compile and link line): the merged
+#                               profile steers inlining, block layout and
+#                               branch weights on top of LTO. It changes code
+#                               placement only, never what the code computes
+#                               (no fast-math, no reassociation); the oracle is
+#                               run on it all the same.
+# tools/emu/ot_emu/pgo.sh does the whole ritual (instrumented build, the two
+# training runs, `llvm-profdata merge`, the optimised build into out/emu).
+# The profile is BUILD-HOST SPECIFIC (compiler version, flags, the source
+# bytes it was collected on): after any source change under tools/emu/ot_emu
+# or the vendored cores regenerate it; a stale profile is matched function by
+# function by name and CFG hash, a changed function simply gets no weights,
+# so it only loses speed, never correctness (O15d measured that with the
+# oracle on a deliberately stale profile). Set before add_subdirectory so the
+# vendored targets inherit both; directory-scoped so nothing here needs to
+# know the vendored target names.
+option(OT_PGO_GENERATE "PGO: build instrumented for profile collection (O15d)" OFF)
+set(OT_PGO_PROFILE "" CACHE FILEPATH "PGO: merged .profdata to optimise with (O15d); empty = no PGO")
+option(OT_PGO_WARNINGS "PGO: show clang's per-file profile warnings (unprofiled / out-of-date / hash mismatch)" OFF)
+if(OT_PGO_GENERATE AND OT_PGO_PROFILE)
+	message(FATAL_ERROR "ot_emu: OT_PGO_GENERATE and OT_PGO_PROFILE are exclusive (instrument, train, then optimise)")
+endif()
+if(OT_PGO_GENERATE)
+	add_compile_options(-fprofile-instr-generate)
+	add_link_options(-fprofile-instr-generate)
+	message(STATUS "ot_emu: PGO instrumented build (-fprofile-instr-generate); set LLVM_PROFILE_FILE when running it")
+elseif(OT_PGO_PROFILE)
+	if(NOT EXISTS "${OT_PGO_PROFILE}")
+		message(FATAL_ERROR "ot_emu: OT_PGO_PROFILE=${OT_PGO_PROFILE} does not exist (run tools/emu/ot_emu/pgo.sh)")
+	endif()
+	add_compile_options("-fprofile-instr-use=${OT_PGO_PROFILE}")
+	add_link_options("-fprofile-instr-use=${OT_PGO_PROFILE}")
+	# Every object must come from the SAME profile: an object compiled with
+	# profile A cannot be LTO-linked with one compiled with profile B ("ld:
+	# LTO codegen error: linking module flags 'ProfileSummary': IDs have
+	# conflicting values"). The build system only sees the flag text, and the
+	# path is the same whatever the bytes at it -- so a tree that already
+	# holds objects from an earlier profile (the vendored cores, whose sources
+	# did not change; 156 of 171 objects on the second `pgo.sh` run) would
+	# keep them and the link would fail. Two things make the tree follow the
+	# profile's BYTES: its SHA-256 goes into every compile line as a define
+	# nothing reads, so every flags.make changes with the profile and every
+	# object is recompiled (`cmake --fresh` alone does not do that: it clears
+	# the cache, not the objects); and the profile is a configure dependency,
+	# so a plain `cmake --build` after the profile changed re-runs cmake by
+	# itself. The define does not reach the bytes: the same profile gives the
+	# same binary in any tree (O15d, fix1).
+	file(SHA256 "${OT_PGO_PROFILE}" _ot_pgo_sha256)
+	add_compile_definitions("OT_PGO_PROFILE_SHA256=${_ot_pgo_sha256}")
+	set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${OT_PGO_PROFILE}")
+	if(NOT OT_PGO_WARNINGS)
+		# -Wprofile-instr-unprofiled: every file the training never ran (the
+		# test programs, asmjit, the JIT, the DSP disassembler) would warn once;
+		# -Wbackend-plugin: clang's per-function "control flow change detected
+		# (hash mismatch)" for a stale profile, hundreds of lines. Both are
+		# expected noise; -Wprofile-instr-out-of-date (one line per file whose
+		# functions no longer match: "the profile is stale, regenerate") stays
+		# visible. OT_PGO_WARNINGS=ON shows all three (the acceptance check:
+		# no `profile-instr-unprofiled` on machine/rtos/periph/v4e/dsp/m68kops).
+		add_compile_options(-Wno-profile-instr-unprofiled -Wno-backend-plugin)
+	endif()
+	message(STATUS "ot_emu: PGO optimised build with ${OT_PGO_PROFILE}")
+endif()
+
 # mc68k: Musashi plus the ColdFire mode, the HI08 host-port register file and
 # the on-chip peripheral scaffolding. Vendored, GPLv3 -- the same posture as
 # vendor/dsp56300: tooling and patches are shared, built binaries never are.

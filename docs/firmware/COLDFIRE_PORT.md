@@ -3557,3 +3557,310 @@ of a YES-PLAY-STOP script byte-identical to the reference's (312 lines).
 - The table is rebuilt whole on every `mapRegion` (8 MB written, seven
   times per boot: the constructor and the six `mapRegion`s); it costs
   nothing measurable and keeps the rule in one place.
+
+## Milestone O15d — profile-guided optimisation, opt-in: +28 % on top of bursts + LTO + page table, bit for bit ✅ (12 Sep 2026, branch `panel-ui`)
+
+Step 4 of the speed plan; `tools/emu/ot_emu/CMakeLists.txt` and a new
+`tools/emu/ot_emu/pgo.sh`, no source change, no CLI change. The compiler
+already inlines across the whole program (O15b) and the memory path is a
+table lookup (O15c); what it still guesses at is which branches are hot --
+which of Musashi's 1,968 opcode handlers the firmware actually runs, which
+of `DspPair::stepCore`'s paths the cores take, where `Rtos::runInternal`'s
+burst loop leaves. A profile answers that. The speed-mem investigation
+measured +12 % over LTO on the pre-burst code (1.31x vs 1.17x) and 1.33x
+with `--dsp` on its own fast+LTO prototype; this lands the build option and
+the ritual that makes the profile.
+
+### What changed (`CMakeLists.txt`, `pgo.sh`)
+
+Two cache knobs, both OFF by default, set BEFORE the `add_subdirectory`
+calls so the vendored cores inherit them (directory-scoped
+`add_compile_options` / `add_link_options`; nothing here names a vendored
+target):
+
+- `-DOT_PGO_GENERATE=ON`: `-fprofile-instr-generate` on every compile and
+  link line (verified on the verbose build: 167 of 167 compile lines, the
+  `ot_emu` link line). The binary writes an LLVM `.profraw` to
+  `$LLVM_PROFILE_FILE` when `main` returns -- `quit`, EOF on stdin, the end
+  of a batch run (`main.cpp` returns, it never `_exit`s).
+- `-DOT_PGO_PROFILE=<.profdata>`: `-fprofile-instr-use=<path>` on every
+  compile and link line (167 / 167 and the links), FATAL_ERROR if the file
+  does not exist, exclusive with GENERATE. Clang's per-file noise is
+  silenced -- `-Wno-profile-instr-unprofiled` (a file the training never
+  ran: 40 lines, all asmjit, the DSP JIT `jit*.cpp`, the vendored unit
+  tests, `test_emac` / `test_dsp`) and `-Wno-backend-plugin` (the
+  per-function "hash mismatch" of a stale profile) -- while
+  `-Wprofile-instr-out-of-date` stays visible: one line per file whose
+  functions no longer match the profile, i.e. "regenerate". With a FRESH
+  profile 22 such lines remain and are expected: the 19 `jit*.cpp` files
+  (header-defined functions the JIT shares by name with the interpreter and
+  compiles differently; the JIT is never run) and the test programs whose
+  `main` collides with `ot_emu`'s. `-DOT_PGO_WARNINGS=ON` shows all three
+  (the acceptance check of the plan: NO `profile-instr-unprofiled` on
+  `machine` / `rtos` / `periph` / `v4e` / `dsp` / `card` / `main` /
+  `m68kops` / `m68kcpu` / `mc68k` -- verified on a `-j1 --verbose` build,
+  `out/_agents/impl-4-pgo/build-warn.build.log`).
+- `-fprofile-instr-use` changes code placement only -- inlining decisions,
+  block layout, branch weights, register allocation hints; it adds no
+  fast-math, no reassociation, no flag the DSP's floating point could see.
+  The oracle is run on the result all the same (below).
+
+`tools/emu/ot_emu/pgo.sh` is the whole ritual in one command (`bash
+tools/emu/ot_emu/pgo.sh`, 2 min 19 s wall on this Mac): (1) the
+instrumented build into `out/emu-pgo-gen` (23 s); (2) two training runs on
+that binary with `LLVM_PROFILE_FILE=out/emu-pgo/raw/<tag>-%p.profraw` --
+the `bench.py` sequence (boot on `out/_agents/port/otlive.img` with the
+OTLIVE project, `frame on`, PLAY, 16 x `run 250`, `quit`), once without
+the cores (ready 12.9 s + 4.7 s of play, instrumented) and once with
+`--dsp` plus `audio start main` / `audio read` after every run so the pipe
+path is in the profile too (38.6 s + 37.7 s); (3) `llvm-profdata merge`
+(found via `xcrun -f llvm-profdata`, overridable with `LLVM_PROFDATA=`)
+into `out/emu-pgo/ot_emu.profdata` -- 2 x 944,272 B raw, 1,443,552 B
+merged, 9,819 functions, 26,091 blocks, 3.28 x 10^11 counts; (4) the
+optimised build into `out/emu` with `-DOT_PGO_PROFILE=` (18 s), which is
+the operator's binary: the panel server picks it up unchanged. Options:
+`--dest` / `--gen` / `--prof` / `--card` / `--image`, `--no-dsp` (skip the
+long training run), `--skip-train` (rebuild with the profile on disk),
+`--clean-gen` (the instrumented tree is kept by default so a different
+training sequence needs no rebuild), `-j N`. It refuses to finish with an
+instrumented binary in `--dest` (`otool -l` for `__llvm_prf_*`) or one of
+the wrong architecture, and it refuses to finish with an object in
+`--dest` older than the profile (the re-run finding below).
+
+**The profile is build-host specific and goes stale.** It belongs to this
+compiler (AppleClang 21.0.0), these flags and the source bytes it was
+collected on; clang matches it function by function by name and CFG hash.
+After ANY change under `tools/emu/ot_emu` or `vendor/{mc68k,dsp56300}`
+run `pgo.sh` again (re-running it into a tree that already holds a PGO
+build is the normal case and is safe -- since fix1 below; the first
+version of the script failed exactly there) -- a function whose hash
+moved simply gets no weights, so a stale profile loses speed and nothing
+else. That claim was measured,
+not assumed: `out/_agents/impl-4-pgo/build-stale` is this tree built with
+the speed-mem investigation's profile from the PRE-BURST source (its
+`src-fast` copy of `1e76ac5` + the page-table patch, collected on a
+different binary hours earlier: `speed-mem/pgo/fastlto-both.profdata`).
+Clang reported 25 out-of-date files (the 22 above plus `machine.cpp`,
+4 of 82 functions mismatched, `rtos.cpp`, 1 of 128, and `main.cpp`, 1 of
+132 -- the page table, the burst loop and the interactive loop are what
+changed since; `periph`, `v4e`, `dsp`, `card` still match); the binary is
+2,333,704 bytes; **oracle 28
+PASS, 0 FAIL** (`reports/20260912-090429-impl4-stale.txt`, ctest 7 / 7);
+bench 1500 / 161 -- still +17 % / +7 % over LTO because Musashi's handlers
+and the DSP interpreter did not change, 9 % / 6 % short of the fresh
+profile. Nothing is committed: the profile lives under `out/` with the
+binaries, and a default configure (no option) reproduces the O15c binary
+byte for byte (sha `e298c877…`, 2,522,328 bytes, `build-lto`).
+
+### Measured (12 Sep 2026, the same M5 Mac, macOS 26.5, AppleClang 21.0.0; logs under `out/_agents/impl-4-pgo/`)
+
+`bench.py`, all binaries in one session, interleaved, one after the other,
+nothing else running (`bench_series.sh` -> `bench_series.txt`,
+`impl4_*.log`). Reference = `out/emu/ot_emu.ref-1e76ac5`; LTO = the
+default configure of this tree (= O15c, `build-lto`); **PGO** =
+`out/emu/ot_emu` as the first `pgo.sh` left it (sha `2d75bde6…`,
+2,351,544 bytes, -6.8 % vs LTO; the binary in `out/emu` now is the one
+fix1's re-run left, sha `1634501f…`, same size, same speed -- its own
+series is below). The `ready sample=277688.167` stamp is identical in all
+fourteen runs.
+
+| measurement | reference | LTO (O15c) | **PGO + LTO** | stale profile |
+|---|---|---|---|---|
+| play, no `--dsp` (emulated ms per wall s) | 220 | 1336, 1239 | **1665, 1619** | 1500 |
+| play, `--dsp` | 100 | 151, 151 | **171, 171** | 161 |
+| boot + fixture load to `ready`, no `--dsp` | 39.0 s | 7.9, 7.4 s | **6.6, 6.8 s** | 6.9 s |
+| boot + fixture load to `ready`, `--dsp` | 57.8 s | 24.9, 25.0 s | **18.4, 18.5 s** | 19.7 s |
+| `ot_emu` size (bytes) | 2,788,712 | 2,522,328 | **2,351,544** | 2,333,704 |
+
+Ratios: PGO over LTO **1.28x** without `--dsp` (1642 / 1287.5; the plan
+asked for >= 1.10x and a landing >= 1000) and **1.13x** with (171 / 151);
+over the reference **7.5x** (1642 / 220) and **1.71x** (171 / 100).
+Playback without the cores is **1.64x real time** (a 16th at 120 BPM in
+0.075-0.077 s wall; O15c: 0.097 s); with the cores 0.17x, exactly the
+plan's "~0.17-0.20x" landing for the exact single-thread design (O12: the
+cores' interleave cannot change, and their interpreters are what the
+profile speeds up here -- the ColdFire half is now < 0.7 s of the 5.85 wall
+s an emulated second costs with `--dsp`). Ready with `--dsp` is 1.35x
+faster (25.0 -> 18.45 s: the DSP boot and the sample load are core-bound),
+without 1.14x. The instrumented binary itself (5,926,040 bytes) runs at
+848 / 106 -- 0.66x / 0.70x of LTO -- which is why it lives in
+`out/emu-pgo-gen` and never in `out/emu`.
+
+Profile-to-profile variance: a second, independent training run (below,
+the Rosetta accident) produced a profile of 9,840 functions and a
+different binary (2,360,440 bytes, sha `724c5763…`) that benches 1652 /
+176 -- the same speed within noise. The same profile always gives the
+same bytes: three trees (`-j1` verbose, `-j8`, `OT_PGO_WARNINGS` on and
+off) were byte-identical, and a fresh configure from the final profile
+(`build-pgo3`) reproduces `out/emu/ot_emu` byte for byte.
+
+**The gate: 28 PASS, 0 FAIL** on the PGO binary (`out/_agents/speed-
+oracle/reports/20260912-091014-impl4-pgo-arm64.txt`, copy in
+`out/_agents/impl-4-pgo/oracle_pgo_arm64.txt`; 49 s wall): boot logs
+identical, `serial_a` 5731 / 9257 bytes identical, goldens 12,757 /
+26,367 bytes identical, `run3_core0.wav` 7,936,292 bytes identical, the
+UART A stream 18,297 / 18,309 bytes identical step by step, 109 peeks
+identical, 47 run stamps with max |dsample| = 0 and |dframes| = 0,
+`interdsp.pcm` 497,788 bytes identical, ctest 7 / 7 in `out/emu`. Under
+the battery (with a build running alongside) the candidate's jobs took:
+`card` 8.25 s (O15c: 8.87 s; reference 44.2 s), `render` 31.7 s (36.9),
+`inter` boot 8.2 s + 3.0 s of `run` (8.6 + 3.2), `interdsp` 23.6 s +
+24.5 s (26.5 + 27.7). The plain binary: 28 PASS (`…-090416-impl4-plain.
+txt`; its bytes are O15c's verified binary, so the oracle served the
+candidate side from its cache and re-ran ctest, 7 / 7 in `build-lto`).
+The stale-profile binary: 28 PASS, as above.
+
+**The Rosetta accident, kept as a finding.** The first run of `pgo.sh`
+was started as `bash tools/emu/ot_emu/pgo.sh` from a shell whose PATH has
+the Intel Homebrew's `/usr/local/bin` ahead of `/bin`: that `bash` is an
+x86_64 binary, runs under Rosetta, and every child (cmake, clang) inherits
+the translation, so clang targeted x86_64 by default and the whole ritual
+-- instrumented build, training, optimised build -- produced an **x86_64
+`ot_emu`** (`-arch x86_64` in `flags.make`, 2,426,472 bytes). It passed the
+oracle, 28 / 28 (`…-090149-impl4-pgo.txt`: the render WAV and the pipe PCM
+byte-identical across two instruction sets -- the port's arithmetic does
+not depend on the host ISA), but it is not the operator's binary. `pgo.sh`
+now re-executes itself under `arch -arm64 /bin/bash` when
+`sysctl.proc_translated` says it is translated, and checks `lipo -archs`
+of both builds against `uname -m`. The re-run through the same
+`bash pgo.sh` invocation is the binary measured above. (CONTEXT.md's
+"keep /opt/homebrew first in PATH" is this in another form.)
+
+### Re-running `pgo.sh` failed: the tree kept the old profile's objects (fix1, 12 Sep 2026)
+
+The verifier ran `bash tools/emu/ot_emu/pgo.sh` twice from a clean
+state. The first run built `out/emu/ot_emu` (2 min 17 s); the second
+(same command, nothing changed) died at 1 min 51 s in step 4's link, for
+`ot_emu` and every test binary: `ld: LTO codegen error: linking module
+flags 'ProfileSummary': IDs have conflicting values ... from
+out/emu/mc68k/lib68kEmu.a[2](gpt.cpp.o), and ... from ld-temp.o` -- and
+left `out/emu` WITHOUT `ot_emu`, the operator's binary destroyed by the
+script meant to make it (`out/_agents/impl-4-pgo-verify0/pgo_run2.log`).
+
+The cause is in the build system, not in clang: `cmake --fresh` clears
+the top-level `CMakeCache.txt` and `CMakeFiles/`, nothing else. The
+vendored subtrees' objects (`out/emu/mc68k`, `out/emu/dsp56300`: 156 of
+the 171 `.o` files) had been compiled against the first profile, and
+make saw no reason to recompile them: their sources had not changed and
+their `flags.make` was byte-identical -- the same
+`-fprofile-instr-use=<same path>`, whatever the bytes at that path. Only
+`ot_machine` and `main.cpp` (whose `CMakeFiles/` `--fresh` had removed)
+were recompiled against the second profile, and two profiles cannot be
+LTO-linked into one module: every object carries its profile's summary as
+a module flag and the linker refuses to merge two different ones. Any
+second run into a tree holding a PGO build hit this -- i.e. the documented
+rule "run `pgo.sh` after every source change" described the failing path.
+
+The fix (`CMakeLists.txt`, the `OT_PGO_PROFILE` branch) makes the tree
+follow the profile's BYTES rather than its path:
+
+- `file(SHA256 …)` of the profile goes into every compile line as
+  `-DOT_PGO_PROFILE_SHA256=<hex>` (`add_compile_definitions` before the
+  `add_subdirectory` calls, so the cores get it too). Nothing reads the
+  macro; its only job is to change every `flags.make` when the profile
+  changes, which recompiles every object -- the same mechanism that makes
+  a `-D` change rebuild a tree. `pgo.sh` still does not `rm -rf out/emu`
+  (the frozen reference lives there) and still uses `--fresh` for the
+  cache; the recompile is now the CMakeLists' guarantee, not the script's.
+- `CMAKE_CONFIGURE_DEPENDS` on the profile file: a plain `cmake --build`
+  after the profile changed re-runs the configure step by itself, so the
+  hash is recomputed without anyone remembering to reconfigure.
+- `pgo.sh` step 4 checks its own work afterwards: `find "$DEST" -name
+  '*.o' ! -newer "$PROFDATA"` must be empty (it was 156 in the failing
+  run), else exit 1 with the count.
+
+Measured (logs `out/_agents/impl-4-pgo-fix1/pgo_run{1,2,3}.log`,
+`ritual.log`, `checks.log`), started from the state the verifier left --
+`out/emu` holding a PGO build from ANOTHER profile, compiled by the
+pre-fix CMakeLists, the failing precondition:
+
+- run 1: exit 0, 2 min 9 s (instrumented build 12 s, objects reused;
+  training 97 s; optimised build 20 s, 167 compile lines) -> `out/emu/ot_emu` sha
+  `dbe419dd…`, 171 of 171 objects newer than the profile;
+- run 2 (same command, nothing changed -- the verifier's failing case):
+  exit 0, 2 min 7 s, 167 compile lines in step 4 = every object
+  recompiled, link fine -> sha `1634501f…`, 2,351,544 bytes, 171 / 171;
+- run 3, `--skip-train` (same profile): exit 0, 8 s, only the 11
+  top-level objects recompiled (`--fresh` clears their `CMakeFiles/`; the
+  cores' 156 are kept), the binary byte-identical to run 2's -- the same profile still gives the
+  same bytes in the same tree, and (`build-pgo2`) in a fresh tree;
+- the `CMAKE_CONFIGURE_DEPENDS` path (`build-swap`): configure + build
+  with run 1's profile (-> `dbe419dd…`, the run 1 bytes), overwrite the
+  profile FILE with run 2's bytes, plain `cmake --build` with no
+  reconfigure: cmake re-ran itself once, recompiled 167 files, linked ->
+  `1634501f…`, the run 2 bytes. The old CMakeLists would have linked
+  nothing here;
+- the define does not reach the bytes: the stale-profile build
+  (`build-stale`, speed-mem's pre-burst profile) is byte-identical to the
+  one measured above (sha `5672b791…`, 25 out-of-date warnings), and the
+  default configure (`build-plain`, no `-fprofile` anywhere) is still
+  O15c's `e298c877…`.
+
+**The gate on the binary left in `out/emu` (run 2's): 28 PASS, 0 FAIL**
+(`reports/20260912-095805-fix1-outemu.txt`, 45 s, `--build-dir out/emu`,
+ctest 7 / 7); the plain and stale binaries 28 PASS each (their bytes were
+already verified, so the oracle served them from its cache and re-ran
+ctest: `…-095851-fix1-plain.txt`, `…-095902-fix1-stale.txt`). `bench.py`
+on it, same session, interleaved, nothing else running (`checks.log`):
+
+| measurement | reference | LTO (`build-plain`) | **PGO, `out/emu` (fix1)** |
+|---|---|---|---|
+| play, no `--dsp` (emulated ms per wall s) | 222 | 1320, 1371 | **1652, 1655** |
+| play, `--dsp` | 100 | 150, 151 | **168, 172** |
+| boot + fixture load to `ready`, no `--dsp` | 38.5 s | 8.0, 7.2 s | **6.6, 6.6 s** |
+| boot + fixture load to `ready`, `--dsp` | 56.8 s | 25.0, 24.9 s | **19.2, 18.5 s** |
+
+PGO over LTO 1.23x without `--dsp` (1653.5 / 1345.5), 1.13x with (170 /
+150.5); over the reference 7.4x and 1.70x; 1.65x real time without the
+cores (a 16th at 120 BPM in 0.076 s wall), 0.17x with. `ready
+sample=277688.167` in all nine runs. The instrumented binary trained at
+843-844 / 105-106, as before.
+
+Verified independently (verify1, `out/_agents/impl-4-pgo-verify1/`): from
+a clean state (no instrumented tree, no profile, `out/emu` cleaned of its
+build products) `bash pgo.sh` exit 0 in 138 s -> sha `75df7057…`; the same
+command again exit 0 in 127 s, 167 compile lines in step 4 -> sha
+`ccff1e46…` (2,351,544 bytes, arm64, no `__llvm_prf`, 171 / 171 objects
+newer than the profile); `--skip-train` 8 s, byte-identical to that. A
+touched source rebuilds one object and the same bytes; the profile file
+swapped for run 1's under a plain `cmake --build` reconfigures once,
+recompiles 167 and gives run 1's bytes back, and restoring it gives run
+2's. Oracle 28 PASS / 0 FAIL on both profiles' binaries (`…-101606-
+verify1-outemu.txt`, `…-101852-verify1-run1.txt`, ctest 7 / 7 in
+`out/emu`), on the default build (`e298c877…`, no `-fprofile` in any
+`flags.make`) and on the stale-profile build (`5672b791…`). `bench.py`,
+one session, interleaved, nothing else running: reference 221 / 98, LTO
+1263, 1242 / 149, 151, PGO 1615, 1632 / 176, 175 -- PGO over LTO 1.30x /
+1.17x, over the reference 7.3x / 1.79x; ready 38.9 / 7.9, 7.7 / 7.1, 6.8 s
+without the cores, 57.1 / 25.7, 24.6 / 17.8, 18.4 s with.
+
+### What it does not do
+
+- Nothing changes without the option: a default configure is O15c's LTO
+  build, byte for byte. Neither the panel server's auto-build (`cmake
+  --fresh -B out/emu …` when the binary is missing) nor anyone's script
+  gets PGO unless `pgo.sh` is run; that is deliberate -- the profile is a
+  local, perishable artefact, and a build must never fail for want of it.
+- The training is `bench.py`'s sequence on the OTLIVE fixture: playback
+  with and without the cores, the boot and the fixture load. Knobs, SETUP
+  pages, the file browser, sample loading and `--audio-in` are not in the
+  profile; their code runs with static heuristics, as before, not slower.
+- The DSP JIT and asmjit are compiled with the profile flag but have no
+  data (never run); the vendored unit tests likewise.
+- The profile is not committed and not portable: a different compiler
+  version refuses or ignores it, a different source changes the hashes
+  (measured above: it costs speed, never bytes). `pgo.sh` after every
+  source change is the rule; the `-Wprofile-instr-out-of-date` lines in a
+  build are the reminder. Re-running it into `out/emu` recompiles the
+  whole tree (19 s), never less: the profile's hash is on every compile
+  line, and there is no partial rebuild against a new profile.
+- `cmake --fresh` is not a clean: it clears the cache, not the objects.
+  Nothing in the ritual deletes `out/emu` (the reference binary lives
+  beside the build); the recompile against a new profile rests on the
+  hash define, and step 4's object-age check is the tripwire if that
+  ever stops being enough.
+- The remaining `--dsp` distance to real time (0.17x) is the two
+  interpreters' own work under the exact interleave; the plan's step 5
+  (`m68k_execute(N)` with an instruction hook) is in reserve for the
+  ColdFire side, and nothing exact reaches the cores' ceiling (plan:
+  <= 0.4-0.55x).
