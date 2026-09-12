@@ -3135,3 +3135,171 @@ cols 104-108 of rows 59-61: col 108 = off/0, 107 = 32, 106 = 64, 105 = 100,
 pre-change screens byte for byte. RSS grows in bursts while the sequencer
 plays regardless of the audio ring (pre-existing; ~+34 MB per 2 s slice
 observed) -- a long playing session has not been measured.
+
+## Milestone O15a — event-horizon bursts: the run loop 4.2x faster, bit for bit ✅ (12 Sep 2026, branch `panel-ui`)
+
+The first step of the speed plan (`out/_agents/speed-plan/PLAN.md`, the
+architect's plan from the read-only investigation of the same day). Before
+it the port played at **215-220 emulated ms per wall s** without `--dsp` and
+**97** with (`out/_agents/speed/bench.py`: boot on `otlive.img`, PLAY with
+`frame on`, 16 x `run 250`); real time is 1000. Nothing the firmware does
+may change: the gate is `out/_agents/speed-oracle/oracle.sh` (28 checks
+against the frozen pre-speed binary `out/emu/ot_emu.ref-1e76ac5`: boot
+logs, serial bytes, goldens, the O14k render WAV, the `--interactive` UART
+stream, peeks and run stamps, the `--dsp` pipe PCM, ctest).
+
+### What changed (`rtos.cpp/.h`, `periph.h`, `machine.cpp/.h`; no CLI change)
+
+The old loop called `tickTimers()` and `deliver()` after EVERY instruction:
+two PIT advances, four DTIM advances, the frame edge, the eDMA's due list,
+the ATA latency, then the two INTCs' `top()` -- 26 `std::function` line
+probes -- to re-offer or withdraw an interrupt. Both are pure functions of
+the models' state and the sample clock, so between two instructions that
+change neither they are no-ops. Every way that state CAN change is now
+either flagged or timed, and `Rtos::runInternal` runs **bursts**:
+
+- `nextEvent()` = the earliest of: every armed PIT expiry (PIE or not --
+  PCSR reads back PIF), every armed DTIM reference match (`DmaTimer::
+  nextMatch`, new: ORRI or not -- DTER.REF reads back), `m_nextFrame` while
+  `m_frame || m_frameFromDsp` (otherwise `tickTimers()` never touches it and
+  the eDMA boundary it publishes is a constant), `m_ataIrqDue`, and
+  `Edma::nextDue` (new) -- the earliest booked completion, gated ones
+  included: a due-but-gated entry answers a sample already past, which
+  forces exact stepping until it clears, because the gate is the DSP's ring
+  and is re-asked after every instruction.
+- A burst is up to N = min(4096, floor((nextEvent - m_sample) * ips) - 2,
+  the run's end) instructions doing only stepOnce's own per-instruction work
+  (the PC ring when armed, the create record at `g_create`, the dispatch
+  record after the scheduler's `rte`, the first-handoff record, `m_sample +=
+  1/ips` -- the same add in the same order, so every stamp is bit-identical
+  -- and `Machine::stepFast()`); `tickTimers()` + `deliver()` once at its
+  end. The exact tail then steps instruction by instruction across the
+  event, so every timer fires on the same instruction as before.
+- A burst ends early on: any peripheral access (`Machine::peripheralRead/
+  Write` set `m_periphTouched` -- the models, the boot's override table, the
+  card window, the co-processor), an interrupt acknowledgement (the ack
+  hook sets `m_wake`: the core consumed the injected vector and `deliver()`
+  must re-offer or withdraw), the DSP's host-word hook (`m_wake`: a frame
+  edge the horizon cannot see), the PC landing on main's spin after at
+  least one instruction (the idle skip gets its look, as the old loop
+  checked before every instruction), and `runInternal` entry (`m_wake =
+  true`: keys pushed, memory poked, the frame switched between runs are
+  delivered after the run's first instruction, as before). An early end is
+  always exact -- it calls the pair where the old loop called it too.
+- **The list of everything that can change deliverable state** (beside
+  `Intc::addLine` in the constructor, as the plan asked; also the comment on
+  `Rtos::nextEvent`): a peripheral WRITE (INTC masks/forces/ICRs, PIT and
+  DTIM control and acks, eDMA kicks/CINT/CDNE, UART masks, the card's
+  command and data registers, the DSPI, the host port) -> touched; a
+  peripheral READ with a side effect (UART +0x0c pops the receive queue
+  and its line, the card's STATUS clears INTRQ and a DATA read re-arms it,
+  DSPI POPR, the host port) -> touched; the CPU acknowledging a vector ->
+  wake; the DSP's bank word -> wake; the outside world between runs -> wake
+  at entry; TIME (the six sources above) -> the horizon. The DSP cores'
+  state reaches the ColdFire only through the host port (a read), the
+  eDMA gate (a due entry) and the host-word hook; their per-instruction
+  tick is unchanged inside a burst, so the O12 interleave does not move.
+- **The mandatory fix the architect found in the prototype**: `Edma::
+  setBoundary(m_nextFrame)` and `setNow(m_sample)` are refreshed before
+  EVERY eDMA register access in BOTH `Rtos::peripheralRead` and
+  `peripheralWrite`. The prototype did it on reads only; a CSR.START kick
+  is a WRITE and `Edma::start` books its bus-paced completion from
+  `m_now`, so with `m_now` stale by up to a burst the DSP took its block
+  early and the `--dsp` pipe PCM drifted by +-1 LSB in 280 samples
+  (`interdsp.pcm` FAILED, 27/28). The refreshed value is the exact path's:
+  `tickTimers()` set it from `m_sample` after the previous instruction, and
+  `m_sample` has not moved since (the increment follows the instruction).
+- `Machine::stepFast()`: `step()` minus three costs -- the PC through
+  `m68k_get_reg` (now `pcFast()`: a pointer to the CPU state's `pc` field,
+  taken once at construction; measured at ~12 % of the burst loop's samples
+  when it was an out-of-line call into an out-of-line `getCpuState()` three
+  times per instruction), the opcode through the region walk (the SDRAM
+  region's bytes are read directly while the PC is inside it; `read16`
+  otherwise, so the alias window, a grown page and a PC in a peripheral
+  behave as before), and `Mc68k::exec()`'s legacy GPT/SIM/QSM pass
+  (`execInstruction()` runs the core alone). ⚠️ That last one is exact
+  only because the legacy models are unreachable on this machine: they are
+  addressed through `Mc68k::read*/write*`, which `Machine` overrides
+  wholesale and never forwards to, so TMSK1 stays 0, PITR is never written
+  and there is no SCI/QSPI traffic -- none of them can ever inject an
+  interrupt (documented in `machine.h`; `OT_STEPFAST=0` is the bisect knob
+  and the architect's bisect of the prototype cleared it). The instruction
+  count, PC watch, profile, A-line pre-decode into the V4e layer and the
+  co-processor's one tick per instruction are kept exactly.
+- **Kept exact per instruction**: `run(_ms, untilGate=true)` (the batch's
+  M6a gate), `runUntil` (the render's frame predicate, `runToPc`),
+  `callAsMain`, `runToMainSpin`, `loadProjectLive`'s mount wait -- plan
+  step 6 extends them. The bursts apply to `run(_ms, false)`: every
+  `--interactive` `run`, and the load's own 6 s run.
+- **Knobs and stats, stderr only, opt-in** (the batch stdout is diffed byte
+  for byte): `OT_BURST=<quantum>` (default 4096; `0` = the pre-O15a loop),
+  `OT_STEPFAST=0` (`Machine::step` inside bursts), `OT_BURST_STATS=1`
+  (one `burst stats:` line on stderr when the `Rtos` is destroyed:
+  bursts, instructions inside them, exact instructions, how bursts ended
+  -- periph / wake / horizon / spin -- idle skips, the instruction count,
+  the knobs). `Rtos::burstStats()` exposes the same counters. No command,
+  reply or log line changed.
+
+### Measured (12 Sep 2026, the M5 Mac of O14j, macOS 26.5; logs under `out/_agents/impl-1-bursts/`)
+
+Reference = `out/emu/ot_emu.ref-1e76ac5`, candidate = this tree, both run
+in the same session with no other emulator running (an unrelated 25-day-old
+Python process at 100 % of one core was present throughout, as it was for
+the baselines). `bench.py` unless said otherwise.
+
+| measurement | reference | candidate | ratio |
+|---|---|---|---|
+| play, no `--dsp` (emulated ms per wall s) | 217, 220, 215 | **904, 913** (920 with `bench_cmp.py`, no `sample` profiler) | **4.2x** |
+| play, `--dsp` | 97 | **132** (138 with `bench_cmp.py`) | **1.36-1.42x** |
+| boot + fixture load to `ready`, no `--dsp` | 39.2-39.3 s | **10.3-10.5 s** | 3.8x |
+| boot + fixture load to `ready`, `--dsp` | 58.2 s | **28.8-29.0 s** | 2.0x |
+| oracle `card` batch (`--ms 1000`, under the parallel battery) | 49.6 s | 12.0 s | 4.1x |
+| oracle `render` (O14k reference, 3000 frames `--dsp`) | 91.1 s | 41.7 s | 2.2x |
+| oracle `inter` boot / 4490 ms of `run` | 45.4 s / 21.1 s | 11.9 s / 4.6 s | 3.8x / 4.6x |
+| oracle `interdsp` boot / `run` | 68.4 s / 52.6 s | 30.8 s / 31.4 s | 2.2x / 1.7x |
+
+The first pass (before `pcFast` was inlined) measured 709-766 no-dsp and
+130-134 `--dsp`, ready at 12.2-12.7 s; the second pass is what ships. The
+`--dsp` figure is the plan's ceiling for this step: the cores are ~50 % of
+the wall and their interleave cannot change (O12).
+
+**The gate: 28 PASS, 0 FAIL, twice** (`out/_agents/speed-oracle/reports/
+20260912-070039-impl1-bursts.txt` for pass 1, `20260912-071233-impl1-bursts-b.txt`
+for pass 2): boot logs identical, `serial_a` 5731 / 9257 bytes identical,
+goldens 12,757 / 26,367 bytes identical, `run3_core0.wav` 7,936,292 bytes
+identical, the UART A stream 18,297 / 18,309 bytes identical step by step,
+109 peeks identical, 47 run stamps with max |dsample| = 0 and |dframes| =
+0, **`interdsp.pcm` 497,788 bytes identical**, ctest 7/7 with the tests
+built in the candidate tree (`out/_agents/impl-1-bursts/build`, `rtos`
+run from the repo root). `bench_cmp.py`'s fingerprint (every reply, the
+whole UART stream hashed, the peeks, a MIXER key pushed in the middle of
+play for the rxPush-then-wake path) is IDENTICAL to the pre-speed control's
+(`out/_agents/speed-cpu/fp_control_rtc.fp.json`, `fp_dsp_control_rtc.fp.json`),
+with and without `--dsp`.
+
+**What the bursts do** (`OT_BURST_STATS=1`, the whole `bench_cmp.py`
+session, boot + 4 s of play): without `--dsp`, 14,258,883 bursts covered
+1,084,851,615 of 1,146,675,308 instructions (94.6 %; the rest is the boot
+before the handoff and the load's borrowed calls), 11,500 went through the
+exact tails; bursts ended on a peripheral access 13,810,549 times (96.9 %),
+a wake 167,644, the horizon 227,059, main's spin 53,631; 53,665 idle
+skips. **The mean burst is 76 instructions**: the firmware polls its
+peripherals constantly (UART status, INTC IPR, DTIM3's timestamp, the host
+port), and every such read ends a burst. With `--dsp`: 14,171,369 bursts,
+1,051,929,979 instructions, and 32,933,949 exact instructions (2.9 %) --
+the gated eDMA completions holding the exact path while the DSP drains.
+The counts are identical between the two passes (the loop restructure
+changed no decision).
+
+### What it does not do
+
+- A side-effect-free peripheral read (a status poll, an IPR read, a DTCN
+  timestamp) still ends the burst; letting those through needs a
+  per-register classification and is not in the plan.
+- The gated, predicate and borrowed-call runs are still exact per
+  instruction (plan step 6); memory access still walks the region list
+  (step 3); no LTO/PGO (steps 2, 4).
+- Nothing paces playback to wall time (plan step 7); at 0.9x real time the
+  panel's idle pump and `run`s simply finish sooner.
+- Route A is not the oracle here; the 28 checks are port-vs-port against
+  the frozen binary, as the speed-oracle README says.

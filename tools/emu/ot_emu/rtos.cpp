@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 
 namespace ot
@@ -75,6 +76,44 @@ namespace ot
 			m_intc0.addLine(32 + n, [this, n] { return m_dtim[n].irq(); });
 	}
 
+	// O15a: the burst knobs, read once. Diagnosis only -- the shipped default
+	// is bursts of 4096 through stepFast; OT_BURST=0 is the pre-O15a loop.
+	int Rtos::burstQuantum()
+	{
+		static const int q = []
+		{
+			const char* const e = std::getenv("OT_BURST");
+			return e ? std::atoi(e) : 4096;
+		}();
+		return q;
+	}
+
+	bool Rtos::burstStepFast()
+	{
+		static const bool f = []
+		{
+			const char* const e = std::getenv("OT_STEPFAST");
+			return !e || std::atoi(e) != 0;
+		}();
+		return f;
+	}
+
+	Rtos::~Rtos()
+	{
+		// stderr only, opt-in: stdout is diffed byte for byte by the oracles.
+		if(const char* const e = std::getenv("OT_BURST_STATS"); e && std::atoi(e) != 0)
+		{
+			const auto& s = m_burstStats;
+			std::fprintf(stderr, "burst stats: bursts=%llu burstInstr=%llu exactInstr=%llu "
+				"endPeriph=%llu endWake=%llu endHorizon=%llu endSpin=%llu idleSkips=%llu instructions=%llu quantum=%d stepfast=%d\n",
+				static_cast<unsigned long long>(s.bursts), static_cast<unsigned long long>(s.burstInstr),
+				static_cast<unsigned long long>(s.exactInstr), static_cast<unsigned long long>(s.endPeriph),
+				static_cast<unsigned long long>(s.endWake), static_cast<unsigned long long>(s.endHorizon),
+				static_cast<unsigned long long>(s.endSpin), static_cast<unsigned long long>(m_idleSkips),
+				static_cast<unsigned long long>(m_machine.instructions()), burstQuantum(), burstStepFast() ? 1 : 0);
+		}
+	}
+
 	uint32_t Rtos::curTcb()
 	{
 		return m_machine.peek32(g_curTcb);
@@ -92,7 +131,20 @@ namespace ot
 			return true;
 		}
 		if(_addr >= g_dspi && _addr < g_dspi + 0x100)   { _out = m_dspi.read(_addr - g_dspi, _size); return true; }
-		if(_addr >= Edma::g_base && _addr < Edma::g_tcd + 16 * 32) { _out = m_edma.read(_addr, _size); return true; }
+		if(_addr >= Edma::g_base && _addr < Edma::g_tcd + 16 * 32)
+		{
+			// O15a: inside a burst tickTimers() has not run since the burst
+			// began, so the eDMA's `now` and boundary are refreshed HERE, on
+			// every access, read or write. The value is the one the exact path
+			// had: tickTimers() set them from m_sample after the previous
+			// instruction, and m_sample has not moved since (the increment
+			// follows the instruction). A read needs neither; it is done on
+			// both so the rule has no exception to forget.
+			m_edma.setBoundary(m_nextFrame);
+			m_edma.setNow(m_sample);
+			_out = m_edma.read(_addr, _size);
+			return true;
+		}
 		if(m_card && _addr >= AtaCard::g_base && _addr < AtaCard::g_base + AtaCard::g_window)
 		{
 			const auto off = _addr - AtaCard::g_base;
@@ -131,7 +183,19 @@ namespace ot
 		else if(_addr >= g_dtim && _addr < g_dtim + 4 * 0x4000 && ((_addr - g_dtim) & 0x3fff) < 0x10)
 			m_dtim[(_addr - g_dtim) >> 14].write((_addr - g_dtim) & 0xf, _size, _val, m_sample);
 		else if(_addr >= g_dspi && _addr < g_dspi + 0x100) m_dspi.write(_addr - g_dspi, _size, _val, _replay);
-		else if(_addr >= Edma::g_base && _addr < Edma::g_tcd + 16 * 32) m_edma.write(_addr, _size, _val, _replay);
+		else if(_addr >= Edma::g_base && _addr < Edma::g_tcd + 16 * 32)
+		{
+			// ⚠️ THE WRITE SIDE IS THE ONE THAT MATTERS, and the prototype
+			// refreshed only the read side (12 Sep 2026, the architect's
+			// bisect): a CSR.START kick books a bus-paced completion from
+			// `m_now` (Edma::start), and with `m_now` stale by up to a burst the
+			// completion came early, the DSP took its block early, and the
+			// `--dsp` pipe PCM drifted by +-1 LSB in 280 samples. Same rule as
+			// the read above; see there for why the value is the exact one.
+			m_edma.setBoundary(m_nextFrame);
+			m_edma.setNow(m_sample);
+			m_edma.write(_addr, _size, _val, _replay);
+		}
 		else if(m_card && _addr >= AtaCard::g_base && _addr < AtaCard::g_base + AtaCard::g_window)
 		{
 			const auto off = _addr - AtaCard::g_base;
@@ -237,6 +301,7 @@ namespace ot
 		// base 64 + source 1), which is where route A clears it.
 		m_machine.setAckHook([this](const uint8_t _vec, const uint8_t _level)
 		{
+			m_wake = true;		// O15a: the core consumed the injected vector; deliver() must re-offer or withdraw
 			if(_vec == m_intc0.vectorBase() + 1)
 			{
 				m_framePending = false;
@@ -432,6 +497,55 @@ namespace ot
 		}
 	}
 
+	// O15a: THE HORIZON. The earliest sample at which tickTimers()/deliver()
+	// could do anything that a peripheral access (m_periphTouched), an
+	// acknowledgement or the DSP's host-word hook (m_wake) would not already
+	// have ended the burst for. Everything that can change deliverable state
+	// -- the list beside Intc::addLine in the constructor, plus the
+	// registers the firmware reads back -- is one of:
+	//   * a peripheral WRITE (INTC masks/forces/ICRs, PIT/DTIM control and
+	//     acks, eDMA kicks/CINT/CDNE, UART masks, the card's command and data
+	//     registers, the DSPI, the host port): m_periphTouched;
+	//   * a peripheral READ with a side effect (UART +0x0c pops the receive
+	//     queue and its line, the card's STATUS clears INTRQ and a DATA read
+	//     re-arms it, DSPI POPR, the host port): m_periphTouched;
+	//   * the CPU acknowledging a vector (the injected interrupt is consumed;
+	//     the ack hook counts frames/ATA and deliver() must re-offer or
+	//     withdraw): m_wake;
+	//   * the DSP raising its bank word (setFrameFromDsp's hook: the frame
+	//     edge and m_nextFrame): m_wake;
+	//   * the outside world between runs (rxPush from the panel, pokes,
+	//     setFrame, setNames): m_wake at runInternal entry;
+	//   * TIME: an armed PIT expiring (PIF; PIE or not -- PCSR reads back),
+	//     an armed DTIM reaching its reference (DTER.REF; ORRI or not), the
+	//     frame timer's edge and the latched DSP edge (both at m_nextFrame,
+	//     only while a frame source is on -- otherwise tickTimers() never
+	//     touches it and the boundary it publishes is a constant), the ATA
+	//     INTRQ latency, a booked eDMA completion (a gated one answers a
+	//     sample already past: exact stepping until it clears, because the
+	//     gate is the DSP's ring, re-asked after every instruction): HERE.
+	// Nothing else writes the models. The DSP cores' own state reaches the
+	// ColdFire only through the host port (a read: touched), the eDMA gate
+	// (a due entry: here) and the host-word hook (wake); the co-processor's
+	// per-instruction tick is unchanged inside a burst, so its interleave
+	// with the ColdFire -- the O12 contract -- does not move.
+	double Rtos::nextEvent() const
+	{
+		double best = (m_frame || m_frameFromDsp) ? m_nextFrame : 1e300;
+		if(m_ataIrqDue != 0.0 && m_ataIrqDue < best)
+			best = m_ataIrqDue;
+		double e;
+		for(const auto* p : {&m_pit0, &m_pit1})
+			if(p->nextExpiry(e) && e < best)
+				best = e;
+		for(const auto& t : m_dtim)
+			if(t.nextMatch(e) && e < best)
+				best = e;
+		if(m_edma.nextDue(e) && e < best)
+			best = e;
+		return best;
+	}
+
 	bool Rtos::anyPending() const
 	{
 		uint32_t l, s;
@@ -559,6 +673,13 @@ namespace ot
 		}
 		const double end = m_sample + _ms * g_sampleHz / 1000.0;
 		uint64_t idleRuns = 0;
+		// O15a: bursts only on the plain run. The gate and a caller's predicate
+		// are evaluated before every instruction and stay that way (plan step
+		// 6 extends them); the pre-O15a loop is OT_BURST=0.
+		const int quantum = burstQuantum();
+		const bool bursts = quantum > 0 && !_untilGate && !_stop;
+		const bool fast = burstStepFast();
+		m_wake = true;
 
 		while(m_sample < end)
 		{
@@ -613,6 +734,92 @@ namespace ot
 				continue;
 			}
 			idleRuns = 0;
+
+			if(bursts)
+			{
+				// EVENT-HORIZON BURSTS (O15a, 12 Sep 2026). tickTimers() and
+				// deliver() are pure functions of the models' state and the
+				// sample clock, so between two instructions that change
+				// neither they are no-ops -- and every way the state CAN change
+				// is either flagged (m_periphTouched, m_wake) or timed
+				// (nextEvent). So run up to `quantum` instructions with only
+				// the per-instruction port work, stopping two instructions
+				// short of the earliest timed event (and of the run's end), and
+				// call the pair once. The exact tail then steps instruction by
+				// instruction across the event, so every timer fires on the
+				// same instruction as before and every stamp -- the same
+				// `m_sample += 1/ips` in the same order -- stays bit-identical.
+				// A burst that ends early is always exact (it only calls the
+				// pair where the old loop called it too); one that ran too
+				// long would not be, which is what the horizon prevents.
+				const double lim = std::min(nextEvent(), end);
+				double nd = (lim - m_sample) * m_ips - 2.0;
+				if(nd > static_cast<double>(quantum))
+					nd = static_cast<double>(quantum);
+				if(m_wake || nd < 2.0)
+				{
+					// The exact step: the run's first instruction (whatever
+					// changed between runs is delivered after it, as before),
+					// and the tail across an event. m_wake is cleared BEFORE
+					// the step so a wake raised inside it is never lost.
+					++m_burstStats.exactInstr;
+					m_wake = false;
+					if(!stepOnce())
+						return Stop::Illegal;
+					m_machine.takePeriphTouched();		// stepOnce handled that instruction in full
+					continue;
+				}
+				const int n = static_cast<int>(nd);
+				++m_burstStats.bursts;
+				// The ring's state can only change through the card's command
+				// register (a peripheral write: the burst ends there) or between
+				// runs, so it is asked once per burst.
+				const bool ring = m_pcRingArmed && !m_pcRing.empty();
+				int i = 0;
+				for(;;)
+				{
+					// stepOnce's per-instruction work, verbatim, minus the pair.
+					const uint32_t ipc = m_machine.pcFast();
+					// Main's park: the idle skip must get its look at it before
+					// the spin is executed (the old loop checked before every
+					// instruction) -- after at least one instruction, so a park
+					// with something pending but masked still makes progress.
+					if(i > 0 && ipc == g_mainSpin) { ++m_burstStats.endSpin; break; }
+					if(ring)
+					{
+						m_pcRing[m_pcRingPos % m_pcRing.size()] = ipc;
+						++m_pcRingPos;
+					}
+					if(ipc == g_create)
+						recordCreate();
+					const bool atSchedRte = ipc == g_schedRte;
+					if(!(fast ? m_machine.stepFast() : m_machine.step()))
+					{
+						m_why = m_machine.why();
+						return Stop::Illegal;
+					}
+					m_sample += 1.0 / m_ips;
+					if(atSchedRte)
+					{
+						const auto cur = curTcb();
+						m_dispatches.push_back({m_sample, cur, m_machine.pc()});
+						m_gateDirty = true;
+						if(m_firstSwitch.first && !m_firstSwitch.second)
+							m_firstSwitch.second = cur;
+					}
+					if(!m_firstSwitch.first && ipc == g_handoff)
+						m_firstSwitch.first = curTcb();
+					++i;		// once per instruction (the prototype counted twice)
+					if(m_machine.takePeriphTouched()) { ++m_burstStats.endPeriph; break; }
+					if(m_wake) { ++m_burstStats.endWake; break; }
+					if(i >= n) { ++m_burstStats.endHorizon; break; }
+				}
+				m_burstStats.burstInstr += static_cast<uint64_t>(i);
+				m_wake = false;		// before the pair: a wake raised inside them forces an exact step next
+				tickTimers();
+				deliver();
+				continue;
+			}
 
 			if(!stepOnce())
 				return Stop::Illegal;
@@ -899,6 +1106,7 @@ namespace ot
 			return;
 		co->setHostWordHook(_on ? std::function<bool(int)>([this](int)
 		{
+			m_wake = true;		// O15a: a frame edge the horizon could not see
 			if(!m_frame)
 			{
 				m_dspEdgeLatched = true;		// delivered the moment the frame clock comes on

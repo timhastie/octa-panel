@@ -131,6 +131,7 @@ namespace ot
 		// state is real either way; only the model's assertion is gated.
 		explicit Rtos(Machine& _m, double _ips = 3990.0, double _pitClockHz = 264e6,
 			bool _frame = false);
+		~Rtos();		// prints the burst counters on stderr when OT_BURST_STATS=1 (O15a)
 
 		// A DELIBERATE DEPARTURE FROM ROUTE A, for the negative control only.
 		// The gate compares the serial byte count, and a gate that has never
@@ -397,6 +398,20 @@ namespace ot
 		const std::vector<std::string>& ataTrace() const { return m_ataTrace; }
 
 		uint64_t idleSkips() const { return m_idleSkips; }
+		// O15a: the burst loop's own bookkeeping (a mechanism count like the
+		// idle skips, never firmware behaviour). `bursts` bursts ran
+		// `burstInstr` instructions between them; `exactInstr` went through
+		// stepOnce (the entry step, the horizon tails, the gated/untilGate
+		// runs); a burst ended on a peripheral access, a wake (ack, host word),
+		// the horizon, or the PC landing on main's spin.
+		struct BurstStats { uint64_t bursts = 0, burstInstr = 0, exactInstr = 0,
+			endPeriph = 0, endWake = 0, endHorizon = 0, endSpin = 0; };
+		const BurstStats& burstStats() const { return m_burstStats; }
+		// The knobs, read once from the environment: OT_BURST = the quantum
+		// (default 4096; 0 = every instruction exact, the pre-O15a loop),
+		// OT_STEPFAST=0 = Machine::step inside bursts (diagnosis only).
+		static int burstQuantum();
+		static bool burstStepFast();
 		uint64_t forces() const { return m_forces; }
 		uint32_t currentTcb() { return curTcb(); }
 		void setAtaLatency(double _samples) { m_ataLatency = _samples; }
@@ -454,6 +469,7 @@ namespace ot
 		bool deliver();
 		bool anyPending() const;
 		bool nextExpiry(double& _out) const;
+		double nextEvent() const;
 		void recordCreate();
 
 		Machine& m_machine;
@@ -507,6 +523,12 @@ namespace ot
 		std::vector<Dispatch> m_dispatches;
 		std::pair<uint32_t, uint32_t> m_firstSwitch{0, 0};
 		uint64_t m_idleSkips = 0, m_forces = 0;
+		BurstStats m_burstStats;
+		// Something the burst loop cannot see from the horizon happened: an
+		// interrupt was acknowledged, the DSP raised its host word, or the run
+		// is being entered (keys pushed, memory poked, the frame switched in
+		// between). The next instruction goes through stepOnce.
+		bool m_wake = true;
 		// ⚠️ A LATCH, NOT A COUNT. While the source is masked -- through the
 		// boot, and through the handler's own self-mask for the whole DSP
 		// exchange -- a real edge source remembers ONE edge, not how many it

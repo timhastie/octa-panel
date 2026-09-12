@@ -126,6 +126,12 @@ namespace ot
 		// the run loop's idle skip may jump to. A timer without ORRI wakes
 		// nothing, so it is not offered.
 		bool nextExpiry(double& _out) const { _out = m_expiry; return m_armed && (m_dtmr & ORRI); }
+		// The next reference match of ANY kind, ORRI or not: the sample at
+		// which advance() sets DTER.REF, a register the firmware reads back
+		// (DTIM3's timestamp readers, DTIM0 without ORRI). Rtos::nextEvent's
+		// burst horizon needs every state change, not just the ones that
+		// interrupt; the idle skip above still wants only the wakers (O15a).
+		bool nextMatch(double& _out) const { _out = m_expiry; return m_armed; }
 
 		// ⚠️ A DELIBERATE DEPARTURE, for DTIM3 only (Rtos::Quirks::skipBootLogo):
 		// counts added to what DTCN READS, never to the reference match. The
@@ -335,6 +341,22 @@ namespace ot
 		bool irq(uint32_t _ch) const { return m_irq[_ch & 15]; }
 		uint64_t started() const { return m_started; }
 		size_t outstanding() const { return m_due.size(); }
+		// The earliest booked completion advance() would apply, gated ones
+		// included: a due-but-gated entry answers a sample already past, and
+		// that is deliberate -- the gate (the DSP's ring) is re-asked after
+		// every instruction, so the run loop must not burst across it
+		// (Rtos::nextEvent, O15a).
+		bool nextDue(double& _out) const
+		{
+			bool any = false;
+			for(const auto& d : m_due)
+				if(!any || d.second < _out)
+				{
+					_out = d.second;
+					any = true;
+				}
+			return any;
+		}
 
 		// The DSP's next frame boundary, and the sample clock itself;
 		// `Rtos::tickTimers` keeps both current.

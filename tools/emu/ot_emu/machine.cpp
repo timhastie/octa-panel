@@ -93,6 +93,8 @@ namespace ot
 		m68k_set_reg(getCpuState(), M68K_REG_SR, 0x2700);
 		m68k_set_reg(getCpuState(), M68K_REG_SP, g_resetSp);
 		setPC(g_imageBase);
+		static_assert(sizeof(getCpuState()->pc) == sizeof(uint32_t), "REG_PC is the 32-bit pc field");
+		m_pcField = &getCpuState()->pc;
 	}
 
 	void Machine::override32(const uint32_t _addr, const uint32_t _val)
@@ -129,6 +131,7 @@ namespace ot
 		m_lastAutoPage = ~0u;
 		m_lastAutoData = nullptr;
 		m_regions.push_back(std::move(reg));
+		m_imageData = nullptr;
 	}
 
 	// One byte of auto-mapped memory, allocating its page on first touch.
@@ -202,6 +205,7 @@ namespace ot
 
 	uint32_t Machine::peripheralRead(const uint32_t _addr, const uint8_t _size)
 	{
+		m_periphTouched = true;
 		if(m_coproc)
 		{
 			uint32_t v = 0;
@@ -253,6 +257,7 @@ namespace ot
 
 	void Machine::peripheralWrite(const uint32_t _addr, const uint8_t _size, const uint32_t _val)
 	{
+		m_periphTouched = true;
 		if(m_hostPortLogOn && _addr >= 0x20000000 && _addr < 0x20001000
 			&& m_hostPortLog.size() < 4000000)
 			m_hostPortLog.push_back({m_instructions, currentPc(), _addr, _val, _size});
@@ -300,6 +305,48 @@ namespace ot
 			setPC(p);
 		}
 		exec();
+		if(m_coproc)
+			m_coproc->tickInstructions(1);
+		return !m_illegal;
+	}
+
+	bool Machine::stepFast()
+	{
+		const uint32_t p = pcFast();
+		++m_instructions;
+		if(!m_watchPc.empty())
+			notePcWatch(p);
+		if(m_profileEvery && (m_instructions % m_profileEvery) == 0)
+			++m_profile[p];
+		if(!m_imageData)
+			if(auto* const r = find(g_imageBase, 2))
+			{
+				m_imageData = r->data.data();
+				m_imageBase = r->base;
+				m_imageSize = static_cast<uint32_t>(r->data.size());
+			}
+		// The opcode: the SDRAM region's own bytes while the PC is inside it
+		// (no alias fold is needed there -- the window starts at 0x48000000),
+		// the ordinary read16 anywhere else (the alias, a grown page, a
+		// peripheral: each behaves exactly as step() has it).
+		uint16_t op;
+		if(m_imageData && p - m_imageBase < m_imageSize - 1)
+			op = static_cast<uint16_t>((m_imageData[p - m_imageBase] << 8) | m_imageData[p - m_imageBase + 1]);
+		else
+			op = read16(p);
+		if((op & 0xf000) == 0xa000)
+		{
+			setPC(p + 2);
+			if(v4e::execute(*this, op) == v4e::Result::Handled)
+			{
+				++m_v4e;
+				if(m_coproc)
+					m_coproc->tickInstructions(1);
+				return true;
+			}
+			setPC(p);
+		}
+		execInstruction();
 		if(m_coproc)
 			m_coproc->tickInstructions(1);
 		return !m_illegal;

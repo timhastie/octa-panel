@@ -164,6 +164,34 @@ namespace ot
 		// `Rtos` drives once the boot has handed over; it returns false if an
 		// opcode was genuinely unknown (`why()` says which).
 		bool step();
+		// O15a (12 Sep 2026): `step()` for the burst loop. The same work in the
+		// same order -- the instruction count, the PC watch, the profile, the
+		// A-line pre-decode into the V4e layer, the co-processor's one tick --
+		// minus three things that cost more than the instruction: the PC read
+		// through `m68k_get_reg` (it is a field of the CPU state), the opcode
+		// fetch through the region walk (the SDRAM region's bytes are read
+		// directly while the PC is inside it; `read16` otherwise, so the
+		// alias window and a PC in a peripheral behave as before), and
+		// `Mc68k::exec()`'s legacy on-chip peripheral pass (`execInstruction`
+		// runs the core alone). ⚠️ THAT LAST ONE IS EXACT ONLY BECAUSE THE
+		// LEGACY MODELS ARE UNREACHABLE HERE: the vendored GPT/SIM/QSM are
+		// addressed through `Mc68k::read*/write*`, which this class overrides
+		// wholesale and never forwards to, so their registers hold their reset
+		// values for the life of the machine (TMSK1 = 0, PITR never written,
+		// no SCI/QSPI traffic) and none of them can ever inject an interrupt.
+		// `step()` is kept for the exact path, so a run mixes the two freely.
+		bool stepFast();
+		// REG_PC itself, through a pointer taken once at construction (the
+		// CPU state lives in a fixed buffer inside Mc68k). `pc()` goes through
+		// two out-of-line calls; measured 12 Sep 2026 at ~12 % of the burst
+		// loop's samples when called three times per instruction.
+		uint32_t pcFast() const { return *m_pcField; }
+		// Did any instruction since the last call touch a peripheral window
+		// (a model, the boot's override table, the card, the co-processor)?
+		// Set inside `peripheralRead`/`peripheralWrite`, i.e. by EVERY access
+		// that can change a model's state or an interrupt line; the burst
+		// loop ends its burst on it (Rtos::runInternal).
+		bool takePeriphTouched() { const bool t = m_periphTouched; m_periphTouched = false; return t; }
 
 		// The vector base register. The firmware sets it itself with a
 		// `movec %a0,%vbr` at 0x40000db6, so after a boot this reads
@@ -431,6 +459,12 @@ namespace ot
 		uint64_t m_autoMapLimit = 65536;		// 4 KB pages: 256 MB
 		std::vector<uint8_t> m_autoScrap;		// where a write goes once the limit is hit
 		std::function<void(Machine&, uint32_t)> m_step;
+		bool m_periphTouched = false;
+		const uint32_t* m_pcField = nullptr;
+		// stepFast's direct opcode fetch: the region holding the image, resolved
+		// on first use and dropped by mapRegion (the region list may move).
+		const uint8_t* m_imageData = nullptr;
+		uint32_t m_imageBase = 0, m_imageSize = 0;
 		AckHook m_ack;
 		uint64_t m_instructions = 0;
 		uint64_t m_v4e = 0;			// instructions the V4e layer supplied
