@@ -57,6 +57,22 @@ slot → ▶ (or YES) opens the file browser → ▲/▼ find the file → YES l
 it → NO leaves. README §"Loading samples" has the measured sequence and the
 endpoints (`/samples`, `/samples/add`, `/samples/upload`, `/samples/commit`,
 `/tap`).
+
+**Sound** (12 Sep 2026, commit 1e76ac5): the server starts the port child
+with `--dsp` by default (`--sound off` to skip the cores: faster, silent),
+drains the child's main L/R (`audio start main` / `audio read`, O14k) into
+a 180 s ring and, from PLAY to STOP, into a **take**
+`out/_panel_takes_<port>/take-NNN.wav`. In the page, **click the HEAD-PHONES
+jack** to listen (WebAudio; the VOLUME pot is the monitor's gain, the meter
+beside the jack shows level), the MONITOR drawer lists the takes (REPLAY at
+real time, SAVE) and has SOUND ON/OFF; in the app, Audio ▸ Save Main Out
+Recording… / Show Takes Folder / Sound. Endpoints `/audio/status`,
+`/audio/pcm?from&max`, `/audio.wav?take=N|?from&to`, `/audio/enable?on=`.
+Honest limit: with the cores the unit plays ~9× slower than real time
+(~110 emulated ms per wall s; ~350 without), so live listening is behind
+and in bursts; a take replays at real time. The OTLIVE fixture itself
+clips (slots 1/2 loop at GAIN 75/72); `out/_agents/audio/tree2` is the
+clean reference (third-0.wav ×0.70).
 Backends: `--backend auto|port|routea` (port = `out/emu/ot_emu --interactive`,
 built when missing with `cmake --fresh -B out/emu -S tools/emu/ot_emu &&
 cmake --build out/emu -j8`; routea = `tools/emu/emu_rtos.py`, 100× slower).
@@ -133,7 +149,8 @@ EMAC-fixed Unicorn (`scripts/build_unicorn.sh`), `vendor/dsp56300` pinned to
 - Upstream octabam main has moved (recfix, PR #97/#129, Workbench); this fork
   is a 10 Sep clone — merging upstream is pending.
 - Playback still ~3× slower than real time (port), ~9× with the DSP cores
-  (`--dsp`) rendering audio.
+  (`--dsp`, the default now) rendering audio. Cue out and core 1 are not
+  captured; the crossfader and audio inputs have no panel path.
 - `.ot` slice files are not seeded onto the card with their samples; the pool
   is wiped and re-seeded at every server start (files added through the
   page survive only while that server runs, or if they are also in an
