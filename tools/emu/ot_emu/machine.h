@@ -36,7 +36,9 @@
 #pragma once
 
 #include <array>
+#include <cassert>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <string>
 #include <unordered_map>
@@ -118,12 +120,48 @@ namespace ot
 		explicit Machine(const std::vector<uint8_t>& _image);
 
 		// -- the memory interface Musashi calls through ----------------------
-		uint8_t  read8 (uint32_t _addr) override;
-		uint16_t read16(uint32_t _addr) override;
-		void     write8 (uint32_t _addr, uint8_t  _val) override;
-		void     write16(uint32_t _addr, uint16_t _val) override;
-		uint16_t readImm16(uint32_t _addr) override;
-
+		// O15c (12 Sep 2026, plan step 3): THE PAGE-TABLE FAST PATH. Before
+		// it every access walked the region list (`find`: a peripheral test
+		// over three windows, the alias fold, then up to twelve `contains`
+		// checks) -- measured at 2.6 ns per opcode fetch and 15-31 ns per
+		// data access, 28 % of the burst loop (speed-mem). Now `m_pages` holds
+		// one host pointer per 4 KB page of the 4 GB address space (1 << 20
+		// entries, rebuilt by the constructor and by `mapRegion`), and an
+		// access whose page has one goes straight to the bytes. A page has
+		// an entry ONLY when the first Region in list order that touches it
+		// covers ALL of it -- so within the page `find` could answer nothing
+		// else -- and NEVER when it is a peripheral window (asserted), a page
+		// this machine grew on its own (every access to one is counted by
+		// `noteUnmapped`, and that count is in the boot log), or unmapped. The
+		// alias window 0x48000000-0x4fffffff carries its target's entries,
+		// folded exactly as `alias()` folds the address, so the two regions
+		// mapped inside it stay as unreachable as they were. Everything the
+		// table does not hold -- and an access that straddles a page, and a
+		// write while a write watch is armed -- takes the ORIGINAL body,
+		// renamed `*Slow`: the peripheral dispatch, the counters, the logs
+		// and the auto-map are byte for byte what they were, and a page that
+		// IS in the table answers the same bytes `find` would have. Measured
+		// on the bursts+LTO binary, see COLDFIRE_PORT.md O15c.
+		static constexpr uint32_t g_pageBits = 12;
+		static constexpr uint32_t g_pageMask = (1u << g_pageBits) - 1;
+		uint8_t read8(const uint32_t _a) override
+		{
+			if(const uint8_t* const p = m_pages[_a >> g_pageBits])
+				return p[_a & g_pageMask];
+			return read8Slow(_a);
+		}
+		uint16_t read16(const uint32_t _a) override
+		{
+			const uint8_t* const p = m_pages[_a >> g_pageBits];
+			if(__builtin_expect(p != nullptr && (_a & g_pageMask) <= g_pageMask - 1, 1))
+			{
+				uint16_t v;
+				std::memcpy(&v, p + (_a & g_pageMask), 2);
+				return __builtin_bswap16(v);
+			}
+			return read16Slow(_a);
+		}
+		uint16_t readImm16(const uint32_t _a) override { return read16(_a); }
 		// ⚠️ 32-BIT ACCESSES MUST ARRIVE WHOLE. Musashi's memoryOps compose a
 		// longword from two 16-bit halves unless the machine provides these,
 		// and a peripheral register is not two halves: the DSPI's status word
@@ -132,8 +170,62 @@ namespace ot
 		// match and main parked there forever -- no task was ever created
 		// (measured 7 Sep 2026, the second run of the O4 loop). The same class
 		// as the PLL truncation that stalled the boot in O1.
-		uint32_t read32(uint32_t _addr);
-		void     write32(uint32_t _addr, uint32_t _val);
+		uint32_t read32(const uint32_t _a)
+		{
+			const uint8_t* const p = m_pages[_a >> g_pageBits];
+			if(__builtin_expect(p != nullptr && (_a & g_pageMask) <= g_pageMask - 3, 1))
+			{
+				uint32_t v;
+				std::memcpy(&v, p + (_a & g_pageMask), 4);
+				return __builtin_bswap32(v);
+			}
+			return read32Slow(_a);
+		}
+		void write8(const uint32_t _a, const uint8_t _v) override
+		{
+			++m_writes;
+			if(uint8_t* const p = m_pages[_a >> g_pageBits]; p != nullptr && !m_writeSlow)
+			{
+				p[_a & g_pageMask] = _v;
+				return;
+			}
+			write8Slow(_a, _v);
+		}
+		void write16(const uint32_t _a, const uint16_t _v) override
+		{
+			++m_writes;
+			uint8_t* const p = m_pages[_a >> g_pageBits];
+			if(__builtin_expect(p != nullptr && !m_writeSlow && (_a & g_pageMask) <= g_pageMask - 1, 1))
+			{
+				const uint16_t s = __builtin_bswap16(_v);
+				std::memcpy(p + (_a & g_pageMask), &s, 2);
+				return;
+			}
+			write16Slow(_a, _v);
+		}
+		void write32(const uint32_t _a, const uint32_t _v)
+		{
+			++m_writes;
+			uint8_t* const p = m_pages[_a >> g_pageBits];
+			if(__builtin_expect(p != nullptr && !m_writeSlow && (_a & g_pageMask) <= g_pageMask - 3, 1))
+			{
+				const uint32_t s = __builtin_bswap32(_v);
+				std::memcpy(p + (_a & g_pageMask), &s, 4);
+				return;
+			}
+			write32Slow(_a, _v);
+		}
+		// The pre-O15c bodies, unchanged except that `++m_writes` moved into
+		// the inline wrappers above (their only callers).
+		uint8_t  read8Slow (uint32_t _addr);
+		uint16_t read16Slow(uint32_t _addr);
+		uint32_t read32Slow(uint32_t _addr);
+		void     write8Slow (uint32_t _addr, uint8_t  _val);
+		void     write16Slow(uint32_t _addr, uint16_t _val);
+		void     write32Slow(uint32_t _addr, uint32_t _val);
+		// How many 4 KB pages the fast path covers (the alias window's copies
+		// included). Diagnostics only: no log or reply prints it.
+		uint32_t fastPages() const { return m_fastPages; }
 
 		uint32_t getResetPC() override { return g_imageBase; }
 		uint32_t getResetSP() override { return g_resetSp; }
@@ -169,9 +261,11 @@ namespace ot
 		// A-line pre-decode into the V4e layer, the co-processor's one tick --
 		// minus three things that cost more than the instruction: the PC read
 		// through `m68k_get_reg` (it is a field of the CPU state), the opcode
-		// fetch through the region walk (the SDRAM region's bytes are read
-		// directly while the PC is inside it; `read16` otherwise, so the
-		// alias window and a PC in a peripheral behave as before), and
+		// fetch through the region walk (O15a read the SDRAM region's bytes
+		// directly while the PC was inside it; since O15c the inline `read16`
+		// is that direct read for every page in the table, and the slow body
+		// for the rest, so a PC in a grown page or a peripheral behaves as
+		// `step()` has it), and
 		// `Mc68k::exec()`'s legacy on-chip peripheral pass (`execInstruction`
 		// runs the core alone). ⚠️ THAT LAST ONE IS EXACT ONLY BECAUSE THE
 		// LEGACY MODELS ARE UNREACHABLE HERE: the vendored GPT/SIM/QSM are
@@ -424,6 +518,12 @@ namespace ot
 		void peripheralWrite(uint32_t _addr, uint8_t _size, uint32_t _val);
 
 		std::vector<Region> m_regions;
+		// O15c: one host pointer per 4 KB page, or null for "take the slow
+		// body" (see the memory interface above). 1 << 20 entries, 8 MB.
+		std::vector<uint8_t*> m_pages;
+		uint32_t m_fastPages = 0;
+		bool m_writeSlow = false;				// a write watch is armed: every write takes the slow body
+		void rebuildPageTable();
 		// BYTE-addressable, not word: Musashi composes a 32-bit peripheral read
 		// from two 16-bit reads, so a value stored whole and returned per
 		// access is truncated to the access width. That cost the first boot --
@@ -461,10 +561,6 @@ namespace ot
 		std::function<void(Machine&, uint32_t)> m_step;
 		bool m_periphTouched = false;
 		const uint32_t* m_pcField = nullptr;
-		// stepFast's direct opcode fetch: the region holding the image, resolved
-		// on first use and dropped by mapRegion (the region list may move).
-		const uint8_t* m_imageData = nullptr;
-		uint32_t m_imageBase = 0, m_imageSize = 0;
 		AckHook m_ack;
 		uint64_t m_instructions = 0;
 		uint64_t m_v4e = 0;			// instructions the V4e layer supplied

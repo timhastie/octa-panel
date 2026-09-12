@@ -3402,3 +3402,158 @@ session: no `--dsp` reference 218, no LTO 942 / 911, **LTO 1027 / 1010**
 99, no LTO 135 / 136, **LTO 147 / 148** (1.09x, 1.49x; ready 28.3-28.7 s ->
 26.4-26.5 s). ctest 7 / 7 in both trees; the vendored `dsp56kTestRunner`
 (EXCLUDE_FROM_ALL) also links under LTO.
+
+## Milestone O15c — the page-table memory fast path: +28 % on top of bursts + LTO, bit for bit ✅ (12 Sep 2026, branch `panel-ui`)
+
+Step 3 of the speed plan; `machine.h` / `machine.cpp` only, no CLI change.
+Every memory access the core makes -- the opcode fetch, the immediates,
+every operand read and write -- went through `Machine::read*`/`write*`,
+and each of those walked the region list: `isPeripheral` over three
+windows, the `alias()` fold, then `find` over up to twelve `Region::
+contains` checks (the boot map's six plus the six `Rtos::install` and
+`mapCardMemory` add). The speed-mem investigation clocked that at 2.6 ns
+per opcode fetch and 15-31 ns per data access on the pre-burst binary and
+found the memory callbacks at 28 % of the burst loop's samples; its
+prototype (`out/_agents/speed-mem/patch_fast.py`) measured 1.11x on the
+pre-burst code with the oracle at 28 PASS. This lands it.
+
+### What changed (`machine.h/.cpp`)
+
+- **`m_pages`**: one host pointer per 4 KB page of the 4 GB address
+  space (1 << 20 entries, 8 MB), rebuilt by the constructor after the
+  boot map is laid out and by every `mapRegion`. The inline `read8/16/32`,
+  `readImm16` and `write8/16/32` in the header index it with `addr >> 12`
+  and, when the entry is non-null, read or write the bytes in place
+  (`memcpy` + `bswap`, big-endian as the region bytes are). `stepFast`'s
+  O15a special case -- the SDRAM region's bytes read directly while the
+  PC was inside it -- is gone: the inline `read16` IS that direct read,
+  now for every page in the table.
+- **The rule for an entry, `find`'s page by page** (`rebuildPageTable`):
+  the FIRST region in list order that touches a page claims it, and the
+  page gets an entry only if that region covers all of it -- so no
+  non-straddling access inside the page could resolve to any other
+  region. A region that covers a page only partly claims it with NO
+  entry, and a later region cannot take it: `find` would have answered
+  the earlier one for the bytes both hold. (On this machine's map no two
+  regions overlap, so the rule reduces to "one region covers the page";
+  it is written the conservative way so a future `mapRegion` cannot make
+  the table disagree with `find`.)
+- **Never in the table**: a peripheral window (`isPeripheral` is checked
+  per page; `assert`ed, and the guard leaves the entry null in a Release
+  build regardless), a page this machine grew on its own (every access
+  to one goes through `noteUnmapped`, whose count is in the boot log and
+  in `test_rtos` -- so a grown page must keep taking the slow body), and
+  anything unmapped.
+- **The alias window** 0x48000000-0x4fffffff: the first pass skips the
+  two regions mapped inside it (the boot's 1 MB at 0x48000000 and the
+  card's 127 MB at 0x48100000 -- unreachable since 9 Sep 2026, because
+  `alias()` folds every access out of the window before `find` runs), the
+  second pass copies each alias page's entry from the page 0x08000000
+  below. A write through 0x4fxxxxxx lands in the 0x47xxxxxx bytes as
+  before; the O6 ring-clear and loader findings hold.
+- **Everything else takes the ORIGINAL body, renamed `*Slow`**: a null
+  entry (peripheral, grown, unmapped), an access that straddles a page
+  (`(a & 0xfff) > 0xffe` for 16-bit, `> 0xffc` for 32-bit -- `find`
+  answers those with the region-end and auto-map rules, so they are left
+  to it), and every write while a write watch is armed (`addWriteWatch`
+  sets `m_writeSlow`; watches are never removed). The Slow bodies are the
+  pre-O15c code line for line: `isPeripheral` -> `peripheralRead/Write`
+  (with `m_periphTouched`, the logs, the trace, the host-port log), the
+  fold, `find`, `noteUnmapped`, the auto-map with its limit and
+  `badWrite`. The only edit inside them is that `++m_writes` (the boot's
+  stall detector's store counter) moved into the inline wrappers, their
+  sole callers, so it counts every write as before.
+- `readImm16` is the inline `read16` (it was an out-of-line call to it).
+  `fastPages()` reports the table's population; nothing prints it.
+
+### Checked beyond the gate (`out/_agents/impl-3-memory/pagecheck.cpp`)
+
+A standalone program against the built `libot_machine.a`: the boot map,
+then `Rtos::install`'s two spans, then `mapCardMemory`'s four, checking
+the table's population against the map by hand (36,896 pages after the
+boot map = 20,512 region pages + 16,384 alias copies; 37,393 after
+install; **70,401** with the card: 37,633 + 32,768 -- the whole
+0x40000000-0x47ffffff span is then covered, so every alias page has an
+entry), then 2,000,000 random accesses over every region and through the
+alias, one in seven placed to straddle a page: `read8/16/32` equal to
+`read8/16/32Slow` at every one, writes through the inline path read back
+through the Slow body and vice versa, the PLL override whole through
+`read32` and `read16`, an unmapped address counted on every access and
+grown once (and not entering the table), a write watch hit through the
+inline wrappers including via the alias. **0 mismatches.**
+
+### Measured (12 Sep 2026, the same M5 Mac, macOS 26.5, AppleClang 21.0.0; logs under `out/_agents/impl-3-memory/`)
+
+`bench.py`, all three binaries in one session, interleaved, one after the
+other, no other emulator running (`bench_series.sh` -> `bench_series.txt`,
+`impl3_*.log`). Reference = `out/emu/ot_emu.ref-1e76ac5`; Step 2 = this
+tree at commit `3055b36` (bursts + LTO), built here as `build-pre` before
+the patch landed; Step 3 = `build`. The `ready sample=277688.167` stamp is
+identical in all ten runs.
+
+| measurement | reference | Step 2 (bursts + LTO) | **Step 3 (+ page table)** |
+|---|---|---|---|
+| play, no `--dsp` (emulated ms per wall s) | 221 | 1026, 984 | **1292, 1287** |
+| play, `--dsp` | 99 | 144, 148 | **150, 149** |
+| boot + fixture load to `ready`, no `--dsp` | 39.0 s | 9.8-9.9 s | **7.4 s** |
+| boot + fixture load to `ready`, `--dsp` | 57.5 s | 26.5-27.7 s | **25.1-25.7 s** |
+| `ot_emu` size (bytes) | 2,788,712 | 2,273,512 | 2,522,328 |
+
+Ratios: Step 3 over Step 2 **1.28x** without `--dsp` (1289.5 / 1005) --
+the plan asked for >= 1.12x and estimated 1.15-1.25x on the burst binary
+-- and **1.02x** with (149.5 / 146); over the reference **5.8x** (1289.5 /
+221) and **1.51x** (149.5 / 99). Playback without the cores is now
+**1.29x real time** (a 16th at 120 BPM in 0.097 s wall). The `--dsp` gain
+is exactly the ColdFire's share: at Step 2 an emulated second with the
+cores costs 6.85 wall s, of which the ColdFire side is ~1.0 s (the no-dsp
+figure) and the two DSP interpreters the rest; cutting the ColdFire side
+by 1.28x predicts 151 emulated ms per wall s, measured 149.5. The cores'
+interleave cannot change (O12), so the `--dsp` figure stays bounded by
+them, as O15a and O15b said. Ready is 1.33x faster (the boot and the
+6 s load are the same instructions, now with the cheaper fetch).
+
+**The gate: 28 PASS, 0 FAIL** (`out/_agents/speed-oracle/reports/
+20260912-082136-impl3-memory.txt`, copy in `out/_agents/impl-3-memory/
+oracle1-report.txt`; 55 s wall): boot logs identical, `serial_a` 5731 /
+9257 bytes identical, goldens 12,757 / 26,367 bytes identical,
+`run3_core0.wav` 7,936,292 bytes identical, the UART A stream 18,297 /
+18,309 bytes identical step by step, 109 peeks identical, 47 run stamps
+with max |dsample| = 0 and |dframes| = 0, `interdsp.pcm` 497,788 bytes
+identical, ctest 7 / 7 in the candidate tree (also 7 / 7 standalone,
+`ctest.txt`). Under the parallel battery the candidate's jobs took:
+`card` 8.9 s (Step 2: 10.6 s; reference 46.1 s), `render` 36.9 s (37.7),
+`inter` boot 8.6 s + 3.2 s of `run` (10.9 + 4.2), `interdsp` 26.5 s +
+27.7 s (28.0 + 28.2). The build carries only the vendored `-Wswitch`
+warnings; nothing from `machine.*`.
+
+Verified independently (`out/_agents/impl-3-memory-verify0/`): a fresh
+build of this tree (byte-identical binary, sha `e298c877…`) and of commit
+`3055b36` in the same session, `bench.py` interleaved with nothing else
+running: no `--dsp` reference 223, Step 2 1008 / 1004, **Step 3 1375 /
+1312** (1.34x); `--dsp` 99, 147 / 149, **151 / 151** (1.02x); ready
+7.2-7.4 s vs 9.6-10.0 s, the stamp identical in all ten runs. Oracle
+`--fresh` (both sides rerun) 28 PASS / 0 FAIL (`reports/20260912-084127-
+impl3-verify0.txt`); ctest 7 / 7; an adversarial program over the table
+(`adv.cpp`, 175 checks: every peripheral page null and every access to the
+three windows reaching `peripheralRead/Write`, the overrides, both alias
+ends, region-end and in-region straddles proven slow by swapping the page
+entry for a scratch buffer, grown pages counted per access and entering the
+table only through `mapRegion`, a later region overlapping an earlier one
+losing the shared pages, write watches through the wrappers and the alias)
+0 failures; the `watchmem` / `writes` / `watch` / `hits` / `poke` replies
+of a YES-PLAY-STOP script byte-identical to the reference's (312 lines).
+
+### What it does not do
+
+- A grown (auto-mapped) page is still a slow access, by design: its
+  per-access count is a finding, not overhead. With a card attached the
+  golden path makes 4 such accesses at three boot-time addresses (O7:
+  `0x04020000`, `0x100a0000`, `0xffff0000`), so nothing on the oracle's
+  path is left slow except the peripherals and those four.
+- A peripheral access is exactly as expensive as before, and still ends
+  the burst (O15a).
+- No PGO (step 4), no `m68k_execute(N)` hook (step 5); the gated and
+  predicate runs are still exact per instruction (step 6).
+- The table is rebuilt whole on every `mapRegion` (8 MB written, seven
+  times per boot: the constructor and the six `mapRegion`s); it costs
+  nothing measurable and keeps the rule in one place.

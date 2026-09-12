@@ -53,6 +53,7 @@ namespace ot
 		}
 		if(auto* const r = find(g_imageBase, static_cast<uint32_t>(_image.size())))
 			std::memcpy(r->data.data() + (g_imageBase - r->base), _image.data(), _image.size());
+		rebuildPageTable();
 
 		// The PLL gate: the firmware halts at 0x4000fa8c unless the top byte
 		// of 0xfc0c4000 times 12 MHz is 264 MHz, so the byte is 22 (0x16).
@@ -131,7 +132,56 @@ namespace ot
 		m_lastAutoPage = ~0u;
 		m_lastAutoData = nullptr;
 		m_regions.push_back(std::move(reg));
-		m_imageData = nullptr;
+		rebuildPageTable();
+	}
+
+	// O15c: the page table (machine.h, the memory interface). The rule is
+	// `find`'s, page by page: the FIRST region in list order that touches a
+	// page claims it, and the page gets an entry only if that region covers
+	// all of it -- then no access inside the page (a straddling one takes the
+	// slow body) can resolve to any other region. A region that only partly
+	// covers the page claims it with NO entry, so a later region that would
+	// cover it whole cannot take it either: `find` would have answered the
+	// earlier one for the bytes both hold. The alias window is skipped on the
+	// first pass (a region mapped there is unreachable: `alias()` folds every
+	// access out of it before `find` runs) and filled on the second from the
+	// folded pages. A peripheral window can never be a region page; the
+	// assert says so, and the guard keeps the entry null regardless.
+	void Machine::rebuildPageTable()
+	{
+		constexpr uint32_t pageCount = 1u << (32 - g_pageBits);
+		constexpr uint32_t aliasLo = 0x48000000u >> g_pageBits, aliasHi = 0x50000000u >> g_pageBits;
+		constexpr uint32_t aliasDelta = 0x08000000u >> g_pageBits;
+		m_pages.assign(pageCount, nullptr);
+		std::vector<uint8_t> claimed(pageCount, 0);
+		for(auto& r : m_regions)
+		{
+			if(r.data.empty())
+				continue;
+			const uint64_t end = uint64_t(r.base) + r.data.size();				// exclusive
+			for(uint64_t p = r.base >> g_pageBits; (p << g_pageBits) < end; ++p)
+			{
+				if(claimed[p])
+					continue;
+				claimed[p] = 1;
+				const uint64_t pa = p << g_pageBits;
+				if(pa < r.base || pa + (g_pageMask + 1) > end)
+					continue;										// partly covered: no entry
+				if(p >= aliasLo && p < aliasHi)
+					continue;										// unreachable through alias()
+				if(isPeripheral(static_cast<uint32_t>(pa)))
+				{
+					assert(!"a peripheral window inside a region");
+					continue;
+				}
+				m_pages[p] = r.data.data() + (pa - r.base);
+			}
+		}
+		for(uint32_t p = aliasLo; p < aliasHi; ++p)
+			m_pages[p] = m_pages[p - aliasDelta];
+		m_fastPages = 0;
+		for(const auto* const e : m_pages)
+			m_fastPages += e != nullptr;
 	}
 
 	// One byte of auto-mapped memory, allocating its page on first touch.
@@ -318,22 +368,12 @@ namespace ot
 			notePcWatch(p);
 		if(m_profileEvery && (m_instructions % m_profileEvery) == 0)
 			++m_profile[p];
-		if(!m_imageData)
-			if(auto* const r = find(g_imageBase, 2))
-			{
-				m_imageData = r->data.data();
-				m_imageBase = r->base;
-				m_imageSize = static_cast<uint32_t>(r->data.size());
-			}
-		// The opcode: the SDRAM region's own bytes while the PC is inside it
-		// (no alias fold is needed there -- the window starts at 0x48000000),
-		// the ordinary read16 anywhere else (the alias, a grown page, a
-		// peripheral: each behaves exactly as step() has it).
-		uint16_t op;
-		if(m_imageData && p - m_imageBase < m_imageSize - 1)
-			op = static_cast<uint16_t>((m_imageData[p - m_imageBase] << 8) | m_imageData[p - m_imageBase + 1]);
-		else
-			op = read16(p);
+		// The opcode: the inline read16 (O15c) -- the page's own bytes while
+		// the PC is inside a region page, the slow body anywhere else (the
+		// alias, a grown page, a peripheral: each behaves exactly as step()
+		// has it). O15a read the SDRAM region's bytes directly here; the
+		// table makes that the general case.
+		const uint16_t op = read16(p);
 		if((op & 0xf000) == 0xa000)
 		{
 			setPC(p + 2);
@@ -352,7 +392,7 @@ namespace ot
 		return !m_illegal;
 	}
 
-	uint8_t Machine::read8(const uint32_t _a0)
+	uint8_t Machine::read8Slow(const uint32_t _a0)
 	{
 		if(isPeripheral(_a0))
 			return static_cast<uint8_t>(peripheralRead(_a0, 1));
@@ -365,7 +405,7 @@ namespace ot
 		return 0xff;
 	}
 
-	uint16_t Machine::read16(const uint32_t _a0)
+	uint16_t Machine::read16Slow(const uint32_t _a0)
 	{
 		if(isPeripheral(_a0))
 			return static_cast<uint16_t>(peripheralRead(_a0, 2));
@@ -397,9 +437,8 @@ namespace ot
 		m_illegal = true;
 	}
 
-	void Machine::write8(const uint32_t _a0, const uint8_t _val)
+	void Machine::write8Slow(const uint32_t _a0, const uint8_t _val)
 	{
-		++m_writes;
 		if(!m_writeWatches.empty())
 			noteWatchedWrite(_a0, 1, _val);
 		if(isPeripheral(_a0))
@@ -425,9 +464,8 @@ namespace ot
 		}
 	}
 
-	void Machine::write16(const uint32_t _a0, const uint16_t _val)
+	void Machine::write16Slow(const uint32_t _a0, const uint16_t _val)
 	{
-		++m_writes;
 		if(!m_writeWatches.empty())
 			noteWatchedWrite(_a0, 2, _val);
 		if(isPeripheral(_a0))
@@ -450,12 +488,7 @@ namespace ot
 		}
 	}
 
-	uint16_t Machine::readImm16(const uint32_t _addr)
-	{
-		return read16(_addr);
-	}
-
-	uint32_t Machine::read32(const uint32_t _a0)
+	uint32_t Machine::read32Slow(const uint32_t _a0)
 	{
 		if(isPeripheral(_a0))
 			return peripheralRead(_a0, 4);
@@ -475,9 +508,8 @@ namespace ot
 		return 0xffffffff;
 	}
 
-	void Machine::write32(const uint32_t _a0, const uint32_t _val)
+	void Machine::write32Slow(const uint32_t _a0, const uint32_t _val)
 	{
-		++m_writes;
 		if(!m_writeWatches.empty())
 			noteWatchedWrite(_a0, 4, _val);
 		if(isPeripheral(_a0))
@@ -598,6 +630,9 @@ namespace ot
 	void Machine::addWriteWatch(const uint32_t _begin, const uint32_t _end, WriteWatch _cb)
 	{
 		m_writeWatches.push_back({_begin, _end, std::move(_cb)});
+		// O15c: from now on every write takes the slow body, where the watch
+		// is compared (watches are never removed, so this never goes back).
+		m_writeSlow = !m_writeWatches.empty();
 	}
 
 	void Machine::noteWatchedWrite(const uint32_t _a0, const uint8_t _size, const uint32_t _val)
