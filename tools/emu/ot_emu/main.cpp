@@ -11,10 +11,14 @@
 // vendored Musashi is ColdFire V2 and this firmware is V4e. That report is
 // the work list for the ISA half of the port, one opcode at a time.
 #include <cstdio>
+#include <chrono>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <cstdlib>
+#include <cstdint>
 #include <cstring>
+#include <cerrno>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -35,6 +39,412 @@ namespace
 		if(!f)
 			return {};
 		return std::vector<uint8_t>(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+	}
+
+	// -- --interactive: the machine as a server on stdin/stdout (11 Sep 2026)
+	//
+	// After the ordinary boot (and load, when asked) the process prints ONE
+	// line `ready sample=<double> frames=<u64>` and then serves commands, one
+	// per line, one reply line per command, flushed:
+	//
+	//   run <ms>          -> ok sample=<double> frames=<u64> stop=<word>
+	//   key <row> <mask>  -> ok            two bytes into UART A's receive queue
+	//   knob <row> <delta>-> ok            row, then delta & 0xff (signed detent delta)
+	//   tx                -> tx <hex>      UART A's transmit bytes since the last tx
+	//   peek <addr> <len> -> peek <hex>    len <= 4096; unmapped -> err
+	//   poke <addr> <hex> -> ok
+	//   frame on|off      -> ok            Rtos::setFrame
+	//   status            -> status sample= ms= frames= frame=on|off idle= wall=
+	//   quit              -> ok            then exit 0
+	//
+	// Instruments over the pipe (12 Sep 2026, the trig-LED investigation:
+	// KEYMAP.md "the trigs-fired note"), the batch's --watch-pc / --watch-mem
+	// with the report on demand instead of at exit:
+	//
+	//   watch <addr>[,<addr>...] -> ok   Machine::watchPc (replaces the list; `watch off` clears it)
+	//   hits              -> hits n=<count> <rec> ... one record per PC hit since the last `hits`:
+	//                        <instr>:<pc>:<d0>:<d1>:<a0>:<a1>:<sp>:<stack0>:<stack1>:<stack2>:<stack3>:<stack4>:<d2>..<d7>:<a2>..<a6>
+	//                        (hex, no 0x; stack0 is the return address at a routine's entry, stack1.. its arguments)
+	//   watchmem <addr> <len> -> ok      Rtos::watchMem (adds a range; nothing removes one)
+	//   writes            -> writes n=<count> <rec> ... one per watched write since the last `writes`:
+	//                        <sample>:<pc>:<addr>:<val>:<size>:<tcb>
+	//
+	// The hit log is the machine's (capped at 2M records, as the batch); a
+	// watched PC costs one compare per instruction, `watch off` when done.
+	//
+	// `err <message>` for anything else -- an empty line, an unknown word,
+	// the wrong number of arguments (`tx`, `status` and `quit` take none) --
+	// and the loop keeps serving. Integer arguments are decimal or 0x..
+	// (`08` is eight: no octal; `key 0x26 08` was `err usage` under strtoull
+	// base 0 and `010` meant 8 -- fixed 11 Sep 2026); `run`'s ms is any
+	// non-negative decimal (`50`, `50.0`, `1e+03` as the panel's `:g`
+	// prints it); hex payloads are lowercase, no spaces. `run` is
+	// the only command that costs emulated time; nothing else touches the
+	// run loop, so a client is never left waiting between commands. `wall`
+	// in `status` is the wall-clock seconds spent INSIDE `run` since ready
+	// (pipe latency and the client's own time excluded), which is the
+	// number a speed measurement wants. `stop` is the Rtos::Stop word --
+	// `time` is the ordinary case; `fault`/`illegal` mean the machine is
+	// stopped and every later `run` will say so again.
+	//
+	// This is the panel's protocol (tools/panel/panel_server.py drives route
+	// A the same way: `uart64.rx.extend([row, mask])`, `run(ms=50)`), so the
+	// server can drive this port instead of the Python emulator without a
+	// change of contract. The batch behaviour above and below is untouched:
+	// the loop starts where the batch reports would, and `quit` returns
+	// before them. The one thing --interactive changes about the machine is
+	// the RTC's default (`--rtc`, below): the batch keeps the DSPI loopback.
+	bool parseNumber(const std::string& _s, uint64_t& _out)
+	{
+		// Decimal, or 0x/0X hex. A leading zero is NOT octal.
+		size_t i = 0;
+		uint64_t base = 10;
+		if(_s.size() > 2 && _s[0] == '0' && (_s[1] == 'x' || _s[1] == 'X'))
+		{
+			i = 2;
+			base = 16;
+		}
+		if(i >= _s.size())
+			return false;
+		uint64_t v = 0;
+		for(; i < _s.size(); ++i)
+		{
+			const auto c = _s[i];
+			uint64_t d;
+			if(c >= '0' && c <= '9') d = c - '0';
+			else if(base == 16 && c >= 'a' && c <= 'f') d = c - 'a' + 10;
+			else if(base == 16 && c >= 'A' && c <= 'F') d = c - 'A' + 10;
+			else return false;
+			if(v > (UINT64_MAX - d) / base)
+				return false;
+			v = v * base + d;
+		}
+		_out = v;
+		return true;
+	}
+
+	bool parseSigned(const std::string& _s, int64_t& _out)
+	{
+		// An optional sign, then parseNumber's decimal-or-0x.
+		bool neg = false;
+		size_t i = 0;
+		if(!_s.empty() && (_s[0] == '-' || _s[0] == '+'))
+		{
+			neg = _s[0] == '-';
+			i = 1;
+		}
+		uint64_t v = 0;
+		if(!parseNumber(_s.substr(i), v) || v > (1ull << 62))
+			return false;
+		_out = neg ? -static_cast<int64_t>(v) : static_cast<int64_t>(v);
+		return true;
+	}
+
+	bool parseHex(const std::string& _s, std::vector<uint8_t>& _out)
+	{
+		if(_s.empty() || _s.size() % 2)
+			return false;
+		_out.clear();
+		for(size_t i = 0; i < _s.size(); i += 2)
+		{
+			unsigned v = 0;
+			for(size_t k = 0; k < 2; ++k)
+			{
+				const auto c = static_cast<unsigned char>(_s[i + k]);
+				v <<= 4;
+				if(c >= '0' && c <= '9') v |= c - '0';
+				else if(c >= 'a' && c <= 'f') v |= c - 'a' + 10;
+				else if(c >= 'A' && c <= 'F') v |= c - 'A' + 10;
+				else return false;
+			}
+			_out.push_back(static_cast<uint8_t>(v));
+		}
+		return true;
+	}
+
+	std::vector<std::string> splitWords(const std::string& _line)
+	{
+		std::vector<std::string> words;
+		std::string cur;
+		for(const char c : _line)
+		{
+			if(c == ' ' || c == '\t' || c == '\r')
+			{
+				if(!cur.empty()) { words.push_back(cur); cur.clear(); }
+			}
+			else
+				cur += c;
+		}
+		if(!cur.empty())
+			words.push_back(cur);
+		return words;
+	}
+
+	const char* stopWord(const ot::Rtos::Stop _s)
+	{
+		switch(_s)
+		{
+		case ot::Rtos::Stop::Gate:    return "gate";
+		case ot::Rtos::Stop::Time:    return "time";
+		case ot::Rtos::Stop::Fault:   return "fault";
+		case ot::Rtos::Stop::Illegal: return "illegal";
+		}
+		return "?";
+	}
+
+	int serveInteractive(ot::Machine& _m, ot::Rtos& _rtos)
+	{
+		// The first `tx` answers everything since the boot: the panel's
+		// whole screen and LED state is in that stream (the boot's full draw,
+		// then diffs), and a decoder fed from byte 0 has all of it.
+		size_t txCursor = 0;
+		size_t hitCursor = 0, writeCursor = 0;	// `hits` / `writes` report since the previous call
+		double wallInRun = 0.0;
+		const auto reply = [](const std::string& _s)
+		{
+			std::fputs(_s.c_str(), stdout);
+			std::fputc('\n', stdout);
+			std::fflush(stdout);
+		};
+		char buf[160];
+		std::snprintf(buf, sizeof buf, "ready sample=%.3f frames=%llu", _rtos.sample(),
+			static_cast<unsigned long long>(_rtos.frameCount()));
+		reply(buf);
+		std::string line;
+		while(std::getline(std::cin, line))
+		{
+			const auto w = splitWords(line);
+			if(w.empty())
+			{
+				reply("err empty command");
+				continue;
+			}
+			const auto& cmd = w[0];
+			if(cmd == "quit")
+			{
+				if(w.size() != 1)
+				{
+					reply("err usage: quit");
+					continue;
+				}
+				reply("ok");
+				return 0;
+			}
+			if(cmd == "run")
+			{
+				double ms = 0.0;
+				char* end = nullptr;
+				if(w.size() != 2 || (ms = std::strtod(w[1].c_str(), &end), !end || *end) || !(ms >= 0.0) || ms > 1e9)
+				{
+					reply("err usage: run <ms>");
+					continue;
+				}
+				const auto t0 = std::chrono::steady_clock::now();
+				const auto st = _rtos.run(ms, false);
+				wallInRun += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+				std::snprintf(buf, sizeof buf, "ok sample=%.3f frames=%llu stop=%s", _rtos.sample(),
+					static_cast<unsigned long long>(_rtos.frameCount()), stopWord(st));
+				reply(buf);
+				continue;
+			}
+			if(cmd == "key")
+			{
+				uint64_t row = 0, mask = 0;
+				if(w.size() != 3 || !parseNumber(w[1], row) || !parseNumber(w[2], mask) || row > 0xff || mask > 0xff)
+				{
+					reply("err usage: key <row> <mask> (0..255)");
+					continue;
+				}
+				_rtos.uartA().rxPush(static_cast<uint8_t>(row));
+				_rtos.uartA().rxPush(static_cast<uint8_t>(mask));
+				reply("ok");
+				continue;
+			}
+			if(cmd == "knob")
+			{
+				uint64_t row = 0;
+				int64_t delta = 0;
+				if(w.size() != 3 || !parseNumber(w[1], row) || !parseSigned(w[2], delta) || row > 0xff || delta < -128 || delta > 255)
+				{
+					reply("err usage: knob <row> <delta> (-128..127)");
+					continue;
+				}
+				_rtos.uartA().rxPush(static_cast<uint8_t>(row));
+				_rtos.uartA().rxPush(static_cast<uint8_t>(delta & 0xff));
+				reply("ok");
+				continue;
+			}
+			if(cmd == "tx")
+			{
+				if(w.size() != 1)
+				{
+					reply("err usage: tx");
+					continue;
+				}
+				const auto& tx = _rtos.serialTxA();
+				std::string out = "tx ";
+				out.reserve(3 + 2 * (tx.size() - txCursor));
+				static const char* const hex = "0123456789abcdef";
+				for(size_t i = txCursor; i < tx.size(); ++i)
+				{
+					out += hex[tx[i] >> 4];
+					out += hex[tx[i] & 15];
+				}
+				txCursor = tx.size();
+				reply(out);
+				continue;
+			}
+			if(cmd == "peek")
+			{
+				uint64_t addr = 0, len = 0;
+				if(w.size() != 3 || !parseNumber(w[1], addr) || !parseNumber(w[2], len) || addr > 0xffffffffull || len < 1 || len > 4096 || addr + len > 0x100000000ull)
+				{
+					reply("err usage: peek <addr> <len> (1..4096)");
+					continue;
+				}
+				if(!_m.mapped(static_cast<uint32_t>(addr), static_cast<uint32_t>(len)))
+				{
+					std::snprintf(buf, sizeof buf, "err unmapped %#llx+%llu", static_cast<unsigned long long>(addr), static_cast<unsigned long long>(len));
+					reply(buf);
+					continue;
+				}
+				std::string out = "peek ";
+				static const char* const hex = "0123456789abcdef";
+				for(uint64_t i = 0; i < len; ++i)
+				{
+					const auto b = _m.read8(static_cast<uint32_t>(addr + i));
+					out += hex[b >> 4];
+					out += hex[b & 15];
+				}
+				reply(out);
+				continue;
+			}
+			if(cmd == "poke")
+			{
+				uint64_t addr = 0;
+				std::vector<uint8_t> bytes;
+				if(w.size() != 3 || !parseNumber(w[1], addr) || addr > 0xffffffffull || !parseHex(w[2], bytes) || bytes.size() > 4096 || addr + bytes.size() > 0x100000000ull)
+				{
+					reply("err usage: poke <addr> <hex> (1..4096 bytes, even number of hex digits)");
+					continue;
+				}
+				if(!_m.mapped(static_cast<uint32_t>(addr), static_cast<uint32_t>(bytes.size())))
+				{
+					std::snprintf(buf, sizeof buf, "err unmapped %#llx+%zu", static_cast<unsigned long long>(addr), bytes.size());
+					reply(buf);
+					continue;
+				}
+				for(size_t i = 0; i < bytes.size(); ++i)
+					_m.write8(static_cast<uint32_t>(addr + i), bytes[i]);
+				reply("ok");
+				continue;
+			}
+			if(cmd == "frame")
+			{
+				if(w.size() != 2 || (w[1] != "on" && w[1] != "off"))
+				{
+					reply("err usage: frame on|off");
+					continue;
+				}
+				_rtos.setFrame(w[1] == "on");
+				reply("ok");
+				continue;
+			}
+			if(cmd == "status")
+			{
+				if(w.size() != 1)
+				{
+					reply("err usage: status");
+					continue;
+				}
+				std::snprintf(buf, sizeof buf, "status sample=%.3f ms=%.3f frames=%llu frame=%s idle=%llu wall=%.3f",
+					_rtos.sample(), _rtos.ms(), static_cast<unsigned long long>(_rtos.frameCount()),
+					_rtos.frameOn() ? "on" : "off", static_cast<unsigned long long>(_rtos.idleSkips()), wallInRun);
+				reply(buf);
+				continue;
+			}
+			if(cmd == "watch")
+			{
+				std::vector<uint32_t> addrs;
+				bool ok = w.size() == 2;
+				if(ok && w[1] != "off")
+				{
+					size_t q = 0;
+					while(ok && q <= w[1].size())
+					{
+						auto e = w[1].find(',', q);
+						if(e == std::string::npos) e = w[1].size();
+						uint64_t v = 0;
+						ok = parseNumber(w[1].substr(q, e - q), v) && v <= 0xffffffffull;
+						addrs.push_back(static_cast<uint32_t>(v));
+						q = e + 1;
+					}
+				}
+				if(!ok)
+				{
+					reply("err usage: watch <addr>[,<addr>...] | watch off");
+					continue;
+				}
+				_m.watchPc(std::move(addrs));
+				reply("ok");
+				continue;
+			}
+			if(cmd == "hits")
+			{
+				if(w.size() != 1)
+				{
+					reply("err usage: hits");
+					continue;
+				}
+				const auto& hs = _m.pcHits();
+				std::string out = "hits n=" + std::to_string(hs.size() - hitCursor);
+				for(size_t i = hitCursor; i < hs.size(); ++i)
+				{
+					const auto& h = hs[i];
+					std::snprintf(buf, sizeof buf, " %llx:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x",
+						static_cast<unsigned long long>(h.instruction), h.pc, h.d0, h.d1, h.a0, h.a1, h.sp,
+						h.stack[0], h.stack[1], h.stack[2], h.stack[3], h.stack[4],
+						h.d[2], h.d[3], h.d[4], h.d[5], h.d[6], h.d[7], h.a[2], h.a[3], h.a[4], h.a[5], h.a[6]);
+					out += buf;
+				}
+				hitCursor = hs.size();
+				reply(out);
+				continue;
+			}
+			if(cmd == "watchmem")
+			{
+				uint64_t addr = 0, len = 0;
+				if(w.size() != 3 || !parseNumber(w[1], addr) || !parseNumber(w[2], len) || addr > 0xffffffffull || len < 1 || addr + len > 0x100000000ull)
+				{
+					reply("err usage: watchmem <addr> <len>");
+					continue;
+				}
+				_rtos.watchMem(static_cast<uint32_t>(addr), static_cast<uint32_t>(len));
+				reply("ok");
+				continue;
+			}
+			if(cmd == "writes")
+			{
+				if(w.size() != 1)
+				{
+					reply("err usage: writes");
+					continue;
+				}
+				const auto& ws = _rtos.memWrites();
+				std::string out = "writes n=" + std::to_string(ws.size() - writeCursor);
+				for(size_t i = writeCursor; i < ws.size(); ++i)
+				{
+					const auto& r = ws[i];
+					std::snprintf(buf, sizeof buf, " %.1f:%x:%x:%x:%u:%x", r.sample, r.pc, r.addr, r.val, r.size, r.tcb);
+					out += buf;
+				}
+				writeCursor = ws.size();
+				reply(out);
+				continue;
+			}
+			reply("err unknown command " + cmd);
+		}
+		return 0;		// EOF on stdin: the client went away
 	}
 }
 
@@ -63,6 +473,7 @@ int main(int _argc, char** _argv)
 	double runMs = 1000.0;
 	double ips = 3990.0;
 	bool frame = false;			// the DSP frame clock; off by default, as in route A
+	bool bootLogo = false;		// let the boot logo run its 2.8 s on DTIM3 (Rtos::Quirks::skipBootLogo off)
 	bool sequencer = false;		// M6c: load, start the transport, run the sequencer for real
 	int frames = 400;			// with --sequencer: DSP frames to run after the transport start
 	int pokeTrig = 0;			// with --sequencer: set a trig on track 1 at this step (1-64)
@@ -99,6 +510,8 @@ int main(int _argc, char** _argv)
 	std::string pokeAfterLoad;	// O9c: "addr=byte;addr=byte" written after the load, before the frames (drive an apply the load skips)
 	int mainLevel = -1;			// O9b: post sys command 4 (SET MAIN LEVEL) with this level after the load; -1 = don't (the emulated load never does, and every voice then renders at gain zero)
 	std::string memDump;		// O10.21: "addr,len=path[;...]" -- ColdFire memory ranges, raw bytes, to FILE at the very end (peeks only support one word, pre-sequencer; this is a range, post-run)
+	bool interactive = false;	// 11 Sep 2026: after the boot (and load), serve the line protocol on stdin/stdout (serveInteractive above)
+	std::string rtc;			// 11 Sep 2026: the DSPI chip-select-2 clock -- "host", "off", or <epoch seconds> (UTC, frozen); default off, host under --interactive (Dspi::RtcClock)
 
 	for(int i = 1; i < _argc; ++i)
 	{
@@ -122,6 +535,7 @@ int main(int _argc, char** _argv)
 		else if(a == "--ms" && i + 1 < _argc)	runMs = std::atof(_argv[++i]);
 		else if(a == "--ips" && i + 1 < _argc)	ips = std::atof(_argv[++i]);
 		else if(a == "--frame")					frame = true;
+		else if(a == "--boot-logo")				bootLogo = true;
 		else if(a == "--sequencer")				sequencer = true;
 		// --sequencer needs a mounted card and a loaded project: it implies both.
 		else if(a == "--frames" && i + 1 < _argc)	frames = std::atoi(_argv[++i]);
@@ -161,16 +575,40 @@ int main(int _argc, char** _argv)
 		else if(a == "--mem-dump" && i + 1 < _argc)	memDump = _argv[++i];
 		else if(a == "--poke" && i + 1 < _argc)		pokeAfterLoad = _argv[++i];
 		else if(a == "--frame-timer")				frameTimer = true;
+		else if(a == "--interactive")				interactive = true;
+		else if(a == "--rtc" && i + 1 < _argc)		rtc = _argv[++i];
 		else
 		{
 			std::printf("usage: ot_emu [--image FILE] [--max N] [--periph] [--profile]\n"
-			"              [--golden FILE] [--ms N]\n");
+			"              [--golden FILE] [--ms N] [--boot-logo]\n");
 			return 2;
 		}
 	}
 
 	if(sequencer)
 		mount = true;			// M6c needs the card mounted and the project loaded
+
+	// --rtc: the batch keeps the DSPI loopback (chip-select 2 answers 0, the
+	// 2000-00-00 dialog: goldens and serial captures reproducible, and route
+	// A's stock Dspi agrees); --interactive wants the real date on the panel.
+	auto rtcMode = interactive ? ot::Dspi::RtcClock::Host : ot::Dspi::RtcClock::Off;
+	int64_t rtcEpoch = 0;
+	if(rtc == "host")
+		rtcMode = ot::Dspi::RtcClock::Host;
+	else if(rtc == "off")
+		rtcMode = ot::Dspi::RtcClock::Off;
+	else if(!rtc.empty())
+	{
+		char* end = nullptr;
+		errno = 0;
+		rtcEpoch = std::strtoll(rtc.c_str(), &end, 10);
+		if(errno || !end || *end || rtcEpoch < 0)
+		{
+			std::printf("--rtc: host, off, or seconds since 1970 (UTC), not '%s'\n", rtc.c_str());
+			return 2;
+		}
+		rtcMode = ot::Dspi::RtcClock::Fixed;
+	}
 
 	const auto img = readFile(image);
 	if(img.empty())
@@ -289,6 +727,12 @@ int main(int _argc, char** _argv)
 	{
 		std::printf("vbr        : %#x (the firmware's own `movec %%a0,%%vbr` at 0x40000db6)\n", m.vbr());
 		ot::Rtos rtos(m, ips, 264e6, frame);
+		if(bootLogo)
+		{
+			ot::Rtos::Quirks q;
+			q.skipBootLogo = false;
+			rtos.setQuirks(q);
+		}
 		// The card is attached BEFORE install, as route A attaches it before
 		// `Rtos.install()`: its four memory maps have to be in place before
 		// anything runs, and the boot's replayed writes must not start a
@@ -308,6 +752,17 @@ int main(int _argc, char** _argv)
 			rtos.attachCard(*card);
 			rtos.setAtaTrace(!ataTrace.empty());
 			std::printf("card       : %s, %u sectors\n", cardImage.c_str(), card->totalSectors());
+		}
+		rtos.dspi().setRtcClock(rtcMode, rtcEpoch);
+		if(rtcMode != ot::Dspi::RtcClock::Off || !rtc.empty())
+		{
+			// Silent in the default batch (its stdout is diffed byte for byte).
+			if(rtcMode == ot::Dspi::RtcClock::Off)
+				std::printf("rtc        : off (DSPI chip-select 2 is the loopback: the 2000-00-00 dialog)\n");
+			else if(rtcMode == ot::Dspi::RtcClock::Host)
+				std::printf("rtc        : host clock (DSPI chip-select 2, DS1390 registers, local time)\n");
+			else
+				std::printf("rtc        : pinned at %lld s since 1970 (UTC, frozen)\n", static_cast<long long>(rtcEpoch));
 		}
 		rtos.install();
 		rtos.setBlockLog(!blockLog.empty());
@@ -355,6 +810,10 @@ int main(int _argc, char** _argv)
 			rtos.ms(), rtos.created().size(), rtos.dispatches().size(), rtos.ran().size(),
 			static_cast<unsigned long long>(rtos.pit0Fired()),
 			static_cast<unsigned long long>(rtos.idleSkips()), rtos.seeded());
+		std::printf("             DMA timers: DTIM1 (the LED countdown, 8.33 ms) fired %llu, DTIM2 (soft timers, 1 s) fired %llu; "
+			"DTIM3 %s\n",
+			static_cast<unsigned long long>(rtos.dtimFired(1)), static_cast<unsigned long long>(rtos.dtimFired(2)),
+			rtos.quirks().skipBootLogo ? "reads 2.8 s ahead (the boot logo skipped; --boot-logo runs it)" : "counts from zero (the boot logo ran)");
 		std::printf("frame      : %s -- %llu frame interrupt(s) taken, %llu eDMA transfer(s) started\n",
 			frame ? "on" : "off (route A's default: main unmasks source 1 unconditionally)",
 			static_cast<unsigned long long>(rtos.frameCount()),
@@ -688,6 +1147,11 @@ int main(int _argc, char** _argv)
 				}
 			}
 		}
+		// The boot, the load and (if asked) the sequencer run exactly as
+		// above; from here the machine is the client's. `quit` exits here,
+		// before the batch reports.
+		if(interactive)
+			return serveInteractive(m, rtos);
 
 		if(!watchPc.empty())
 		{

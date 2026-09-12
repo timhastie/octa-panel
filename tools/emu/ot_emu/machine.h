@@ -268,6 +268,12 @@ namespace ot
 
 		uint32_t peek32(uint32_t _addr);
 		void     poke32(uint32_t _addr, uint32_t _val);
+		// Is every byte of [_addr, _addr + _len) backed by something -- a
+		// region, a page this machine grew, or a peripheral window? A peek
+		// through the interactive protocol asks BEFORE reading, because a
+		// read8 of unmapped memory grows a zero page as a side effect and the
+		// answer would be indistinguishable from a real zero (11 Sep 2026).
+		bool mapped(uint32_t _addr, uint32_t _len);
 
 		// Route A's `watch_mem`: every write into a small range, with the PC
 		// of the instruction making it. Used by the M6c trig log (the

@@ -69,6 +69,77 @@ int main()
 		check("RLD reloads (a jump forward fires every period)", n >= 3 && n <= 4, d);
 	}
 
+	// ---- DMA timers ------------------------------------------------------
+	{
+		// DTIM1 as the firmware programs it (0x40040498..0x400404a6): DTRR
+		// 68750 as a long, then DTMR 0x1d as a word = RST, bus/16, restart,
+		// reference interrupt. Off the 132 MHz bus that is 68751 * 16 / 132e6
+		// = 8.333 ms = 367.5 samples: the LED countdown's tick (12 Sep 2026).
+		ot::DmaTimer t("DTIM1", 132e6);
+		t.write(4, 4, 68750, 0.0);
+		t.write(0, 2, 0x1d, 0.0);
+		const auto period = t.periodSamples();
+		char d[128];
+		std::snprintf(d, sizeof d, "period %.3f samples (want ~367.5)", period);
+		check("DTIM period is (DTRR+1) * 16 / bus clock in restart mode", std::fabs(period - 367.5) < 0.01, d);
+		check("no reference match before DTRR is reached", t.advance(period - 1.0) == 0);
+		{
+			const auto c = t.count(period / 2.0);
+			std::snprintf(d, sizeof d, "count %u at half a period (want 34375 +-1)", c);
+			check("DTCN counts from 0 at the programmed rate", c >= 34374 && c <= 34376, d);
+		}
+		check("one match at the reference", t.advance(period + 0.1) == 1);
+		check("REF raises the line while ORRI is set", t.irq());
+		checkEq("DTER reads REF as bit 1 (byte at +3)", t.read(3, 1, period + 0.1), 2);
+		checkEq("a long read at +0 is DTMR:DTXMR:DTER", t.read(0, 4, period + 0.1), (0x1du << 16) | 2);
+
+		// The handler's acknowledgement: `moveb #2, DTER`. Write-1-to-clear,
+		// and it must not re-arm or disturb the count (a second match a few
+		// instructions later would double every tick).
+		t.write(3, 1, 2, period + 0.2);
+		check("DTER is write-1-to-clear and the line drops", !t.irq());
+		check("the acknowledgement does not fire the match again", t.advance(period + 5.0) == 0);
+
+		// Restart mode reloads: a jump forward fires once per period.
+		const auto n = t.advance(period * 4.6);
+		std::snprintf(d, sizeof d, "fired %u times over ~3.5 more periods", n);
+		check("restart mode fires every period", n >= 3 && n <= 4, d);
+
+		// DTIM2's shape (0x40040430, and the handler 0x40040ac6..0x40040b02):
+		// bus/1, FREE-RUN, DTRR 132,000,000 = one second; after a match the
+		// count keeps going, so the next match is a 2^32 wrap away unless the
+		// handler clears DTCN (any write) and reprograms DTRR -- which it does.
+		ot::DmaTimer s("DTIM2", 132e6);
+		s.write(4, 4, 132000000, 0.0);
+		s.write(0, 2, 0x13, 0.0);
+		check("free-run: no match before one second", s.advance(44100.0 - 1.0) == 0);
+		check("free-run: the match at one second", s.advance(44100.0 + 0.5) == 1 && s.irq());
+		s.write(3, 1, 2, 44101.0);
+		check("free-run: no second match until the 2^32 wrap", s.advance(44100.0 * 3.0) == 0);
+		s.write(0xc, 4, 0, 44100.0 * 3.0);		// the handler: clrl DTCN
+		s.write(4, 4, 13200000, 44100.0 * 3.0);	// ... then a 0.1 s reference
+		check("a DTCN write restarts the count", s.count(44100.0 * 3.0) == 0);
+		check("the reprogrammed reference matches 0.1 s later",
+			s.advance(44100.0 * 3.0 + 4409.0) == 0 && s.advance(44100.0 * 3.0 + 4411.0) == 1);
+
+		// DTIM3 (DTMR 0x0b: bus/1, restart, no ORRI, DTRR untouched) is a
+		// timestamp: it counts at 132 MHz, interrupts nothing and offers the
+		// idle skip no expiry. DTIM0 (DTMR 7) counts the DTIN pin: no model,
+		// it holds at 0.
+		ot::DmaTimer u("DTIM3", 132e6);
+		u.write(0, 2, 0x0b, 0.0);
+		{
+			const auto c = u.count(44100.0);
+			std::snprintf(d, sizeof d, "count %u after a second (want 132,000,000 +-1)", c);
+			check("a free-running bus-clock timestamp reads 132,000,000 after a second", c >= 131999999 && c <= 132000001, d);
+		}
+		double e;
+		check("without ORRI it neither interrupts nor wakes the idle skip", u.advance(44100.0 * 40.0) >= 1 && !u.irq() && !u.nextExpiry(e));
+		ot::DmaTimer z("DTIM0", 132e6);
+		z.write(0, 2, 7, 0.0);
+		checkEq("a DTIN-clocked channel holds at 0", z.count(44100.0), 0);
+	}
+
 	// ---- INTC ------------------------------------------------------------
 	{
 		ot::Intc intc("INTC0", 64);

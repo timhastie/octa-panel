@@ -1,5 +1,7 @@
 #include "periph.h"
 
+#include <ctime>
+
 #include <algorithm>
 #include <cmath>
 
@@ -89,6 +91,153 @@ namespace ot
 	{
 		m_pcsr = _pcsr;
 		m_pmr = _pmr;
+		arm(_now);
+	}
+
+	// ---- DMA timers --------------------------------------------------------
+	double DmaTimer::rate() const
+	{
+		if(!(m_dtmr & RST))
+			return 0.0;
+		double hz;
+		switch((m_dtmr & CLK_MASK) >> CLK_SHIFT)
+		{
+		case 1:  hz = m_busHz; break;
+		case 2:  hz = m_busHz / 16.0; break;
+		default: return 0.0;		// 0 = stopped, 3 = the DTIN pin (unmodelled)
+		}
+		return hz / static_cast<double>(((m_dtmr >> 8) & 0xff) + 1) / g_sampleHz;
+	}
+
+	double DmaTimer::modulus() const
+	{
+		return (m_dtmr & FRR) ? static_cast<double>(m_dtrr) + 1.0 : 4294967296.0;
+	}
+
+	uint32_t DmaTimer::count(const double _now) const
+	{
+		const double c = std::fmod(m_count0 + std::max(0.0, _now - m_t0) * m_rate, modulus());
+		return static_cast<uint32_t>(std::fmod(c + static_cast<double>(m_bias), 4294967296.0));
+	}
+
+	double DmaTimer::periodSamples() const
+	{
+		return m_rate > 0.0 ? modulus() / m_rate : 0.0;
+	}
+
+	void DmaTimer::freeze(const double _now)
+	{
+		m_count0 = std::fmod(m_count0 + std::max(0.0, _now - m_t0) * m_rate, modulus());
+		m_t0 = _now;
+	}
+
+	void DmaTimer::arm(const double _now)
+	{
+		const double r = m_rate;
+		if(r <= 0.0)
+		{
+			m_armed = false;
+			return;
+		}
+		// The next time the count equals DTRR: ahead of it in this cycle, or
+		// after the wrap (restart: DTRR+1 counts; free-run: 2^32). Less than
+		// half a count ahead is the match that just fired, seen through
+		// floating point -- not a second one.
+		const double c = std::fmod(m_count0 + std::max(0.0, _now - m_t0) * r, modulus());
+		double ahead = static_cast<double>(m_dtrr) - c;
+		if(ahead < 0.5)
+			ahead += modulus();
+		m_expiry = _now + ahead / r;
+		m_armed = true;
+	}
+
+	uint32_t DmaTimer::advance(const double _now)
+	{
+		// The run loop is here after EVERY instruction: nothing but two
+		// compares until a match is actually due.
+		if(!m_armed || _now < m_expiry)
+			return 0;
+		uint32_t n = 0;
+		const double r = m_rate;
+		while(m_armed && r > 0.0 && _now >= m_expiry)
+		{
+			m_dter |= REF;
+			++m_fired;
+			++n;
+			if(m_dtmr & FRR)
+			{
+				// The clock after the match restarts the count at 0.
+				m_t0 = m_expiry + 1.0 / r;
+				m_count0 = 0.0;
+				m_expiry = m_t0 + static_cast<double>(m_dtrr) / r;
+			}
+			else
+				m_expiry += 4294967296.0 / r;
+			if(n > 100000)		// a reference of a few counts: fire, do not spin (the firmware programs none)
+				break;
+		}
+		return n;
+	}
+
+	uint32_t DmaTimer::reg32(const uint32_t _off, const double _now) const
+	{
+		switch(_off & 0xc)
+		{
+		case 0x0: return (m_dtmr << 16) | (m_dtxmr << 8) | m_dter;
+		case 0x4: return m_dtrr;
+		case 0x8: return 0;				// DTCR: no capture input
+		default:  return count(_now);	// DTCN
+		}
+	}
+
+	uint32_t DmaTimer::read(const uint32_t _off, const uint32_t _size, const double _now) const
+	{
+		// Byte by byte, big-endian, so an access of any width sees the same
+		// bytes: the firmware reads DTMR as a word, DTER as a byte, DTCN as a
+		// long.
+		uint32_t v = 0;
+		for(uint32_t i = 0; i < _size; ++i)
+		{
+			const uint32_t a = (_off + i) & 0xf;
+			v = (v << 8) | ((reg32(a, _now) >> (8 * (3 - (a & 3)))) & 0xff);
+		}
+		return v;
+	}
+
+	void DmaTimer::write(const uint32_t _off, const uint32_t _size, const uint32_t _val, const double _now)
+	{
+		// An acknowledgement (DTER) or a mode-extension write (DTXMR) touches
+		// no timing: leave the count and the armed match alone.
+		const uint32_t last = (_off + _size - 1) & 0xf;
+		const bool timing = (_off & 0xf) < 2 || last >= 4;
+		if(timing)
+			freeze(_now);		// a DTMR rewrite changes the rate; the count it had carries over
+		bool dtcn = false;
+		for(uint32_t i = 0; i < _size; ++i)
+		{
+			const uint32_t a = (_off + i) & 0xf;
+			const uint32_t b = (_val >> (8 * (_size - 1 - i))) & 0xff;
+			switch(a)
+			{
+			case 0x0: m_dtmr = (m_dtmr & 0x00ff) | (b << 8); break;
+			case 0x1: m_dtmr = (m_dtmr & 0xff00) | b; break;
+			case 0x2: m_dtxmr = b; break;
+			case 0x3: m_dter &= ~(b & (CAP | REF)); break;			// write-1-to-clear
+			case 0x4: case 0x5: case 0x6: case 0x7:
+				m_dtrr = (m_dtrr & ~(0xffu << (8 * (7 - a)))) | (b << (8 * (7 - a)));
+				break;
+			case 0xc: case 0xd: case 0xe: case 0xf:
+				dtcn = true;											// any write clears the count
+				break;
+			default: break;												// DTCR is read-only
+			}
+		}
+		if(!timing)
+			return;
+		m_rate = rate();
+		if(!(m_dtmr & RST) || dtcn)
+			m_count0 = 0.0;			// RST low holds the counter at 0; a DTCN write clears it
+		m_t0 = _now;
 		arm(_now);
 	}
 
@@ -299,15 +448,95 @@ namespace ot
 		return it != m_regs.end() ? it->second : (1u << (8 * _size)) - 1;
 	}
 
+	uint8_t Dspi::rtcRegister(const uint8_t _reg) const
+	{
+		const auto reg = _reg & 0x1f;
+		if(m_rtcHasWrite[reg])
+			return m_rtcWritten[reg];
+		const auto bcd = [](const int _n) { return static_cast<uint8_t>(((_n / 10) << 4) | (_n % 10)); };
+		std::tm tm = {};
+		if(m_rtcMode == RtcClock::Fixed)
+		{
+			// Pinned: UTC, so the same epoch draws the same dialog on every
+			// machine (the host mode is local time, as the user's wall clock).
+			std::time_t t = static_cast<std::time_t>(m_rtcEpoch);
+			gmtime_r(&t, &tm);
+		}
+		else
+		{
+			std::time_t t = std::time(nullptr);
+			localtime_r(&t, &tm);
+		}
+		switch(reg)
+		{
+		case 0x01: return bcd(tm.tm_sec);
+		case 0x02: return bcd(tm.tm_min);
+		case 0x03: return bcd(tm.tm_hour);
+		case 0x04: return static_cast<uint8_t>((tm.tm_wday + 6) % 7 + 1);	// 1 = Monday
+		case 0x05: return bcd(tm.tm_mday);
+		case 0x06: return bcd(tm.tm_mon + 1);
+		case 0x07: return bcd(tm.tm_year % 100);
+		default:   return 0;		// 0x00 hundredths, 0x0e status, anything unread
+		}
+	}
+
 	void Dspi::write(const uint32_t _off, uint32_t, const uint32_t _val, const bool _replay)
 	{
 		if(_off == PUSHR)
 		{
-			if(!_replay)
+			if(_replay)
+				return;
+			// PUSHR: CONT bit 31, PCS bits 21-16, the frame's data bits 15-0
+			// (the firmware's frames are 8 bits: the low byte).
+			const bool cont = (_val >> 31) & 1;
+			const auto pcs = (_val >> 16) & 0x3f;
+			const auto data = static_cast<uint8_t>(_val);
+			uint32_t reply = 0;
+			if(m_rtcMode == RtcClock::Off)
 			{
+				// The loopback, exactly as before the RTC: every chip select
+				// answers 0 and nothing is remembered (the batch's default --
+				// goldens and serial captures stay reproducible, and agree
+				// with route A's stock Dspi).
 				m_rx.push_back(0);
 				++m_pushed;
+				return;
 			}
+			if(!m_inTx)
+			{
+				m_inTx = true;
+				m_txPcs = pcs;
+				m_txFirst = data;
+				m_txFrames = 0;
+				// Route A answers the first frame of a read with the register
+				// too; the firmware takes the value from the second frame's
+				// POPR, so this only has to not matter.
+				if(pcs == g_rtcPcs && !(data & 0x80))
+					reply = rtcRegister(data);
+			}
+			else
+			{
+				++m_txFrames;
+				const auto reg = static_cast<uint8_t>((m_txFirst & 0x7f) + m_txFrames - 1);
+				if(m_txPcs == g_rtcPcs)
+				{
+					if(m_txFirst & 0x80)
+					{
+						m_rtcWritten[reg & 0x1f] = data;
+						m_rtcHasWrite[reg & 0x1f] = true;
+						++m_rtcWrites;
+					}
+					else
+					{
+						reply = rtcRegister(reg);
+						++m_rtcReads;
+					}
+				}
+			}
+			m_rx.push_back(reply);
+			++m_pushed;
+			if(!cont)
+				m_inTx = false;
 		}
 		else if(_off != SR)
 			m_regs[_off] = _val;

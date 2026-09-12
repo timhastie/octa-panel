@@ -446,3 +446,286 @@ SETUP (its own narrower shape, `Z_recording_setup.png`) and PLAYBACK page
   the "no sequencer LEDs" of the report referred to together with the
   never-moving position; the per-trig flashes will need `tools/emu` to
   post that message. panel_server carries what the firmware sends.
+
+## 12 Sep 2026: the trig-row running light -- found on the port, and it is not an emulation gap
+
+Verifier follow-up on "Trig LEDs while playing" above, done on the C++
+port (`out/emu/ot_emu --interactive`, OTLIVE/PROJECT, `--rtc 1000000000`,
+stock image). Scratch (gitignored): `out/_agents/seqled/` -- `repro.py`
+(PLAY through the matrix, the panel stream decoded per 50 ms slice, LED
+rows and the trigs-fired mask/ring logged; `--no-activate`, `--dsp`),
+`probe.py` (the same run with PC watches over the pipe; `--reselect`,
+`--trigkey`), `hits.py` / `dis.py` (the batch's `--watch-pc` report and
+the 0x40000400 listing sliced by address), `batch1..6.log` (the batch
+`--sequencer` runs), `*.out`, `*.tx.bin` (raw panel streams), `os.lst`.
+Boot + load 19-20 s wall; each play window 2-9 s wall.
+
+**The sequencer-to-UI "trigs fired" note exists, it is a SYS command, and
+under the port it is posted, dispatched and drawn** -- as long as the
+panel has NOT "activated" the tracks first. Everything the section above
+attributes to a missing emulator message is one poke in `panel_server`.
+
+### The message, decoded
+
+- `0x400622da` is not a UI-queue handler: it is **case 22 of the sys task's
+  78-entry dispatcher** (receive on `0x460d17ae` at `0x40061cd8`, index =
+  `msg[0]-1`, 16-bit offset table at `0x40061cfa`; table[21] ->
+  `0x400622da`). The handler ORs `msg[1] << 8` into the 16-bit mask
+  `0x460d1794` (`movew` at `0x400622ee`), calls `0x4007e998(0)` -- the
+  page-0 LED callback from the table at `0x460e762c` (= the trig-LED pass
+  `0x40043fdc`), then the flush `0x400136a8` -- and, if the fired byte has
+  the current track's bit (`0x100b14cc`), takes `0x40062ab6`.
+- **Its poster is the ColdFire frame builder, not the DSP.** In the
+  per-frame per-track loop (8 tracks, `cmpl %sp@(114),%d5` at
+  `0x4000c824`) a byte at `%sp@(113)` collects `1 << track` (`%sp@(212)`,
+  set at `0x4009b812`) for every track whose fired flag `%sp@(196)` is set
+  (`0x4000c6f4`; the flag is written at `0x4000bef8` on the trig-match
+  path `0x4000bebe`..). After the loop, if the byte is non-zero,
+  `0x4000c832` builds `16 <byte>` in the ring at `0x461052a6` (cursor
+  `0x46104d42`, +2 per post) and `0x4000c858` posts it to the sys queue.
+  `msg[1]` is the TRACK mask; the pass flashes trig LEDs 9-16 for tracks
+  1-8 (`set_led(id, 0xa)` at `0x4004405e`, ids from the table
+  `0x400a76ae` = 0, 2, .., 30, bits 8-15 of the mask), then clears the bit.
+  The `--dsp` cores are irrelevant: the same LED timeline comes out with
+  `--frame` and with `--dsp` (`after_frame.out`, `after_dsp.out`).
+- The batch path (`--sequencer`, `Rtos::startTransportLive` = FW_TRANSPORT(0)
+  + FW_START_TRACK(0..7) through `callAsMain`) had this working all along:
+  `batch2.log` (`--poke-trig` and trigs poked on steps 1/5/9/13, 3000
+  frames = 209 ticks): `0x4000c858` posts at samples 277,993 (byte 0xff:
+  the fixture's own step-1 trigs on all tracks), 300,023 (0x01, the poked
+  step 5) and 322,074 (0xff, step 9); each is dispatched at `0x400622da`
+  in sys ~40 samples later, the mask goes `0xff00 -> 0xfe00 -> .. -> 0`
+  (`0x4004406e`, one clear per flash), `set_led(16..30, 10)` and
+  `send_row(2, ..)`/`send_row(3, ..)` follow. The live nibble
+  `0x46104d15` is written for all 8 tracks at frame 0 (`flags 0x10`).
+
+### Why the panel never saw it: pattern +0x54 is PLAYS FREE, not "active"
+
+`panel_server.activate_tracks` (10 Sep 2026) writes 1 into the pattern
+record at `+84 + 2330*t` for all eight tracks before PLAY, on the reading
+that `FW_START_TRACK` "only promotes an active track". The byte's two
+consumers say the opposite (objdump prints a plain displacement in
+decimal -- `%a0@(84)` -- and an indexed one in hex -- `%a0@(54,%d0:l)`;
+both are 0x54):
+
+- **FW_TRANSPORT(0)** (`0x4009b964`, the PLAY key's path from sys at
+  `0x40061894`, and the batch's) sets up each track only if the byte is
+  ZERO: `0x4009bc76 tstb %a3@ / bnew 0x4009bd2c` with `%a3 = 0x400e2234 +
+  2330*t` (`probe_regs.out`), and again at `0x4009bf8c` for the second
+  loop. A set byte skips the track: no per-track schedule, so the step
+  handler `0x4009d1e8` is never called (0 hits in 400 ms, `probe_key2.out`
+  -- vs 8 per step from `0x4009dca2` once selected), no trig path
+  `0x4009d422`, no fired flag, no post. The 24-PPQN clock, the step byte,
+  the LCD bar and the tempo LED run regardless, which is what made the
+  "sequencer runs but the light does not" look like a message gap.
+- **FW_START_TRACK(t)** (`0x4009b5c8`) does something only if the byte is
+  SET (`0x4009b630 tstb %a0@(84) / beqw 0x4009b95a`): it is the trig-key
+  start (callers `0x4004460c` / `0x400446ca` in the trig-key handler;
+  `probe_trigkey.out`: with the bytes set, PLAY starts nothing and a trig-1
+  tap calls FW_START_TRACK(0) from `0x40044612`). The only UI writer of the
+  byte is an encoder toggle clamped to 0..1 for the UI's current track
+  (`0x400824fe`, via `0x100b14d0`). Skipped by the sequencer's PLAY,
+  started by its trig key, a per-track ON/OFF in the pattern: the
+  Octatrack's **PLAYS FREE** setting. With the fixture's bytes all clear
+  the batch's eight FW_START_TRACK calls return at `0x4009b634` having done
+  nothing, which is why the batch never needed them and never noticed.
+- FW_SEQ_SELECT is not the difference: the sequencer's bank/pattern
+  `0x800065bd/be` read 0/0 after the load on both backends (`seqsel.out`,
+  `batch4.log`: written 0 at `0x400a05f6/0608` four times during the
+  load, the last from the LOAD PROJECT handler's own last step at
+  `0x400907da`), and re-selecting A01 through the panel (PATTERN 0x25.6 +
+  trig 1 -> `0x400a1030(0,0)` from `0x40056b6e`, `probe_resel.out`) changed
+  nothing while the bytes were set.
+
+### Measured: before / after (matrix PLAY, `frame on`, trigs poked on steps 1/5/9/13 of track 1)
+
+| | `activate_tracks` (today's panel) | bytes left clear |
+|---|---|---|
+| panel bytes over 1.1 s of play | 50 (`before_activated.tx.bin`) | 96 (`after_noact.tx.bin`) |
+| LED-row messages from the PLAY row on | 2: `2b08 .. 2b01` (PLAY on/off) | 33 |
+| rows 0x20-0x23 | never sent, state array `00000000` | `2003` at PLAY, then `200c 2030 20c0` / `2103 210c 2130 21c0` / `2256 2259 2265 2295` / `2356 2359 2365 2395` -- one step to the right every 125 ms, wrapping at 16 (`after_frame.out`, 2.1 s = 16 steps) |
+| fired-track flashes | none | at PLAY `2201 2205 2215 2255 2301 2305 2315 2355` (8 x set_led on ids 16..30), rows 0x22/0x23 = `55` after |
+| ring cursor `0x46104d42` | 0 throughout | +2 at steps 1, 5, 9, 13 and again at the wrap (bytes read for the first three: 0xff, 0x01, 0xff -- `probe_noact.out`) |
+| `0x4009d422` / `0x4000c858` / `0x400622da` hits in 1.1 s | 0 / 0 / 0 | 9 / 2 / 2 (`probe_noact.out`) |
+
+Same numbers with `--dsp` (`after_dsp.out`: 306 panel bytes, 43 LED/level
+messages over 2.1 s, identical rows; 22.4 s wall vs 9.4 s).
+
+### What to change, and what was changed
+
+- `panel_server`: do NOT set `+84` on PLAY (`activate_tracks` in the
+  PLAY-down hook and in `poke_trig`); the OTLIVE fixture plays as saved.
+  The flag is a user setting to expose, not a prerequisite. (Changed in the
+  verifier round, next section: the two call sites are gone, PLAY answers
+  `active=[0, ..]` = the bytes as saved, and `/leds` chases.)
+- The port (`tools/emu/ot_emu/main.cpp`): four commands over the pipe so
+  this kind of question can be answered without a batch run -- `watch
+  <addr>[,..]` / `watch off` (`Machine::watchPc`), `hits` (every hit since
+  the last call: `instr:pc:d0:d1:a0:a1:sp:stack0..4:d2..d7:a2..a6`, hex),
+  `watchmem <addr> <len>` (`Rtos::watchMem`), `writes`
+  (`sample:pc:addr:val:size:tcb`). `rtos.h` says what FW_START_TRACK is.
+  `ctest` 7/7, `smoke.py --card` PASS on the rebuilt `out/emu/ot_emu`.
+- The note in `COLDFIRE_PORT.md` O14i ("the same open item as under route
+  A") and the "sequencer's per-tick message never reaches the UI task"
+  reading above are superseded by this section: the message is sys opcode
+  22 from the frame builder, and it reaches the LEDs.
+- Not measured: what `+0x56` (the plays-free start mode FW_START_TRACK
+  reads) needs for a trig-key start to land -- the tap above called it and
+  no track ran within 1 s. Whether the 0x55 rows 0x22/0x23 leave after the
+  timed-LED countdown (`0x4001387c`) -- they were still lit at 2.1 s -- was
+  the port's real gap: the countdown's clock is a DMA timer the port did
+  not have. Next section.
+
+## 12 Sep 2026, verifier round: the light follows the current track, and the flashes that never went out were the port's missing DMA timers
+
+Follow-up on the section above, on the C++ port, same rig (`out/emu/ot_emu
+--interactive`, OTLIVE/PROJECT, `--rtc 1000000000`, matrix PLAY, `frame on`,
+trigs poked on steps 1/5/9/13 of track 1). Scratch (gitignored):
+`out/_agents/seqled/` -- `seqcheck.py` (the verifier's per-25-ms LED-row
+decode, `--activate <list>`, `--trackkey`, `--watch`), `ledtimer.py` (the
+LED countdown, its signaller and the LED arrays watched over PLAY + STOP),
+`rv_*.out` (per-track re-checks), `ledtimer_before.out` /
+`ledtimer_final.out`, `after_final.out` / `after_final_dsp` (the 2.1 s chase),
+`batch_final.log` (the batch cross-check), `loads_*.log` / `popup_*.log` (the
+boot mount), `smoke_dtim/` and `smoke_final*/` (the boot screens),
+`e2e_ready.png` / `e2e_play.png` (the shipped panel). Boot + load is now
+37.5 s of wall (below).
+
+### The light follows the UI's current track
+
+"`activate_tracks` sets the byte on all 8 tracks, which stops every track"
+is true; the condition for the LIGHT is the CURRENT track's byte. Measured
+(`seqcheck.py --activate <all but one>`, 400 ms of play, the lit pair
+against the STEP byte `0x800065b5`): only track 4 (T5) left clear -> chase
+(`2003 200c 2030 20c0`, 125.1-125.2 ms per step); only track 5 clear -> no
+chase, although its trig fires (`2304`) and the posts run; only track 0
+clear -> no chase; only track 0 clear with T1 tapped first (`0x100b14cc`
+4 -> 0) -> chase; {0,1,2,3} clear -> none, {4,5,6,7} -> chase. The fixture
+loads with track 4 current (`0x100b14cc` = 4, `0x80000000` = 4).
+
+The code says why. The trig-LED pass `0x40043fdc` clears ids 0..31 on every
+pass (`0x400131c8` from `0x40044030`/`0x40044040`, 15 passes per 400 ms)
+and its tail `0x400444fc..0x40044574` draws ONE pair: track = the byte at
+`0x80000000` (+8 when `0x80000012` is set, the MIDI side); `0x4009b290
+(track)` must answer 1 (running); `0x4009b2b0(track)` is the position; ids
+`2*(pos & 15)` and `+1` are lit through `0x400135b0` (level 15 / d4) and
+`0x400131a0` (the phase array `0x460ba98c`; the hits return to `0x4004455e`
+and `0x40044574`). FW_TRANSPORT(0) marks a track running only if its `+0x54`
+byte is zero (above), so the current track's byte alone decides whether
+there is a light; the other seven decide only whether their trigs fire. The
+case-22 handler reads the same track as a bit index at `0x400622fe`
+(`btst` against msg[1]; `0x40062ab6` -> `0x40045614` when the fired track is
+the current one).
+
+### The flashes never went out: the port had no DMA timers
+
+`set_led(id, n)` (`0x40013784`) is not "on": it writes n into a per-id
+COUNTDOWN (`0x460ba9cc`, 136 longs), sets the bit in `0x460ba9ae` and
+flushes (`set_led_timed` `0x400136f4` adds to the counter instead).
+`0x4001387c` walks the table, decrements, clears the bit at zero and
+flushes; it runs in the task at `0x4005593c` (RTOS_FORK.md's "key-repeat
+timer"), which pends (`0x400007a4`) on `0x46c7e0e2` every pass -- and the
+ONLY signaller of `0x46c7e0e2` is the interrupt handler `0x40055cb8`
+(vector 0x61 = INTC0 source 33, installed at `0x40040482` from sys's
+init), which acknowledges by writing 2 to `0xfc074003`: DTER of **DMA timer
+1**. DTRR 68750, DTMR 0x1d (bus/16, restart, reference interrupt) =
+68751 * 16 / 132 MHz = 8.333 ms, 120 Hz. Every second tick the same handler
+posts `0x01` to the UI queue `0x460d1664` and `0x05` to sys (`0x40061e8e`):
+the firmware's 60 Hz UI and sys ticks. The port modelled no DMA timer
+(nothing under `0xfc07xxxx`; RTOS_FORK.md's vector table carried 0x61/0x62
+as "?"): the counters sat at 10, rows 0x22/0x23 at 0x55, the beat flash
+(`set_led(38, 3)` from `0x40056f2a`, once per beat) never ended, and
+neither tick ever ran -- 0 hits on `0x4001387c` and `0x40055cfe` over 2.5 s
+of play + stop (`ledtimer_before.out`).
+
+The port now carries the block (`periph.h` `DmaTimer`: DTIM0..3 at
+`0xfc070000 + 0x4000*n`, INTC0 sources 32+n, DTMR/DTXMR/DTER/DTRR/DTCR/
+DTCN, the 132 MHz internal bus clock -- DTRR2 = 132,000,000 with bus/1 is
+the firmware's own one-second constant, which is what pins it; gate section
+in `test_periph.cpp`). After (`ledtimer_final.out`, `after_final.out`):
+`0x4001387c` and the signal run 6 times per 50 ms (291 each in 2.4 s); the
+eight fired-track flashes `2201 2205 2215 2255 2301 2305 2315 2355` at PLAY
+are followed 83 ms later by `2200` / `2300` (10 ticks); the step-5 flash
+`2201` at 450 ms is gone by 550 ms; the beat LED shows as `2465` -> `2425`
+(3 ticks = 25 ms) every 500 ms; at 2.1 s the rows are `0c 00 00 00` (were
+`0c 00 55 55`); STOP sends `2300 3648 2901 2b01 2200` and the countdown
+table reads all zero. 52 LED-row messages over 2.1 s (were 27). The chase
+itself is unchanged (18 steps, 125.1-125.2 ms, 0 of 84 slices off the STEP
+byte), and identical with `--dsp` (`after_final_dsp`).
+
+What else the block is, measured, and running now:
+- DTIM2: DTMR 0x13, DTRR 132,000,000, free-run: the one-second idle poll of
+  the MIDI note-length scheduler `0x400409f4` (mask `0x46c7e0de`, 128 slots,
+  3-byte messages into the UART0 ring `0x400b966c` through `0x40010bc8`; it
+  clears DTCN and reprograms DTRR itself, and is also forced through INTFRC
+  34). 6 fires per batch run.
+- DTIM3: DTMR 0x0b, bus/1, no interrupt: a free-running timestamp
+  (`0x4000169a` / `0x400016cc` in the host-port code, `0x40055b42`).
+- DTIM0: DTMR 7 = the DTIN0 pin, no interrupt: the MIDI RX ISR timestamps
+  0xF8 with it (`0x4001070a`). No pin model; it holds at 0. (The F8
+  estimator's 1,881,600-count floor is 11,289,600 / 6 -- 256*Fs over one
+  clock at 15 BPM -- a lead, not a measurement.)
+
+### Two consequences of the timers, and what the port does about them
+
+1. **The boot logo.** The LED/key-scan task's first loop
+   (`0x400559c6..0x40055b7a`) clears DTCN3 and animates the logo, yielding
+   to nothing, until `int(DTCN3 / 660000.0) > 559` -- 2.8 s. The all-ones
+   stub read as 4.29e9 (`0x400a6e38` converts unsigned) and the logo left on
+   its first pass, which is what every measurement in this tree was taken
+   with (the M6a gate at 205 ms, `ready` at sample 277,821). A faithful
+   count holds every boot on the logo for 2.8 s (~12 s of wall) and moves
+   every sample stamp. The port keeps the old behaviour as a documented
+   quirk (`Rtos::Quirks::skipBootLogo`, on by default: DTIM3 READS 2.8 s
+   ahead, a constant its other readers, which take differences, cannot
+   see); `--boot-logo` runs the logo. The report line says which is in
+   force.
+2. **The boot mount.** The sys tick's startup step (`0x40052200` ..
+   `jmp 0x400256b8` at `0x4007ec5a`) is the firmware's own "mount the last
+   set": it reads the set name at `0x100f8480` ~7,500 instructions after
+   the media case and, finding it empty, opened "NO SET IS MOUNTED! PLEASE
+   MOUNT ONE." over SET DATE/TIME (`0x400256ce`, then the 75x41 popup
+   through `0x400116aa`) and, after YES, the CHOOSE A SET browser -- so the
+   panel's boot YES closed the popup and the clock record never got written
+   (`smoke_dtim/smoke_boot.png`, `smoke_main.png`). The port used to write
+   the names after main's next spin, one tick too late; it writes them at
+   the media-case join now (`Rtos::loadProjectLive`), the firmware mounts
+   the set itself (`0x400255ec`, no popup), and the load is still the one
+   the port posts (`0x400907da` once). The set mount reads the card as the
+   firmware does: 10285 ATA commands / 42926 sectors per boot (were 5395 /
+   22714); boot + load is 37.5 s of wall (was 21 s) and play runs at ~319 ms
+   of emulated time per wall second (was 358). `--names-early` (O7b) now
+   means two loads (11932 ATA commands).
+
+### Before / after (matrix PLAY, `frame on`, OTLIVE as saved, trigs poked on steps 1/5/9/13 of track 1)
+
+| | before (`B_none`, `ledtimer_before`) | after (`after_final`, `ledtimer_final`) |
+|---|---|---|
+| running light | chases, 125.1-125.2 ms per step | same |
+| fired-track flashes at PLAY | `2201 2205 2215 2255 2301 2305 2315 2355`; rows 0x22/0x23 = 0x55 through STOP and after | the same eight, then `2200` / `2300` 83 ms later |
+| step-5 flash (track 1) | `2201` at 450 ms, stays | `2201` at 450 ms, `2200` by 550 ms |
+| beat LED | `2903` once at PLAY | `2903`, then `2465` / `2425` every 500 ms (25 ms on) |
+| `0x4001387c` / `0x40055cfe` hits | 0 / 0 | 120 Hz (291 each over 2.4 s) |
+| rows at 2.1 s | `0c 00 55 55` | `0c 00 00 00` |
+| STOP | `2000 2901 2b01` | `2300 3648 2901 2b01 2200` (the last flash cleared) |
+| LED-row messages over 2.1 s | 27 | 52 |
+| batch `--sequencer` cross-check | posts 0xff / 0x01 / 0xff at samples 277,993.9 / 300,023.1 / 322,074.7 | the same three, 139.8 samples earlier (277,854.1 / 299,883.3 / 321,935.0), mask 0xff00 -> 0 clear by clear (`batch_final.log`) |
+
+### What changed
+
+- `panel_server.py`: `_before_play` and `poke_trig` no longer call
+  `activate_tracks`; PLAY answers `active=[0, 0, 0, 0, 0, 0, 0, 0]` (the
+  bytes as saved), `poke_trig` reports `plays-free bytes`. The function
+  stays for scripts that want a plays-free track, its docstring corrected.
+  The shipped server's `/leds` chases end to end (`panel_e2e.py --port
+  8583`: `0c 30 c0 0003 000c ..`, the `5555` flashes gone within 100 ms,
+  `e2e_ready.png` = SET DATE/TIME closed, the main page).
+- The port: `DmaTimer` (`periph.h` / `periph.cpp`) with its gate section in
+  `test_periph.cpp`; INTC0 lines 32..35, the decode, `tickTimers`, the idle
+  skip's `nextExpiry`, a report line and `dtim1_fired` / `dtim2_fired` in
+  the gate JSON (`rtos.h` / `rtos.cpp` / `main.cpp`); `Quirks::skipBootLogo`
+  and `--boot-logo`; the names-at-the-join order in `loadProjectLive`.
+  `ctest` 7/7 (the M6a gate still at 205.39 ms, the serial prefix byte for
+  byte), `smoke.py --card` PASS on the final binary. `COLDFIRE_PORT.md` is
+  not this task's file: the O-milestone note for the DMA timers, the logo
+  quirk and the mount order is owed there.

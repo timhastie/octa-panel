@@ -522,6 +522,32 @@ namespace ot
 		write16(_addr + 2, static_cast<uint16_t>(_val));
 	}
 
+	bool Machine::mapped(const uint32_t _addr, const uint32_t _len)
+	{
+		for(uint64_t a = _addr; a < static_cast<uint64_t>(_addr) + _len; )
+		{
+			const auto a32 = static_cast<uint32_t>(a);
+			if(isPeripheral(a32))
+			{
+				++a;
+				continue;
+			}
+			const auto al = alias(a32);
+			if(const auto* const r = find(al, 1))
+			{
+				a += (r->base + r->data.size()) - al;	// skip to the region's end
+				continue;
+			}
+			if(autoByte(al, false))
+			{
+				++a;
+				continue;
+			}
+			return false;
+		}
+		return true;
+	}
+
 	void Machine::addWriteWatch(const uint32_t _begin, const uint32_t _end, WriteWatch _cb)
 	{
 		m_writeWatches.push_back({_begin, _end, std::move(_cb)});

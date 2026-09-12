@@ -86,7 +86,7 @@ namespace ot
 	inline constexpr uint32_t g_mainGainTable   = 0x80003c60;	// 10 longwords, gain:(-1-gain), read per voice by 0x4000cca4
 
 	inline constexpr uint32_t g_fwTransport   = 0x4009b964;	// (arg) transport start/stop; start posts to the UI queue
-	inline constexpr uint32_t g_fwStartTrack  = 0x4009b5c8;	// (track) promote a track to running
+	inline constexpr uint32_t g_fwStartTrack  = 0x4009b5c8;	// (track) the trig-key start of a PLAYS FREE track (pattern +0x54 set); returns at 0x4009b634 otherwise (12 Sep 2026)
 	inline constexpr uint32_t g_fwSeqSelect   = 0x400a1030;	// sequencer select(bank, pattern): LOAD PROJECT's last step
 	inline constexpr uint32_t g_fwSeqBank     = 0x800065bd;	// the sequencer's own playing bank byte
 	inline constexpr uint32_t g_fwSeqPattern  = 0x800065be;	// ... and playing pattern
@@ -102,6 +102,8 @@ namespace ot
 
 	inline constexpr uint32_t g_intc0 = 0xfc048000, g_intc1 = 0xfc04c000;
 	inline constexpr uint32_t g_pit0  = 0xfc080000, g_pit1  = 0xfc084000;
+	inline constexpr uint32_t g_dtim  = 0xfc070000;		// DTIM0..3, 0x4000 apart; INTC0 sources 32..35
+	inline constexpr double   g_busClockHz = 132e6;		// the internal bus clock the DMA timers count (CHIP.md)
 	inline constexpr uint32_t g_dspi  = 0xfc05c000;
 	inline constexpr uint32_t g_uartA = 0xfc064000, g_uartB = 0xfc068000;
 
@@ -137,8 +139,18 @@ namespace ot
 		// machine a second time with `clearTransmitInterrupt` false and
 		// requires the count to CHANGE, which is what makes the comparison
 		// evidence rather than decoration. Nothing but the test sets it.
-		struct Quirks { bool clearTransmitInterrupt = true; };
+		// `skipBootLogo` (12 Sep 2026, with the DMA-timer block): the boot-logo
+		// animation times itself on DTIM3 and holds the CPU for 2.8 s of bus
+		// clock; the all-ones stub it replaced made the logo leave on its
+		// first pass, and every measurement in the tree was taken that way.
+		// On by default so they stand: DTIM3 reads 2.8 s ahead
+		// (DmaTimer::setBias, applied at install). `--boot-logo` runs the logo.
+		struct Quirks { bool clearTransmitInterrupt = true; bool skipBootLogo = true; };
 		void setQuirks(const Quirks& _q) { m_quirks = _q; }
+		const Quirks& quirks() const { return m_quirks; }
+		// 560 * 660,000: the logo loop's own units (DTCN3 / 660000.0, i.e. 5 ms
+		// of the 132 MHz bus) one past its `cmpil #559` at 0x40055b74.
+		static constexpr uint32_t g_bootLogoCounts = 369600000;
 
 		// Install the models over the peripheral window and SEED them by
 		// replaying every write the boot made into the stub. Route A's
@@ -249,6 +261,16 @@ namespace ot
 		// posts to the UI queue, and FW_START_TRACK(t) writes a per-track
 		// state byte directly. Neither has a wait primitive on its path, so
 		// both are safe under callAsMain.
+		// ⚠️ 12 Sep 2026 (KEYMAP.md "the trig-row running light"): pattern
+		// +0x54 + 2330·t is the per-track PLAYS FREE flag, not an "active"
+		// flag. FW_TRANSPORT(0) sets up every track whose byte is ZERO
+		// (0x4009bc76; a set byte skips the track), and FW_START_TRACK(t) is
+		// the trig-key path that starts a track whose byte is SET (0x4009b630).
+		// With the fixture's bytes all clear the eight calls below return at
+		// 0x4009b634 having done nothing -- the trigs fire from FW_TRANSPORT
+		// alone -- and setting the bytes before PLAY (the panel's
+		// activate_tracks) is exactly what stops the sequencer from playing
+		// any track: no step handler, no trigs-fired note, no trig LEDs.
 		bool startTransportLive();
 
 		// Set a trig on track 1 at `step` (1-64) in whichever bank PART_PTR
@@ -335,6 +357,10 @@ namespace ot
 		double sample() const { return m_sample; }
 		double ms() const { return m_sample / g_sampleHz * 1000.0; }
 		uint64_t pit0Fired() const { return m_pit0.fired(); }
+		// DTIM1 is the LED countdown's 120 Hz clock, DTIM2 the soft-timer
+		// dispatcher's one-second delay (periph.h, DmaTimer).
+		const DmaTimer& dtim(size_t _n) const { return m_dtim[_n & 3]; }
+		uint64_t dtimFired(size_t _n) const { return m_dtim[_n & 3].fired(); }
 		uint64_t frameCount() const { return m_frameCount; }
 		bool framePending() const { return m_framePending; }
 		const Intc& intc0() const { return m_intc0; }
@@ -390,6 +416,13 @@ namespace ot
 		size_t seeded() const { return m_seeded; }
 		size_t serialSent() const { return m_uart64.tx().size() + m_uart68.tx().size(); }
 		const std::vector<uint8_t>& serialTxA() const { return m_uart64.tx(); }
+		// The panel's own wire, both ways, for a driver outside the run loop
+		// (main.cpp's --interactive): `uartA().rxPush(row); rxPush(mask)` is a
+		// matrix report, `serialTxA()` past a cursor is what the panel would
+		// have drawn. And the DSPI, for its RTC.
+		Uart& uartA() { return m_uart64; }
+		Dspi& dspi() { return m_dspi; }
+		bool frameOn() const { return m_frame; }
 		const std::vector<uint8_t>& serialTxB() const { return m_uart68.tx(); }
 		size_t serialA() const { return m_uart64.tx().size(); }
 		size_t serialB() const { return m_uart68.tx().size(); }
@@ -428,6 +461,7 @@ namespace ot
 		double m_sample = 0.0;
 
 		Pit m_pit0, m_pit1;
+		DmaTimer m_dtim[4] = {{"DTIM0", g_busClockHz}, {"DTIM1", g_busClockHz}, {"DTIM2", g_busClockHz}, {"DTIM3", g_busClockHz}};
 		Edma m_edma;
 		Intc m_intc0, m_intc1;
 		Uart m_uart64{"UART@fc064000", g_uartA}, m_uart68{"UART@fc068000", g_uartB};

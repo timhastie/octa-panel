@@ -2792,6 +2792,166 @@ unit, not a ceiling. Only the burn sweep measures the ceiling.
   --dsp --main-level 64 --audio-in tones --dsp-stopwatch 0:50d:50e     # core 0 FX2 calls
 ```
 
+## Milestone O14i — `--interactive`: the port as the panel's emulator, with a real-time clock (11 Sep 2026, branch `panel-ui`)
+
+The virtual front panel (`tools/panel`) drives route A one key at a time:
+push `<row> <mask>` into UART A's receive queue, run 50 ms, decode what the
+firmware sent the panel. `--interactive` gives the port the same surface
+over a pipe, so the panel (or any script) can drive it instead of the
+Python emulator without a change of contract. The boot, the mount and the
+load are the batch code paths, unchanged, flag for flag; the loop starts
+where the batch reports would have, and `quit` returns before them.
+
+### The protocol (`main.cpp`, `serveInteractive`)
+
+```
+out/emu/ot_emu --interactive --image ... [--card IMG --mount --set S --project P] [--dsp] [--frame] [...]
+```
+
+boots exactly as today, prints one line `ready sample=<double> frames=<u64>`
+to stdout, then reads one command per line from stdin and answers one line
+per command, flushed. Integer arguments are decimal or `0x..` -- a leading
+zero is NOT octal (`key 0x26 08` is mask 8; the first cut parsed with
+`strtoull` base 0, so it answered `err usage` and `010` meant 8 -- fixed 11
+Sep 2026, later the same day); `run`'s ms is any non-negative decimal
+(`50`, `50.0`, `1e+03` as the panel's `:g` prints it); hex payloads
+lowercase, no spaces.
+
+| command | reply | does |
+|---|---|---|
+| `run <ms>` | `ok sample= frames= stop=<time\|gate\|fault\|illegal>` | `Rtos::run(ms, untilGate=false)`, idle skip included |
+| `key <row> <mask>` | `ok` | `Uart::rxPush(row); rxPush(mask)` into UART A; the receive interrupt follows `Uart::irq()` |
+| `knob <row> <delta>` | `ok` | row, then `delta & 0xff` (signed detent delta) |
+| `tx` | `tx <hex>` | UART A's transmit bytes since the previous `tx` (the first answers everything since boot: the panel's whole screen is in it) |
+| `peek <addr> <len>` | `peek <hex>` | `len` 1..4096; `Machine::mapped` first -- an unmapped address answers `err` instead of growing a zero page |
+| `poke <addr> <hex>` | `ok` | same mapping rule |
+| `frame on\|off` | `ok` | `Rtos::setFrame`; with `--dsp` the DSP-driven edge stays as configured (`frame on` is what arms it) |
+| `status` | `status sample= ms= frames= frame= idle= wall=` | `wall` = seconds of wall clock spent INSIDE `run` since ready |
+| `quit` | `ok` | exit 0 |
+
+Anything else answers `err <message>` and the loop keeps serving -- an
+empty line, an unknown word, the wrong number of arguments (`tx`, `status`
+and `quit` take none: `tx extra` / `status now` / `quit please` answer
+`err usage: ...` instead of ignoring the word, as the first cut did), a
+number out of range or with a stray character; EOF on stdin exits 0.
+Measured 11 Sep 2026: 33 malformed lines all answer `err`, `key 0x26 08` /
+`0x26 010` / `38 0X1A` / `knob 0x30 -3` land `26 08` / `26 0a` / `26 1a` /
+`30 fd` in UART A (read back through a peek of its data register), and
+the queue is empty after the rejected ones. `run` is the only command that costs
+emulated time. A `peek`/`poke` of a peripheral register is a real bus
+access (a peek of UART A's data register consumes a received byte).
+
+### ✅ The RTC on the DSPI (`periph.h`, `Dspi`)
+
+Found 10 Sep 2026 under route A (`panel_server.install_rtc`), ported here:
+on DSPI chip-select 2 the far end is a DS1390-style SPI real-time clock.
+PUSHR is CONT (bit 31) | PCS (bits 21-16) | data (bits 15-0); the firmware
+reads one register per transaction, `<reg> 00` with CONT held between the
+two frames: 0x01 sec, 0x02 min, 0x03 hour, 0x04 weekday (1 = Monday), 0x05
+date, 0x06 month, 0x07 year, all BCD, plus 0x00 hundredths and 0x0e status,
+and one write `9e 07` at boot. Transactions are delimited by CONT, not by
+counting frames (a boot-time one is three frames). Every other chip select
+keeps the loopback (reply 0); on chip-select 2 the reply is the clock's
+time, and a written register is remembered and answered back from then on
+(the dialog's own SET sticks; that register no longer advances).
+
+**`--rtc host|off|<epoch>`, and OFF is the batch default** (11 Sep 2026,
+later the same day, after the verifier's diff). The first cut answered the
+host clock unconditionally, in the batch too, and that broke the repo's
+own oracle rule: the standard card-loaded batch (`--card otlive.img
+--mount --set OTLIVE --project PROJECT --ms 1000 --serial-out --golden`)
+had byte-identical stdout but its `serial_a` differed from the pre-RTC
+binary at byte 5141 of 7325 (158 bytes: the dialog's date), two runs of
+the same binary seconds apart differed from each other (44 bytes from
+5211: the seconds), `oracle.py` on the two goldens exited 1 with `DIFFERS
+serial_a`, and route A's stock `emu_rtos.Dspi` still answers 0 (only
+`panel_server.install_rtc` has the model) -- so a route-A-vs-port oracle
+on any loaded project reported a false fatal serial divergence. Now
+`Dspi::RtcClock` is `Off` unless `--interactive` (then `Host`), and
+`--rtc` picks explicitly (`main.cpp`, wired through `Dspi::setRtcClock`
+before `Rtos::install`):
+
+| `--rtc` | chip-select 2 | the dialog, OTLIVE loaded (looked at) | YES stores at `0x80000080` |
+|---|---|---|---|
+| `off` (the batch default) | the loopback: reply 0, nothing remembered -- the pre-RTC `Dspi::write`, byte for byte | `SUN 2000-00-00 00:00:00` | `07d0 00 00 00 00 00` |
+| `host` (the `--interactive` default) | DS1390 registers from the host's local time | `FRIDAY 2026-09-11 20:58:15` (`otlive_boot.png`) | `07ea 09 0b 14 3a 0f` |
+| `<epoch>` (seconds since 1970) | the same registers from that instant, decoded as UTC and frozen -- the same dialog on every machine, every run | `--rtc 1000000000`: `SUNDAY 2001-09-09 01:46:40` | `07d1 09 09 01 2e 28` |
+
+A non-default mode prints one `rtc        :` line in the boot log; the
+default batch prints nothing. Measured after the fix, the same batch
+invocation, the fixed binary run twice: `serial_a` is byte-identical to
+the pre-RTC binary's and run to run (`cmp` silent, 7325 bytes), stdout
+identical (output paths aside), `oracle.py` base-vs-fixed and
+run-vs-run both `8 compared field(s) agree`, exit 0; 19.9 s wall.
+
+Under `--interactive` (`out/_agents/port/smoke.py --card
+out/_agents/port/otlive.img`, `otlive_boot.png`): the SET DATE/TIME
+dialog the boot opens reads **FRIDAY / 2026-09-11 / 20:58:15**, the host
+clock at the time, over `LAST SET: 0000-00-00 00:00:00`; before this (and
+in the batch, still) it reads 2000-00-00. YES writes the 7-byte clock
+record at RAM `0x80000080` as **u16 year, u8 month, day, hour, minute,
+second, binary** -- `07ea 09 0b 14 3a 0f`, the boot-time read, 17 s behind
+the host by the time YES lands -- and draws DATE/TIME STORED
+(`otlive_main.png`). `ctest` still passes 7/7: the rtos test's 4831-byte
+serial prefix ends before the dialog's date is drawn (and the tests run
+the batch default, the loopback).
+
+### ✅ Speed, OTLIVE loaded, frame on (`out/_agents/port/measure.py`, 11 Sep 2026)
+
+The M1 that runs the port; boot + load 19.2-19.3 s wall to `ready`
+(277,821 samples = 6.3 s emulated). Tracks activated by poking pattern +84
++ 2330·t := 1 (pattern base = PART_PTR `[0x46c82456]` + CUR_PATTERN
+`[0x80000004]` × 0x8ed8, here 0x400e21e0 + 0), CLOCK RECEIVE bit clear
+(it already was), PLAY as the matrix key `0x25 0x01` / `0x25 0x00`.
+
+| edge | idle, emulated ms per wall s | playing, emulated ms per wall s | emulated ms per 16th | wall s per 16th | sequencer |
+|---|---|---|---|---|---|
+| `--frame` (16-sample timer, `frame on` after the load) | 357 (5000 ms in 13.99 s; 13,782 frames = 2756/emulated s) | 356 (6008 ms in 16.88 s; 16,559 frames) | **125.2** (48 steps) | **0.352** | ✅ runs: the tick byte `0x800065b6` changed in 60/60 100-ms slices, the step byte 0..15 wraps every 2 s |
+| `--dsp` (the cores' bank word is the edge; `frame on` arms it) | 134 (5000 ms in 37.36 s; 13,781 frames) | 132 (6007 ms in 45.43 s; 16,557 frames) | **125.2** (48 steps) | **0.946** | ✅ runs, identically: tick byte changed in 60/60 slices, same step trace; boot + load 30.3 s wall (the cores run through the boot) |
+| `--dsp --frame-timer` (the cores run, the 16-sample timer is the edge) | 133 (5000 ms in 37.50 s; 13,782 frames) | 134 (6008 ms in 44.68 s; 16,559 frames) | **125.2** (48 steps) | **0.931** | ✅ runs: tick byte changed in 60/60 slices, same step trace; the timer's frame count (13,782, as `--frame`) at the cores' cost (boot + load 30.6 s); `out/_agents/port/dsptimer_measure.txt` |
+
+Nominal at 120 BPM is 20.8 ms per tick and 125 ms per 16th, so under the
+timer edge the port's sequencer runs at the firmware's own rate in emulated
+time -- every one of the 2756 frame interrupts per emulated second is
+delivered (the CPU is 3990 instructions per sample and the frame handler
+fits). Route A at the same point delivers ~414 of them (`KEYMAP.md` "PLAY
+through `/key`": ~840 emulated ms per step, ~15 wall s per step at 54-59
+emulated ms per wall second); the port is **43x faster per wall second of
+play and 6.7x closer to real time** on top of that. Idle with the frame
+clock on costs the same as playing -- the frame handler is the load, not
+the sequencer -- and `status idle=` shows the idle skip still runs between
+frames (37,383 skips over the 5 s).
+
+### What it does not do
+
+- Nothing paces the receive bytes: a `key` lands both bytes at once, and
+  the firmware's own double-tap and long-press timers see whatever spacing
+  the client's `run`s give them (a tap is row+mask, ~60 ms, row+0, ~100 ms
+  -- `smoke.py`'s `tap`).
+- `run` blocks the pipe for its whole length; there is no interrupt, and a
+  `fault`/`illegal` stop is permanent.
+- Only UART A is exposed; the LED bitmap and levels, the LCD, are the
+  client's to decode (`tools/panel/panel_link.py`).
+- The sequencer-to-UI "trigs fired" message and the trig-row running light
+  are the same open item as under route A (`KEYMAP.md`); the LCD position
+  bar under the BPM redraws (8639 panel bytes over 6 s of play) but the trig
+  LEDs do not chase.
+- A written RTC register freezes; nothing advances it or rolls it over,
+  and a pinned `--rtc <epoch>` is a constant: its seconds do not advance
+  with emulated time (reproducibility over realism, by design).
+- The batch does not read the RTC at all unless told to (`--rtc host`):
+  a `--golden`/`--serial-out` capture past the dialog draw (~400 ms) is
+  only reproducible because of that.
+
+**Reproduce:** `.venv/bin/python3 out/_agents/port/smoke.py --card
+out/_agents/port/otlive.img` (boot, ready, the protocol's error and
+argument-parsing checks, YES, MIXER, tx -> PanelLink -> PNG, PLAY, 3 s, tx,
+status, quit; ~28 s wall, exit 0; `--rtc off` / `--rtc 1000000000` pass
+the mode through and the clock-record check follows it) and `measure.py
+--tag frame` / `--tag dsp --dsp` / `--tag dsptimer --dsp --frame-timer`.
+The card image is `stage_card.py` over `out/_projects/otlive/OTLIVE/PROJECT`
+with its AUDIO pool (`--audio` per WAV, options before the positionals).
+
 ## What is NOT here yet
 
 - **The rest of the peripherals.** The eDMA with its completion-timing rules
@@ -2837,3 +2997,37 @@ disagreement between the two emulators is a finding, not a nuisance, and the
 one to trust is whichever can point at a firmware constant that only makes
 sense one way (`RTOS_FORK.md` §10.16's reciprocal tables are the worked
 example).
+
+
+## Milestone O14j — the DMA timers, and the trig-row running light ✅ (12 Sep 2026)
+
+The sequencer's running light never showed under any emulator. Two causes,
+neither in the DSP path (identical LED timelines with `--frame` and `--dsp`):
+
+- **Pattern byte +84 + 2330·t is PLAYS FREE, not "active".** `FW_TRANSPORT(0)`
+  (the PLAY key, `0x4009bc76`) sets a track up only while that byte is ZERO;
+  `FW_START_TRACK` (`0x4009b630`) is the trig-key start of a track whose byte
+  is SET. The panel used to set the byte on all eight tracks before PLAY
+  ("activate"), which is exactly what silenced the sequencer; the fixture
+  project plays as saved with the bytes left clear. The "trigs fired" note is
+  SYS command 22 (handler `0x400622da` = table[21] of the 78-entry sys
+  dispatcher at `0x40061cfa`), built by the frame builder at
+  `0x4000c832/0x4000c858`, drawn by `0x40043fdc` as timed `set_led` flashes;
+  the running light follows the UI's CURRENT track (`0x100b14cc`).
+- **The LED countdowns need the MCF5445x DMA timers.** `set_led(id, n)`
+  (`0x40013784`) is a countdown of n ticks decremented by `0x4001387c` in the
+  task pending on `0x46c7e0e2`, whose only signaller is the DMA-timer-1
+  interrupt (vector `0x61`, DTRR 68750 / DTMR 0x1d = 8.333 ms at the 132 MHz
+  bus; every second tick also posts 0x01 to the UI queue and 0x05 to sys). The
+  port had no `0xfc07xxxx` model: flashes never cleared, LEDs 9-16 stayed lit.
+  `DmaTimer` (periph.h/.cpp: four channels at `0xfc070000 + 0x4000·n`, INTC0
+  sources 32-35, DTMR/DTXMR/DTER/DTRR/DTCR/DTCN, restart and free-run; gated in
+  `test_periph.cpp`) fixes it. Cost: the firmware's own boot mount now runs
+  (boot + fixture load 37.5 s wall, was 21 s; `--boot-logo` restores the
+  faithful logo wait, `Rtos::Quirks::skipBootLogo` is the default) and play is
+  ~11% slower from the 60 Hz UI/sys ticks. Batch stamps move ~140 samples
+  earlier than pre-timer logs. DTIM0 counts the (unmodelled) DTIN0 pin.
+
+Measured after: the lit trig pair equals the STEP byte `0x800065b5` in 84/84
+25 ms slices at 125.1-125.2 ms per step (120 BPM); the eight fired-track
+flashes at PLAY clear 83 ms later; STOP leaves the LED table all zero.

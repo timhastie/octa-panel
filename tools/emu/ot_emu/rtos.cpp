@@ -67,6 +67,12 @@ namespace ot
 		m_intc0.addLine(1, [this] { return m_frame && m_framePending; });
 		for(uint32_t ch = 0; ch < 16; ++ch)
 			m_intc0.addLine(8 + ch, [this, ch] { return m_edma.irq(ch); });
+		// INTC0 sources 32..35 = DTIM0..3. Source 32 is also the forced
+		// sequencer tick (INTFRC, above); DTIM0 never asserts it -- the
+		// firmware runs DTIM0 without ORRI (DTMR 7). DTIM1 is the LED
+		// countdown's clock and DTIM2 the soft-timer dispatcher's (periph.h).
+		for(uint32_t n = 0; n < 4; ++n)
+			m_intc0.addLine(32 + n, [this, n] { return m_dtim[n].irq(); });
 	}
 
 	uint32_t Rtos::curTcb()
@@ -80,6 +86,11 @@ namespace ot
 		if(_addr >= g_intc1 && _addr < g_intc1 + 0x100) { _out = m_intc1.read(_addr - g_intc1, _size); return true; }
 		if(_addr >= g_pit0 && _addr < g_pit0 + 0x10)    { _out = m_pit0.read(_addr - g_pit0, _size, m_sample); return true; }
 		if(_addr >= g_pit1 && _addr < g_pit1 + 0x10)    { _out = m_pit1.read(_addr - g_pit1, _size, m_sample); return true; }
+		if(_addr >= g_dtim && _addr < g_dtim + 4 * 0x4000 && ((_addr - g_dtim) & 0x3fff) < 0x10)
+		{
+			_out = m_dtim[(_addr - g_dtim) >> 14].read((_addr - g_dtim) & 0xf, _size, m_sample);
+			return true;
+		}
 		if(_addr >= g_dspi && _addr < g_dspi + 0x100)   { _out = m_dspi.read(_addr - g_dspi, _size); return true; }
 		if(_addr >= Edma::g_base && _addr < Edma::g_tcd + 16 * 32) { _out = m_edma.read(_addr, _size); return true; }
 		if(m_card && _addr >= AtaCard::g_base && _addr < AtaCard::g_base + AtaCard::g_window)
@@ -117,6 +128,8 @@ namespace ot
 		else if(_addr >= g_intc1 && _addr < g_intc1 + 0x100) m_intc1.write(_addr - g_intc1, _size, _val);
 		else if(_addr >= g_pit0 && _addr < g_pit0 + 0x10) m_pit0.write(_addr - g_pit0, _size, _val, m_sample);
 		else if(_addr >= g_pit1 && _addr < g_pit1 + 0x10) m_pit1.write(_addr - g_pit1, _size, _val, m_sample);
+		else if(_addr >= g_dtim && _addr < g_dtim + 4 * 0x4000 && ((_addr - g_dtim) & 0x3fff) < 0x10)
+			m_dtim[(_addr - g_dtim) >> 14].write((_addr - g_dtim) & 0xf, _size, _val, m_sample);
 		else if(_addr >= g_dspi && _addr < g_dspi + 0x100) m_dspi.write(_addr - g_dspi, _size, _val, _replay);
 		else if(_addr >= Edma::g_base && _addr < Edma::g_tcd + 16 * 32) m_edma.write(_addr, _size, _val, _replay);
 		else if(m_card && _addr >= AtaCard::g_base && _addr < AtaCard::g_base + AtaCard::g_window)
@@ -208,6 +221,7 @@ namespace ot
 		if(m_quirks.clearTransmitInterrupt)
 			for(auto* u : {&m_uart64, &m_uart68})
 				u->clearTransmitInterrupt();
+		m_dtim[3].setBias(m_quirks.skipBootLogo ? g_bootLogoCounts : 0);
 
 		installHostPortMover();
 
@@ -382,6 +396,8 @@ namespace ot
 	{
 		m_pit0.advance(m_sample);
 		m_pit1.advance(m_sample);
+		for(auto& t : m_dtim)
+			t.advance(m_sample);
 		if(m_frame && !m_frameFromDsp)
 			while(m_sample >= m_nextFrame)
 			{
@@ -440,6 +456,15 @@ namespace ot
 		{
 			double e;
 			if(p->nextExpiry(e) && (!any || e < best))
+			{
+				best = e;
+				any = true;
+			}
+		}
+		for(const auto& t : m_dtim)
+		{
+			double e;
+			if(t.nextExpiry(e) && (!any || e < best))
 			{
 				best = e;
 				any = true;
@@ -799,12 +824,29 @@ namespace ot
 		// into a measurement. Waiting for the join point makes the order a
 		// choice; `_namesEarly` takes the other one deliberately.
 		if(!_namesEarly)
+		{
 			out.mediaCaseSeen = runToPc(g_mediaCaseJoin, 2000.0) == Stop::Gate;
+			// ⚠️ 12 Sep 2026, with the DMA timers modelled: the names go in AT
+			// the join, not after main's next spin. The sys tick (DTIM1's
+			// handler posts sys command 5 at 60 Hz) is already queued behind
+			// the media case, and its startup step (0x40052200 .. `jmp
+			// 0x400256b8` at 0x4007ec5a) is the firmware's own "mount the
+			// last set": it reads g_setName ~7,500 instructions after the
+			// case ends. Empty, it opens "NO SET IS MOUNTED! PLEASE MOUNT
+			// ONE." and the CHOOSE A SET browser (measured: 0x400256ce, then
+			// 0x400116aa with a 75x41 box); named, it mounts the set
+			// (0x400255ec) and nothing pops. The media case's own reload
+			// check has passed by then, so the load is still the one posted
+			// below (1 pass of 0x400907da); the set mount itself now reads the
+			// card as the firmware does: 10285 ATA commands / 42926 sectors per
+			// boot where the old order read 5395 / 22714, ~16 s more wall.
+			// Before the timers that tick never came and the order did not
+			// matter; `setNames` is plain memory writes and needs no spin.
+			setNames(_set, _project);
+		}
 
 		if(runToMainSpin() != Stop::Gate)
 			return out;
-		if(!_namesEarly)
-			setNames(_set, _project);
 		// Route A's own watch: the engine's BANK= parse is the write to
 		// PART_PTR made at 0x40087d44, and it is the ONLY thing that tells
 		// the saved bank apart from every other writer of that word (`sys`'s
@@ -1146,6 +1188,7 @@ namespace ot
 
 		f << " \"gate_ms\": " << ms() << ",\n";
 		f << " \"pit0_fired\": " << pit0Fired() << ",\n";
+		f << " \"dtim1_fired\": " << dtimFired(1) << ", \"dtim2_fired\": " << dtimFired(2) << ",\n";
 		// THE SERIAL STREAM, not its length -- see route A's golden writer and
 		// the O5 section of COLDFIRE_PORT.md. ⚠️ The COUNT tracks the `ips`
 		// knob (5731 at 3900/3990, 4831 at 4100/4200/4300) because the

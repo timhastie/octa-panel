@@ -66,6 +66,98 @@ namespace ot
 		uint64_t m_fired = 0;
 	};
 
+	// ---- DMA timers --------------------------------------------------------
+	// MCF5445x DTIM0..3 at 0xfc070000 + 0x4000*n, INTC0 sources 32+n (vectors
+	// 0x60..0x63). DTMR +0 (16 bits: RST, CLK, FRR, ORRI, PS), DTXMR +2, DTER
+	// +3 (write-1-to-clear), DTRR +4, DTCR +8, DTCN +0xc (any write clears the
+	// count). Counts the 132 MHz internal bus clock (CHIP.md) /1 or /16 (CLK),
+	// then /(PS+1). CLK = 3 is the DTIN pin, which has no model here: that
+	// channel holds at 0.
+	//
+	// ✅ Measured 12 Sep 2026 (KEYMAP.md "the trig-row running light", part
+	// 2): without this block every TIMED LED stayed lit. set_led(id, n) at
+	// 0x40013784 writes n into a per-id countdown (0x460ba9cc, 136 longs)
+	// and lights the bit; 0x4001387c decrements the table and clears bits at
+	// zero, from the task loop 0x4005595c that pends on 0x46c7e0e2; and
+	// 0x46c7e0e2 is signalled only by DTIM1's handler 0x40055cb8 (vector
+	// 0x61, installed at 0x40040482 from the sys task's init: DTRR 68750,
+	// DTMR 0x1d = bus/16, restart, reference interrupt -> 8.333 ms, 120 Hz).
+	// The same handler posts, every second tick, one message to the UI queue
+	// 0x460d1664 (0x01) and one to sys 0x460d17ae (0x05 -> 0x40061e8e), and
+	// acknowledges by writing 2 to DTER. What the firmware programs:
+	//   DTIM0  DTMR 7     DTIN0 pin, no interrupt: the MIDI RX ISR timestamps
+	//                     0xF8 with its count (0x4001070a). Holds at 0 here.
+	//   DTIM1  DTMR 0x1d  DTRR 68750: 120 Hz, the LED countdown + a 60 Hz post.
+	//   DTIM2  DTMR 0x13  DTRR 132,000,000: bus/1, free-run, interrupt: 1.000 s
+	//                     to the soft-timer dispatcher 0x400409f4 (mask
+	//                     0x46c7e0de), which clears DTCN and reprograms DTRR
+	//                     itself; the firmware also forces it via INTFRC 34.
+	//   DTIM3  DTMR 0x0b  bus/1, restart, DTRR never written, no interrupt: a
+	//                     free-running 132 MHz timestamp (0x4000169a, 0x40055b42).
+	// DTRR2 = 132,000,000 for a one-second delay is what pins the input clock
+	// (the PIT's 264e6 above is route A's knob, not this block's).
+	class DmaTimer
+	{
+	public:
+		enum : uint32_t { RST = 1, CLK_SHIFT = 1, CLK_MASK = 6, FRR = 8, ORRI = 16 };	// DTMR
+		enum : uint32_t { CAP = 1, REF = 2 };											// DTER
+
+		DmaTimer(const char* _name, double _busHz) : m_name(_name), m_busHz(_busHz) {}
+
+		const char* name() const { return m_name; }
+		// Counts per sample at the current DTMR; 0 when stopped or on DTIN.
+		double rate() const;
+		// The count the firmware would read at `_now`.
+		uint32_t count(double _now) const;
+		// Samples between reference events in restart mode: (DTRR+1)/rate.
+		double periodSamples() const;
+		bool irq() const { return (m_dter & REF) && (m_dtmr & ORRI); }
+		uint64_t fired() const { return m_fired; }
+		uint32_t dtmr() const { return m_dtmr; }
+		uint32_t dtrr() const { return m_dtrr; }
+
+		uint32_t read(uint32_t _off, uint32_t _size, double _now) const;
+		void write(uint32_t _off, uint32_t _size, uint32_t _val, double _now);
+
+		// Fire every reference match up to `_now`; returns how many.
+		uint32_t advance(double _now);
+
+		// The next reference match that will interrupt, if one is armed: what
+		// the run loop's idle skip may jump to. A timer without ORRI wakes
+		// nothing, so it is not offered.
+		bool nextExpiry(double& _out) const { _out = m_expiry; return m_armed && (m_dtmr & ORRI); }
+
+		// ⚠️ A DELIBERATE DEPARTURE, for DTIM3 only (Rtos::Quirks::skipBootLogo):
+		// counts added to what DTCN READS, never to the reference match. The
+		// boot-logo animation (0x400559c6..0x40055b7a, in the LED/key-scan
+		// task) clears DTCN3 and loops, yielding to nothing, until
+		// int(DTCN3 / 660000.0) > 559 -- 2.8 s of bus clock, the logo's time
+		// on screen. The all-ones stub this block replaced read as 4.29e9 and
+		// the logo left on its first pass; a faithful count keeps every boot
+		// on the logo for 2.8 s (~12 s of wall) and shifts every sample-stamped
+		// measurement in the tree by that much. DTIM3's other readers
+		// (0x4000169a, 0x400016cc: host-port timestamps) take differences of
+		// two reads, which a constant cannot change. `--boot-logo` turns it off.
+		void setBias(uint32_t _counts) { m_bias = _counts; }
+		uint32_t bias() const { return m_bias; }
+
+	private:
+		double modulus() const;		// DTRR+1 in restart mode, 2^32 otherwise
+		void freeze(double _now);	// bank the count so a rate change keeps it
+		void arm(double _now);		// when the count next equals DTRR
+		uint32_t reg32(uint32_t _off, double _now) const;
+
+		const char* m_name;
+		double m_busHz;
+		double m_rate = 0.0;			// counts per sample for the current DTMR (rate(), cached: the run loop asks advance() after every instruction)
+		uint32_t m_bias = 0;
+		uint32_t m_dtmr = 0, m_dtxmr = 0, m_dter = 0, m_dtrr = 0xffffffff;
+		double m_count0 = 0.0, m_t0 = 0.0;		// the count at sample m_t0
+		bool m_armed = false;
+		double m_expiry = 0.0;
+		uint64_t m_fired = 0;
+	};
+
 	// ---- UART --------------------------------------------------------------
 	// One of the serial blocks at 0xfc064000 / 0xfc068000, modelled from the
 	// firmware's own use of it (route A: handler 0x400109bc, ring writer
@@ -97,6 +189,17 @@ namespace ot
 		// 🟡 inferred from the storm, not measured.
 		void clearTransmitInterrupt() { m_imr &= ~1u; }
 
+		// The far end of the line sending a byte (the panel scanner's key and
+		// encoder reports, `<row> <mask>`): it queues behind whatever is
+		// unread and the receive interrupt follows from `irq()` -- source 27,
+		// deliverable once the firmware's driver has armed the mask's bit 1,
+		// which it does at boot. Route A's `rt.uart64.rx.extend(...)`
+		// (panel_server.key). ⚠️ Nothing paces it: two bytes pushed together
+		// are two RXRDY reads in a row, which is what the handler's loop does
+		// at any baud (11 Sep 2026, --interactive).
+		void rxPush(const uint8_t _b) { m_rx.push_back(_b); }
+		size_t rxPending() const { return m_rx.size(); }
+
 		uint32_t read(uint32_t _off, uint32_t _size);
 		void write(uint32_t _off, uint32_t _size, uint32_t _val, bool _replay);
 
@@ -120,18 +223,68 @@ namespace ot
 	// parks in that wait at 0x4001c50e and never reaches its init list, so no
 	// task is ever created and the M6a gate cannot pass (measured 7 Sep 2026,
 	// the first run of the O4 loop -- 401 dispatches, 0 creates, main pinned).
+	//
+	// ✅ THE RTC (11 Sep 2026, from panel_server.install_rtc, found 10 Sep):
+	// on chip-select 2 the far end is a DS1390-style SPI real-time clock. A
+	// PUSHR frame is CONT (bit 31) | PCS (bits 21-16) | data (bits 15-0); the
+	// firmware reads one register per transaction -- `<reg> 00`, CONT held
+	// between the two frames -- with regs 0x01 sec, 0x02 min, 0x03 hour,
+	// 0x04 weekday (1 = Monday: 4 draws THURSDAY, measured under route A),
+	// 0x05 date, 0x06 month, 0x07 year, all BCD; 0x00 hundredths and 0x0e
+	// status are read too, and one write `9e 07` (0x1e := 7) goes out at
+	// boot. Answering 0 to all of it is exactly the `2000-00-00 00:00:00`
+	// the SET DATE/TIME dialog shows; answering the host clock shows today.
+	// ⚠️ Transactions are delimited by CONT, NOT by counting frames: one
+	// boot-time transaction is three frames long. A write to a time
+	// register is remembered and answered back from then on (the dialog's
+	// own SET sticks for the session; that register no longer advances).
+	// Every other chip select keeps the loopback above, reply 0.
+	//
+	// ⚠️ OFF BY DEFAULT (11 Sep 2026, later the same day). With the RTC
+	// answering the wall clock, a `--serial-out`/`--golden` capture of any
+	// loaded project differed from the pre-RTC binary from byte 5141 of
+	// 7325 (the dialog's date) and from ITSELF run to run (44 bytes: the
+	// seconds), and route A's stock `emu_rtos.Dspi` still answers 0 -- so
+	// the route-A-vs-port oracle reported a false fatal serial divergence.
+	// The batch keeps the loopback (`Off`, reply 0, nothing remembered:
+	// the pre-RTC `write` to the byte); `--interactive` defaults to `Host`;
+	// `--rtc host|off|<epoch>` picks explicitly (main.cpp). A `Fixed` epoch
+	// is decoded as UTC and does not advance, so a pinned capture is the
+	// same on every machine and every run.
 	class Dspi
 	{
 	public:
 		enum : uint32_t { SR = 0x2c, PUSHR = 0x34, POPR = 0x38 };
+		static constexpr uint32_t g_rtcPcs = 2;
+		enum class RtcClock { Off, Host, Fixed };
 
 		uint32_t read(uint32_t _off, uint32_t _size);
 		void write(uint32_t _off, uint32_t _size, uint32_t _val, bool _replay);
+
+		// The RTC's view of "now": Off = chip-select 2 is the loopback (reply
+		// 0, the 2000-00-00 dialog, the default), Host = the host's local
+		// time, Fixed = `_epoch` seconds since 1970 as UTC, frozen.
+		void setRtcClock(const RtcClock _mode, const int64_t _epoch = 0) { m_rtcMode = _mode; m_rtcEpoch = _epoch; }
+		RtcClock rtcClock() const { return m_rtcMode; }
+		uint64_t rtcReads() const { return m_rtcReads; }
+		uint64_t rtcWrites() const { return m_rtcWrites; }
+		uint8_t rtcRegister(uint8_t _reg) const;
 
 	private:
 		std::vector<uint32_t> m_rx;
 		std::unordered_map<uint32_t, uint32_t> m_regs;
 		uint64_t m_pushed = 0;
+		// The transaction in flight: chip select, its first byte (bit 7 set
+		// = a write, low bits the first register), frames so far.
+		bool m_inTx = false;
+		uint32_t m_txPcs = 0;
+		uint8_t m_txFirst = 0;
+		uint32_t m_txFrames = 0;
+		std::array<uint8_t, 32> m_rtcWritten = {};
+		std::array<bool, 32> m_rtcHasWrite = {};
+		RtcClock m_rtcMode = RtcClock::Off;
+		int64_t m_rtcEpoch = 0;
+		uint64_t m_rtcReads = 0, m_rtcWrites = 0;
 	};
 
 	// ---- eDMA --------------------------------------------------------------
