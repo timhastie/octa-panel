@@ -134,7 +134,8 @@ EMAC-fixed Unicorn (`scripts/build_unicorn.sh`), `vendor/dsp56300` pinned to
   keep): out/emu/ot_emu.ref-1e76ac5 (pre-speed) and out/emu/ot_emu.ref-73c2815
   (end of Phase A, PGO).
   Speed bench: `OT_EMU=<bin> .venv/bin/python3 out/_agents/speed/bench.py
-  <tag> [--dsp]`. Diagnostics: OT_BURST=0 (old loop), OT_STEPFAST=0,
+  <tag> [--dsp [--dsp-rt]]` (macOS `sample` hangs on the rt process: put
+  out/_agents/jit-verify/stubbin on PATH). Diagnostics: OT_BURST=0 (old loop), OT_STEPFAST=0,
   OT_BURST_STATS=1. Never enable `rt.exact_clock()` on route A (100×).
 - LCD framebuffer in RAM (0x460d1f80) is NOT what the screen shows (page
   order rotates) — always render from the UART stream.
@@ -170,17 +171,27 @@ EMAC-fixed Unicorn (`scripts/build_unicorn.sh`), `vendor/dsp56300` pinned to
   push (not found in the matrix); trig LEDs 9-16 colour vs hardware.
 - Upstream octabam main has moved (recfix, PR #97/#129, Workbench); this fork
   is a 10 Sep clone — merging upstream is pending.
-- With the DSP cores (`--sound on`, the default) playback is ~0.2× real
-  time after Phase B (O16a exact micro-opts, O16b lazy batching of the pair
-  between ColdFire touch points: 168 → 205 emulated ms per wall s, audio
-  still byte-identical; O16d/e an opt-in worker thread `--dsp-thread 2` /
-  `OT_DSP_THREAD=2`, +9 %, deterministic, TSan-clean). What remains is the
-  DSP interpreter's own work (DSP::execOp): the two cores share memory and a
-  mailbox, so they cannot be split across threads without changing the
-  audio; the only route to real time with sound is the vendored JIT
-  (dsp56300), judged a rabbit hole (the host-stepped patch does not apply to
-  upstream HEAD; the pinned JIT faulted on interrupts). Cue out and core 1
-  are not captured; the crossfader and audio inputs have no panel path.
+- **Sound in real time (13 Sep 2026, O17/O17b, commits 15c54ac/02ace27):**
+  `--dsp-rt` runs both DSP56303 cores under the vendored dsp56300 JIT on
+  their own threads as WORKERS ON THE LOCKSTEP SCHEDULE — the ColdFire stays
+  master of emulated time and books DSP ticks; the workers run up to a
+  frame ahead but never past the due count; the one timing-assumptive point
+  of the firmware's frame protocol (core 0's bank-word write at P:0x73, read
+  by the handler with no ready check) is FENCED until the ColdFire has
+  finished the previous frame. Five JIT/library fixes + lock-free HDI08
+  rings + burst DMA live in tools/patches/dsp56300.patch (applies to the
+  pinned 3c01813f). Free-running cores were proven a dead end (the protocol
+  halts on a few samples of jitter). The panel spawns `--dsp-rt` with sound
+  on (fallback to lockstep `--dsp` with a note). Measured on the PGO binary:
+  **1208 emulated ms per wall s flat out with sound, paced 1.000× in the
+  panel (90 s PLAY, dropped 0), boot 7 s**; old modes byte-identical (strict
+  oracle 28/28). Audio vs the lockstep interpreter: same music, onset within
+  2 samples, ~1 dB quieter on the clipping OTLIVE fixture (the cores'
+  interleave), not the same samples. Diagnostics: `rtstatus`, `cfstatus`,
+  OT_RT_LEAD / OT_RT_FENCE / OT_RT_DOITER knobs; stalls are hunted with
+  out/_agents/rt-fence-build/stall_hunt.py. The fence/poll addresses are
+  payload A's (P:0x73/0x97/0x4b). Cue out and core 1 are not captured; the
+  crossfader and audio inputs have no panel path.
 - `.ot` slice files are not seeded onto the card with their samples; the pool
   is wiped and re-seeded at every server start (files added through the
   page survive only while that server runs, or if they are also in an
