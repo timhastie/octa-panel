@@ -14,16 +14,23 @@ open "out/Virtual Panel.app"
 ## What it does
 
 - Spawns `<repo>/.venv/bin/python3 tools/panel/panel_server.py --port 8563
-  [--project DIR --set SET --name NAME]` with `/opt/homebrew/bin` first on
-  `PATH`, stdout/stderr appended to `out/panel_app.log` (the app's own lines
-  are in the same file, prefixed `app:`).
+  [--card IMG] [--project DIR --set SET --name NAME]` with `/opt/homebrew/bin`
+  first on `PATH`, stdout/stderr appended to `out/panel_app.log` (the app's
+  own lines are in the same file, prefixed `app:`). With a card chosen
+  (below) the server boots that image as it is; the project arguments are
+  only given when the image has to be created.
 - Shows "Booting the firmware..." with the app-side phase until `GET /status`
   answers (polled every 500 ms), then loads `http://127.0.0.1:8563/`; the
   page itself shows the firmware phase (booting, loading project, ready).
 - If something already answers on the port when the app starts, it attaches
   to that server and leaves it running on quit.
 - The spawned server is terminated on quit, on window close and on
-  SIGTERM/SIGINT/SIGHUP to the app. Only `kill -9` of the app orphans it
+  SIGTERM/SIGINT/SIGHUP to the app (SIGTERM to the server, which handles
+  it since O19: `card flush` + `quit` to its child -- the child fsyncs the
+  card image before its `ok` -- and the card's sidecar written; measured
+  13 Sep 2026: the app gone 0.8 s after its SIGTERM with `server pid ...
+  stopped (signal 15)`, no server and no `ot_emu` on the card left, the
+  image not mounted). Only `kill -9` of the app orphans it
   (`pkill -f panel_server.py`). `kill -USR1 <app pid>` is File > Reload
   and `kill -USR2 <app pid>` File > Show Card Audio Folder, for scripts
   (the menus themselves need the Accessibility grant to drive).
@@ -58,7 +65,49 @@ open "out/Virtual Panel.app"
 
 ## Menus
 
-- **File > Open Project...** (cmd-O): a project folder saved on a unit;
+- **The card (13 Sep 2026, O19).** The unit's CF card is a file that
+  persists -- what you SAVE on the unit (PROJECT menu: FUNC + MIXER,
+  RIGHT, DOWN to SAVE, YES, YES) and the samples you put on the card are
+  there at the next launch; `tools/panel/README.md` "Your card" has the
+  whole story and the measurements.
+  - **File > New Card from Project...** (cmd-N): a project folder saved on
+    a unit (SET/PROJECT, as Open Project) -> the server creates
+    `out/cards/<Set>-<Project>.img` from it and its sibling AUDIO (once)
+    and boots it; the choice is remembered (UserDefaults `cardPath`) and
+    booted at every later launch. An image of that name that exists is
+    offered as it is (Open Existing -- what the unit saved stays) or
+    replaced (Replace deletes the `.img` and its `.json`).
+  - **File > Open Card...** (cmd-shift-O): an existing `.img` (`out/cards/`
+    first); its sidecar names the project, and a card without one is
+    booted into the first set/project the server finds on it.
+  - **File > Show Card in Finder**: reveals the `.img` (copy it to back the
+    card up; the `.json` beside it keeps the names).
+  - **File > Eject Card** (cmd-E) / **Insert Card** (the same item; the
+    title follows `/status card_ejected`, enabled with a persistent card
+    at phase `ready`, or while ejected): Eject asks first, then `GET
+    /card/eject?open=0` -- the server flushes, stops the child and mounts
+    the image on the Mac -- and once `/status` says `card_ejected` the
+    volume is opened in Finder (`/Volumes/OCTABAM`): copy samples into
+    `<SET>/AUDIO`, projects into `<SET>/`, or whole sets, as with a CF
+    card in a reader; the page shows the empty slot. Insert is `GET
+    /card/insert`: the server removes what macOS dropped on the volume,
+    detaches it and boots the unit again (~15 s). A detach refused (a
+    Finder window holding a file) is a sheet; the card stays ejected.
+  - With no card ever chosen (or after **Open Project (scratch card)...**,
+    which forgets the card), the old behaviour: the remembered project on
+    a fresh per-port image, nothing persists.
+  - `VIRTUAL_PANEL_CARD=<img>` boots that card for one launch (created from
+    the default project if missing; not remembered);
+    `VIRTUAL_PANEL_PORT_BIN=<bin>` passes `--port-bin` (a build of `ot_emu`
+    that knows `--card-rw` before `out/emu` is rebuilt). Measured 13 Sep
+    2026 (port 8598, `out/_agents/persist/`): the spawn line carried
+    `--port-bin ... --card .../OTLIVE-PROJECT.img`, `/status` read
+    `card_mode persistent, card_rw true` and the item logged `Eject Card,
+    enabled` at `ready` (+8 s); `/card/eject` from a script had the item
+    read `Insert Card, enabled` with `EJECTED at /Volumes/OCTABAM` in the
+    log, `/card/insert` brought it back to `Eject Card`; SIGTERM to the
+    app stopped the server and the child.
+- **File > Open Project (scratch card)...** (cmd-O): a project folder saved on a unit;
   `--set` is its parent folder's name, `--name` the folder's own. The server
   is restarted with it and the choice is remembered (UserDefaults
   `projectDir` under `io.octabam.virtual-panel`) for the next launch. When

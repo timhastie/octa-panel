@@ -66,6 +66,16 @@ namespace
 	//   status            -> status sample= ms= frames= frame=on|off idle= wall=
 	//   quit              -> ok            then exit 0
 	//
+	// The card (O19, 13 Sep 2026; needs --card, else `err no card`):
+	//
+	//   card status       -> card ok rw=0|1 path=<file> written=<sectors the firmware wrote>
+	//                             through=<sectors pwrite()n to the file> errors=<short writes>
+	//   card flush        -> card ok rw=0|1 through=<n> errors=<n>   fsync of the image file
+	//                             (a no-op without --card-rw: `rw=0`). With --card-rw every
+	//                             committed sector is already in the file before its WRITE
+	//                             completes; the flush is for a client that wants it on disk
+	//                             now. `quit`, EOF and the destructor fsync as well.
+	//
 	// Instruments over the pipe (12 Sep 2026, the trig-LED investigation:
 	// KEYMAP.md "the trigs-fired note"), the batch's --watch-pc / --watch-mem
 	// with the report on demand instead of at exit:
@@ -318,7 +328,7 @@ namespace
 		static void serveInteractiveMarker() {}
 	};
 
-	int serveInteractive(ot::Machine& _m, ot::Rtos& _rtos, ot::DspPair* _dsp)
+	int serveInteractive(ot::Machine& _m, ot::Rtos& _rtos, ot::DspPair* _dsp, ot::AtaCard* _card)
 	{
 		SelfProfiler prof;
 		if(const char* e = std::getenv("OT_SELFPROF"); e && std::atof(e) > 0.0)
@@ -576,8 +586,40 @@ namespace
 					reply("err usage: quit");
 					continue;
 				}
+				if(_card)
+					_card->flush();		// O19: the write-back file on disk before the exit
 				reply("ok");
 				return 0;
+			}
+			if(cmd == "card")
+			{
+				// O19: the card's write-back state (see the protocol above)
+				if(w.size() != 2 || (w[1] != "status" && w[1] != "flush"))
+				{
+					reply("err usage: card status | card flush");
+					continue;
+				}
+				if(!_card)
+				{
+					reply("err no card");
+					continue;
+				}
+				if(w[1] == "flush")
+				{
+					const bool ok = _card->flush();
+					std::snprintf(buf, sizeof buf, "card %s rw=%d through=%llu errors=%llu", ok ? "ok" : "fsync-failed",
+						_card->writeBack() ? 1 : 0, static_cast<unsigned long long>(_card->writtenThrough()),
+						static_cast<unsigned long long>(_card->writeErrors()));
+					reply(buf);
+					continue;
+				}
+				std::string line = "card ok rw=" + std::string(_card->writeBack() ? "1" : "0")
+					+ " path=" + (_card->writeBack() ? _card->writeBackPath() : std::string("-"))
+					+ " written=" + std::to_string(_card->sectorsWritten())
+					+ " through=" + std::to_string(_card->writtenThrough())
+					+ " errors=" + std::to_string(_card->writeErrors());
+				reply(line);
+				continue;
 			}
 			if(cmd == "run")
 			{
@@ -927,6 +969,7 @@ int main(int _argc, char** _argv)
 	std::string golden;
 	std::string cardImage;		// a FAT16 card image built by emu_rtos.stage_project
 	bool mount = false;			// post the card-mount request to the SYS task
+	bool cardRw = false;		// O19: --card-rw -- WRITE SECTORS go through to the image FILE (AtaCard::setWriteBack); the file is the card
 	std::string ataTrace;		// write every task-file access here, for diffing against route A
 	std::string periphTrace;	// every peripheral access over the load, for the same diff
 	std::string peeks;			// comma-separated hex addresses to print after the load
@@ -991,6 +1034,7 @@ int main(int _argc, char** _argv)
 		else if(a == "--golden" && i + 1 < _argc)	golden = _argv[++i];
 		else if(a == "--card" && i + 1 < _argc)		cardImage = _argv[++i];
 		else if(a == "--mount")						mount = true;
+		else if(a == "--card-rw")					cardRw = true;
 		else if(a == "--ata-trace" && i + 1 < _argc)	ataTrace = _argv[++i];
 		else if(a == "--periph-trace" && i + 1 < _argc)	periphTrace = _argv[++i];
 		else if(a == "--peek" && i + 1 < _argc)		peeks = _argv[++i];
@@ -1250,6 +1294,22 @@ int main(int _argc, char** _argv)
 			rtos.attachCard(*card);
 			rtos.setAtaTrace(!ataTrace.empty());
 			std::printf("card       : %s, %u sectors\n", cardImage.c_str(), card->totalSectors());
+			if(cardRw)
+			{
+				// O19: the file IS the card from here on -- every sector the
+				// firmware writes lands in it as the WRITE completes.
+				if(!card->setWriteBack(cardImage))
+				{
+					std::printf("card rw    : %s could not be opened for writing\n", cardImage.c_str());
+					return 1;
+				}
+				std::printf("card rw    : write-back on -- WRITE SECTORS go through to %s (O19)\n", cardImage.c_str());
+			}
+		}
+		else if(cardRw)
+		{
+			std::printf("card rw    : --card-rw needs --card\n");
+			return 2;
 		}
 		rtos.dspi().setRtcClock(rtcMode, rtcEpoch);
 		if(rtcMode != ot::Dspi::RtcClock::Off || !rtc.empty())
@@ -1663,7 +1723,7 @@ int main(int _argc, char** _argv)
 				std::printf("main level : sys command %u posted with %d -> gain table[0] = %#x%s (bit 0 of 0x8000004a = %u)\n",
 					ot::g_setMainLevelCase, mainLevel, g, g ? "" : " -- NOT FILLED", m.read8(0x8000004a) & 1);
 			}
-			return serveInteractive(m, rtos, dspPair.get());
+			return serveInteractive(m, rtos, dspPair.get(), card.get());
 		}
 
 		if(!watchPc.empty())

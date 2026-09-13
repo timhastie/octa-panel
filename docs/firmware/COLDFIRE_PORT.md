@@ -5833,3 +5833,139 @@ audio is unchanged**: `rtdrive.py --rt --seconds 4` on `otlive2.img` →
   runs never get there; nothing compares an interactive end report).
 - The `--dsp` lockstep mode shares every record here; it was checked for
   60 s of play (0.1x real time), not five minutes.
+
+## Milestone O19 — the card persists: `--card-rw` write-back, `card flush` / `card status` on the pipe; the panel boots a card file as it is ✅ (13 Sep 2026, branch `panel-ui`)
+
+The owner's words: *"if I save the project, but then quit the program, not
+only are all the samples I added to the flash gone, but my project is not
+saved, and I cannot continue my previous work."* Two causes, both in the
+code: `panel_server.py` rebuilt `out/_panel_card_<port>.img` from the
+fixture at every start (and wiped the per-port sample pool), and the port's
+`AtaCard` held the whole image in `m_img` — WRITE SECTORS landed in that
+vector and were never written back to the file, so the firmware's own SAVE
+PROJECT (which does write: 22,752 sectors on the OTLIVE fixture) went to
+RAM. The design that fixes both is the hardware's: **the CF card is a real,
+persistent file.**
+
+### What changed in the port (`card.h`, `card.cpp`, `main.cpp`)
+
+- `AtaCard::setWriteBack(path)` opens the image file `O_RDWR` and keeps the
+  descriptor; `commitSector` — after the copy into `m_img`, as before —
+  `pwrite()`s the same 512 bytes at the same offset, synchronously, before
+  the WRITE completes (`writtenThrough()` counts the sectors, `writeErrors()`
+  the short writes, never retried). Nothing is buffered on this side: after
+  a commit the bytes are the kernel's, so a `kill -9` of the child loses
+  nothing that was written. `flush()` is an `fsync`; the destructor fsyncs
+  and closes. Reads are from memory as they always were (the file is never
+  re-read); the class is copy-deleted.
+- `--card-rw` (needs `--card`, else `card rw : --card-rw needs --card`,
+  exit 2): after the card is attached, `setWriteBack(cardImage)` and one
+  boot-log line `card rw    : write-back on -- WRITE SECTORS go through to
+  <file> (O19)`. Without the flag the class and every line of output are
+  the O18 ones — the gate below.
+- Two interactive commands (`serveInteractive` now takes the card):
+  `card status` → `card ok rw=0|1 path=<file> written=<sectors the firmware
+  wrote> through=<sectors in the file> errors=<n>`; `card flush` → `card ok
+  rw=0|1 through=<n> errors=<n>` (fsync; `card fsync-failed ...` if it
+  fails); `err no card` without a card, `err usage: card status | card
+  flush` otherwise. `quit` flushes before its `ok`. EOF and a fault leave
+  the file as it is (already written through); SIGTERM/SIGKILL the same.
+
+### What changed in the panel (`panel_server.py`, `panel.html`, the app)
+
+- `--card <file.img>`: the image is booted **as it is** (no rebuild, no pool
+  wipe), the child spawned with `--card-rw` when the binary knows the flag
+  (`/status card_rw`; an older binary boots it read-only and says so in
+  `backend_note`). A missing file is created once from `--project` + its
+  sibling AUDIO + `--audio` — `build_card` as before — and a sidecar
+  `<file.img>.json` keeps the set/project names, the removals marked for
+  the next re-insert, the pool path; later starts read it (the firmware
+  does not reload its last project by itself in emulation: a bare boot of
+  the saved card, no `--mount`, leaves `0x100f8480`/`0x100f8378` zero with
+  the card ready, `out/_agents/persist/bare-boot` run). The names the
+  firmware holds are read at every flush and the sidecar follows a
+  PROJECT > CHANGE on the unit. Without `--card` the per-port path is
+  byte-for-byte what it was.
+- `card flush` after every action batch and every 3 s idle (`_card_flush`);
+  `_stop_child` = `card flush`, `quit`, kill — used by every reboot path
+  (respawn, re-insert, sound switch) so a stopped child never leaves the
+  file behind its memory. A SIGTERM handler in `main()` ends
+  `serve_forever` through the `finally` (flush, quit, sidecar) — Python's
+  default action killed the interpreter outright before, the app's README
+  said so.
+- The pool is `<file.img>.pool/`, never wiped. **RE-INSERT** on a
+  persistent card (`_commit_persistent`): flush + stop the child, `hdiutil
+  attach -imagekey diskimage-class=CRawDiskImage -nobrowse` (mounts the
+  builder's image as FDisk + DOS_FAT_16 at `/Volumes/<label>`;
+  `-mountpoint` answers "no mountable file systems" for it), copy the pool
+  into `<SET>/AUDIO` (VFAT long names by macOS), delete the marked files,
+  `card_clean` (`.fseventsd`, `.Spotlight-V100`, `.Trashes`, `._*`,
+  `.DS_Store`, `.metadata_never_index` — the volume is asked not to index or
+  log first), `hdiutil detach`, re-list, boot. Never a mount while the
+  child runs.
+- `Fat16Image`: a read-only walk of the image (MBR partition, BPB, the FAT,
+  8.3 + LFN entries, cluster chains) — `/samples` lists `<SET>/AUDIO` from
+  the file directly (`on_card: true`, the format from each file's first
+  16 KB through `sample_header`, which takes bytes now), `/card` the sets
+  and projects on it, and the sidecar-less card is booted into the first
+  set/project found.
+- `/card/eject` (flush, stop, mount browsable, `open` in Finder unless
+  `?open=0`; every action answers `ok: false` "the card is ejected", the
+  loop idles, nothing respawns) and `/card/insert` (clean, detach — `-force`
+  on a second try — re-list, boot); `/status` gains `card`, `card_mode`,
+  `card_rw`, `card_ejected`, `card_mount`, `project`. A server started on
+  a card the previous one left mounted detaches it first
+  (`card_mounted_at` from `hdiutil info -plist`).
+- `panel.html`: the ejected state only — the slot shows the card out, the
+  drawer says where the volume is and has INSERT CARD.
+- The app: File > New Card from Project… (`out/cards/<Set>-<Project>.img`,
+  remembered in `cardPath`, Open Existing / Replace when it exists), Open
+  Card…, Show Card in Finder, Eject Card / Insert Card (one item, the
+  title from `/status`), Open Project (scratch card)… keeps the old
+  behaviour and forgets the card; `VIRTUAL_PANEL_CARD=<img>` (one launch),
+  `VIRTUAL_PANEL_PORT_BIN=<bin>` (`--port-bin`). Quit → SIGTERM → the
+  server's handler.
+
+### Measured (13 Sep 2026, the M5, macOS 26.5; `out/_agents/persist/`: `verify.py`, `verify.log`, `verify.json`, `shots-verify/`, `oracle.out`, `fit-rt.out`)
+
+One run of `verify.py` on port 8597 (its own `cards/VERIFY.img`, the
+patched LTO build `build/ot_emu`, `--dsp-rt` on):
+
+| step | measured |
+|---|---|
+| A new card from the OTLIVE fixture | ready in **7.1 s**; `/status` `card_mode persistent, card_rw true, project OTLIVE/PROJECT`; the child's argv carries `--card-rw`; 37 files listed from the image's AUDIO, none pending; sidecar `{set, project, image_bytes 67108864}` |
+| B REC, TRIG 3 | REC LED on; the trig-3 LED (row 0 bit 4) 0 → 1, row 0 = `0x11` (bit 0 the fixture's trig 1) |
+| C FUNC+MIXER, RIGHT, DOWN, YES, YES | the PROJECT menu popup 5/0/0xf6/0x40 (KEYMAP.md's), the `SAVE PROJECT ... CONTINUE?` box (shots C1–C4); `card flush` `through=0` → **`through=20030 errors=0`** (10.3 MB) 3.3 s after the second YES (a first burst at once, the bank files ~2 s later; the by-hand run wrote 22,752 — the save's size depends on what changed), the image's md5 changed |
+| D SIGTERM | the server exits rc 0 in **78 ms**, no child left on the card, md5 unchanged |
+| E `--card` alone | ready in 7 s, `project` from the sidecar; the trig-3 LED off until REC, **on in GRID RECORDING** — the trig is on the card |
+| F a generated WAV | `/samples/add` → pending; `/samples/commit` → re-insert + boot **9.1 s**; listed `on_card: true`, pending `[]`, the pool empty, 38 files in the image's AUDIO; the firmware's file browser (T1 ×2, RIGHT, UP to the top of the list — `verify_browser.py`, shots J2/J3) lists it first: `AAA persist 440.wav 0.08`, footer `44.1k 16b 2Ch`, then the WAV copied in through the eject below |
+| G SIGTERM + restart | still listed on the card (38) |
+| H eject / insert | ejected in 0.5 s, mounted at `/Volumes/OCTABAM`, root = `[OTLIVE]`, `/key` → `ok: false` "the card is ejected", 0 children; a second WAV copied into `OTLIVE/AUDIO` by hand; `/card/insert` → booted in **8.1 s**, mount point gone, both files `on_card`, 39 in AUDIO, the image's root still `[OTLIVE]` (no `.fseventsd`/`.Spotlight-V100`/`.Trashes`) |
+| the app (port 8598, `VIRTUAL_PANEL_CARD`, `VIRTUAL_PANEL_PORT_BIN`) | spawned `--port-bin ... --card ...`, `card item: Eject Card, enabled` at ready (+8 s); `/card/eject` → `Insert Card, enabled`, `EJECTED at /Volumes/OCTABAM`; `/card/insert` → back; SIGTERM → the app gone in 0.13 s, `server pid ... stopped (status 0)`, no child, nothing mounted; `build.sh` 0 warnings, `codesign -vv` valid |
+
+**The gate: 28 PASS, 0 FAIL** on the patched build against
+`out/emu/ot_emu.ref-73c2815` (`out/_oracle/reports/20260913-083439-persist.txt`:
+boot logs, serial, goldens, the `--interactive` UART step by step, 109
+peeks, 47 run stamps at |dsample| = 0, `interdsp.pcm` identical, ctest 7/7),
+and **the rt audio fit −33.0 dB** (`rtdrive.py --rt --seconds 4` on
+`otlive2.img` → `fit.py`: onset 82, lag 81, gain 0.7032).
+
+### What it does not do
+
+- Route A has no write-back (`--card` needs the port backend; the server
+  exits saying so instead of falling back).
+- `out/emu/ot_emu` is rebuilt by the orchestrator: until then the app's
+  default spawn boots a persistent card **read-only** (`/status card_rw`
+  false, the reason in `backend_note`); `VIRTUAL_PANEL_PORT_BIN` points a
+  launch at `out/_agents/persist/build/ot_emu`.
+- The "last set / last project" record the unit keeps is not on the card in
+  emulation; the sidecar stands in for it. A card copied without its
+  `.json` boots into the first set/project found on it.
+- An eject leaves the volume mounted if the server dies; the next start
+  detaches it (`card_mounted_at`). Finder's `._*` and `.DS_Store` are removed
+  at insert; files a user leaves open in Finder make the detach fall back to
+  `-force`.
+- The write-through is per sector (~22,750 `pwrite`s for a project save,
+  inside the emulation's own `run`); it was not measured against the pacer
+  beyond "the count stood still 3.3 s after YES". A `pwrite` that fails is
+  counted (`errors=`), not retried.

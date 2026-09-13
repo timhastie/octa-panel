@@ -34,6 +34,27 @@ namespace ot
 		enum : uint32_t { ST_DRDY = 0x40, ST_DSC = 0x10, ST_DRQ = 0x08 };
 
 		explicit AtaCard(std::vector<uint8_t> _image);
+		~AtaCard();
+		AtaCard(const AtaCard&) = delete;
+		AtaCard& operator=(const AtaCard&) = delete;
+
+		// O19 (13 Sep 2026): WRITE-BACK, opt-in (`--card-rw`). The image
+		// stays in memory for every read, as before; with a file attached
+		// here every sector a WRITE SECTORS commits is ALSO pwrite()n to the
+		// file at the same offset, synchronously, before the command
+		// completes -- so the file is the card: the firmware's own SAVE
+		// PROJECT / SYNC TO CARD land in it and a later boot on the same
+		// file finds them. Nothing is buffered on this side: a kill of the
+		// process after a commit loses nothing (the bytes are the kernel's),
+		// and flush() is an fsync for the client that wants them on disk.
+		// Without setWriteBack the class is byte-for-byte the O18 one (the
+		// oracle's contract: every batch mode, every reply).
+		bool setWriteBack(const std::string& _path);
+		bool writeBack() const { return m_fd >= 0; }
+		const std::string& writeBackPath() const { return m_wbPath; }
+		uint64_t writtenThrough() const { return m_wbSectors; }
+		uint64_t writeErrors() const { return m_wbErrors; }
+		bool flush();
 
 		uint32_t read(uint32_t _off, uint32_t _size);
 		void write(uint32_t _off, uint32_t _size, uint32_t _val);
@@ -97,5 +118,8 @@ namespace ot
 				++m_logDropped;
 		}
 		uint64_t m_reads = 0, m_writes = 0;
+		int m_fd = -1;					// O19: the image file, when write-back is on
+		std::string m_wbPath;
+		uint64_t m_wbSectors = 0, m_wbErrors = 0;
 	};
 }

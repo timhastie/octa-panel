@@ -73,6 +73,25 @@ Honest limit: with the cores the unit plays ~9× slower than real time
 and in bursts; a take replays at real time. The OTLIVE fixture itself
 clips (slots 1/2 loop at GAIN 75/72); `out/_agents/audio/tree2` is the
 clean reference (third-0.wav ×0.70).
+**The card persists** (13 Sep 2026, milestone O19 in COLDFIRE_PORT.md):
+`--card <file.img>` boots that image as it is with the child's write-back
+on (`ot_emu --card-rw`: WRITE SECTORS are `pwrite()`n to the file as they
+complete; `card flush` / `card status` on the pipe), so the unit's own
+SAVE PROJECT (FUNC+MIXER, RIGHT, DOWN, YES, YES: 22,752 sectors into the
+file on the OTLIVE fixture) and the samples put on the card survive a quit
+-- the file is the CF card. A missing image is created once from
+`--project` with a sidecar `<file.img>.json` (set/project names; the
+firmware does not reload its last project by itself in emulation, tested);
+the pool is `<file.img>.pool/`; RE-INSERT copies the pool onto the card
+through an `hdiutil attach` while the child is stopped (no rebuild);
+`/card/eject` mounts the card on the Mac for Finder, `/card/insert` boots
+it again; `/samples` reads the image's AUDIO folder directly (`Fat16Image`
+in the server). The app: File ▸ New Card from Project… (→
+`out/cards/<Set>-<Project>.img`, remembered in UserDefaults `cardPath`),
+Open Card…, Show Card in Finder, Eject/Insert Card; `VIRTUAL_PANEL_CARD`,
+`VIRTUAL_PANEL_PORT_BIN`. Without `--card` everything is as before (fresh
+per-port image; the oracle stays 28/28). Verification and numbers:
+`out/_agents/persist/` (`verify.py`, `verify.json`).
 Backends: `--backend auto|port|routea` (port = `out/emu/ot_emu --interactive`,
 built when missing with `cmake --fresh -B out/emu -S tools/emu/ot_emu &&
 cmake --build out/emu -j8`; routea = `tools/emu/emu_rtos.py`, 100× slower).
@@ -197,10 +216,10 @@ EMAC-fixed Unicorn (`scripts/build_unicorn.sh`), `vendor/dsp56300` pinned to
   out/_agents/rt-fence-build/stall_hunt.py. The fence/poll addresses are
   payload A's (P:0x73/0x97/0x4b). Cue out and core 1 are not captured; the
   crossfader and audio inputs have no panel path.
-- `.ot` slice files are not seeded onto the card with their samples; the pool
-  is wiped and re-seeded at every server start (files added through the
-  page survive only while that server runs, or if they are also in an
-  `--audio <dir>`).
+- `.ot` slice files are not seeded onto the card with their samples. Without
+  `--card` the pool is still wiped and re-seeded at every server start
+  (files added through the page survive only while that server runs, or if
+  they are also in an `--audio <dir>`) -- with `--card` they persist.
 - The firmware's file browser lists files in card order, not name order.
 - Memory: the child's RSS is flat during play since O18 (13 Sep 2026: the
   peripheral-write seed log was unbounded); the panel UART tx buffer still

@@ -19,6 +19,8 @@ File ▸ Open Project… (`tools/panel/app/README.md`).
 .venv/bin/python3 tools/panel/panel_server.py --image out/mainos_bus.bin   # a built remix
 .venv/bin/python3 tools/panel/panel_server.py --project ~/octa/backups/<snap>/<project>
 .venv/bin/python3 tools/panel/panel_server.py --project <dir> --audio ~/samples   # more WAV/AIFF on the card
+.venv/bin/python3 tools/panel/panel_server.py --card out/cards/OTLIVE-PROJECT.img --project <dir> --set OTLIVE --name PROJECT
+                                              # a PERSISTENT card: what the unit saves stays ("Your card" below)
 ```
 
 Open <http://localhost:8563/>. Under the port, boot is ~3 s and boot + the
@@ -129,17 +131,20 @@ beside it), is a good PR — it is pure discovery, no firmware bytes.
 |---|---|
 | `GET /screen.png` | current LCD as a 128×64 PNG |
 | `GET /screen.txt` | the same frame as 64 lines of 128 `#` (dark) / `.` — for agents that grep |
-| `GET /status` | `{booted, seq, ran_ms, fault, image, phase, backend, backend_note, speed, rt, pace, restarts, card_busy}` — `seq` bumps on any screen change; **`rt`** is x real time by the wall clock (emulated ms per wall s over the last second / 1000: 1.0 = the unit's own clock; null under route A and before the pacer is up); `speed` is the older meter, emulated ms per wall second *inside the emulation* over the last 5 s — idle slices are instant, so it reads high (thousands) idle and only approaches `rt × 1000` while playing; kept for scripts; `pace` is the child's last `pacestatus` (`on, rate, ratio, lag_ms, slices, reanchors, slept_s, busy_s, stop`); `card_busy` while a `/samples/commit` reboots (`booted` is false through any reboot, respawn or re-insert) |
+| `GET /status` | `{booted, seq, ran_ms, fault, image, phase, backend, backend_note, speed, rt, pace, restarts, card_busy, card, card_mode, card_rw, card_ejected, card_mount, project}` — **`card`** the image file, `card_mode` `persistent` (`--card`) or `fresh`, `card_rw` the child writes through, `card_ejected` / `card_mount` the eject state, `project` `{set, name}` (O19); `seq` bumps on any screen change; **`rt`** is x real time by the wall clock (emulated ms per wall s over the last second / 1000: 1.0 = the unit's own clock; null under route A and before the pacer is up); `speed` is the older meter, emulated ms per wall second *inside the emulation* over the last 5 s — idle slices are instant, so it reads high (thousands) idle and only approaches `rt × 1000` while playing; kept for scripts; `pace` is the child's last `pacestatus` (`on, rate, ratio, lag_ms, slices, reanchors, slept_s, busy_s, stop`); `card_busy` while a `/samples/commit` reboots (`booted` is false through any reboot, respawn or re-insert) |
 | `GET /key?row=0x26&bit=0&down=1` | one matrix key edge |
 | `GET /tap?row=0x22&bit=0&n=2&hold=50&gap=150` | `n` presses of one key inside one action (the double-tap chords, see "Loading samples") |
 | `GET /knob?row=0x30&delta=2` | one encoder report (rows 0x30–0x36, signed delta) |
 | `GET /knob/reset?row=0x33` | the parameter this encoder edits on the CURRENT page back to its init value, done by the firmware (detent reports until the page descriptor's default is reached): `{ok, note, knob, name, page, track, addr, before, after, init, range, sent}`; `ok: false` + `note` and nothing sent on a SETUP window, the MIXER, a menu, MIDI mode, or a dead slot (AMP F/XVOL). "Scenes and the crossfader" below, `param_map.json` |
 | `GET /xfader?pos=64` | the crossfader: `pos` 0..127 (0 = leftmost = scene A, 127 = rightmost = scene B, the MIDI CC 48 scale) goes out as the panel board's own fader report `0x40 <byte>`; without `pos` it only reads. Answers the firmware's value `{ok, pos, xf, cc48, byte, scene_a, scene_b}` (`xf` = the firmware's 0x460d16c8, 127 at A; `scene_a/b` = the Part's assigned scenes, 1-based) |
-| `GET /samples` | the sample pool: `{pool, staged, files: [{name, bytes, format}], pending, removed, busy, phase}` |
+| `GET /samples` | the sample pool: `{pool, staged, files: [{name, bytes, format, on_card, removing}], pending, removed, busy, phase, card, card_mode, card_rw, card_ejected}` -- on a persistent card `files` is the image's `<SET>/AUDIO` (read directly, `on_card: true`) plus the pool's pending files |
 | `GET /samples/add?path=<abs>` | copy a Mac file into the pool (converted when needed): `{ok, name, converted, note, format, bytes, pending}` (+ `cmd`, afconvert's argv, when converted) or `{ok: false, error}` |
 | `POST /samples/upload?name=<n>` | the same with the raw file bytes as the body (one file per request, no multipart) |
-| `GET /samples/remove?name=<n>` | take a file out of the pool |
-| `GET /samples/commit` | re-insert the card: `{ok, phase}`, then `/status phase` shows the reboot |
+| `GET /samples/remove?name=<n>` | take a file out of the pool; on a persistent card an on-card file is marked for deletion at the next re-insert (again = un-mark) |
+| `GET /samples/commit` | re-insert the card: `{ok, phase}`, then `/status phase` shows the reboot (a persistent card is not rebuilt: the pool is copied onto it through a mount while the child is stopped) |
+| `GET /card` | the card (O19): `{card, mode, sidecar, meta, project, rw, flush, ejected, mount, pool, audio: {name: {bytes, format}}, removals, sets: {set: [projects]}, busy, phase}` -- `flush` is the child's last `card flush` line (`ok rw=1 through=<sectors in the file> errors=0`), `sets` what the image holds |
+| `GET /card/eject?open=1` | flush, stop the child, mount the image on the Mac (browsable; `open=0` leaves Finder alone): `{ok, phase, mount}`; `/status card_ejected`/`card_mount` when done |
+| `GET /card/insert` | clean the volume, detach, boot the child again: `{ok, phase}` |
 | `GET /keys` | the jump-table handlers (the `press()` fallback) |
 | `GET /press?idx=28&edge=0` | call a jump-table handler directly (route A only) |
 | `GET /transport?k=play\|rec\|stop` | PLAY/REC/STOP: the handlers under route A, matrix taps under the port |
@@ -204,6 +209,96 @@ under a pumpless `ot_emu --interactive` on the empty card, then every
 key alone, held 1.2 s, twice, and under 20 held modifiers — only the
 double tap of T1–T8 hit. KEYMAP.md's "UP held + track key" (E3) was two
 T2 taps that happened to fall inside the window.
+
+## Your card: saving projects and samples
+
+Until 13 Sep 2026 the card was rebuilt from the fixture at every server
+start and the port child never wrote its card back to the file, so the
+unit's own SAVE landed in RAM and a quit lost the project and every sample
+added. Now (O19 in `docs/firmware/COLDFIRE_PORT.md`) **the card is a
+file that persists, like the CF card in the unit**:
+
+```sh
+.venv/bin/python3 tools/panel/panel_server.py --card out/cards/OTLIVE-PROJECT.img \
+    --project out/_projects/otlive/OTLIVE/PROJECT --set OTLIVE --name PROJECT
+```
+
+- `--card <file.img>` boots that image **as it is** with the child's
+  write-back on (`ot_emu --card-rw`: every sector the firmware writes is
+  `pwrite()`n to the file as the WRITE SECTORS completes; `card flush` =
+  fsync, sent after every action batch, every 3 s idle, and before the
+  child is stopped). A missing file is created once from `--project` and
+  its sibling `AUDIO` (plus `--audio`), exactly as the per-port card is,
+  and a sidecar **`<file.img>.json`** records the set and project names
+  (and the removals marked for the next re-insert); later starts need
+  only `--card` -- the names come from the sidecar. The firmware does
+  not reload its last project by itself in emulation (tested 13 Sep
+  2026: a bare boot on the saved card leaves the SET/PROJECT names empty
+  with the card ready; the "last set" record the manual describes is not
+  on the card), so the sidecar is what boots you back into your project;
+  it follows the unit when you change project there (the names at
+  `0x100f8480` / `0x100f8378` are read at every flush). **Without
+  `--card` nothing changes**: a fresh `out/_panel_card_<port>.img` every
+  start, the pool wiped and re-seeded, as every script and the oracle
+  expect. `--card` needs the port backend and a binary that knows
+  `--card-rw` (an older `out/emu/ot_emu` boots the card read-only and
+  `/status card_rw` is false, with the reason in `backend_note`).
+- **Saving on the unit**, as in the manual (8.4): **FUNC + MIXER** opens
+  the PROJECT menu (`OTLIVE/PROJECT` in the header, PROJECT / SYSTEM /
+  CONTROL / MIDI at the left), **RIGHT** enters the PROJECT list (CHANGE,
+  SAVE, RELOAD, SYNC TO CARD, SAVE TO NEW, ...), **DOWN** to SAVE,
+  **YES**, and **YES** again on `SAVE PROJECT -- ANY PREVIOUSLY SAVED
+  STATE WILL BE LOST. CONTINUE?`. Measured 13 Sep 2026 on the OTLIVE
+  fixture (`out/_agents/persist/verify.py`, its log, `verify.json` and
+  the screens in `shots-verify/`): a first burst of sectors at once, the
+  16 bank files ~2 s later -- **20,030 sectors (10.3 MB) in the file**
+  3.3 s after the second YES (22,752 in the by-hand run: the save's size
+  depends on what changed), the image's md5 changed; SIGTERM to the
+  server (what the app's Quit sends) exits in 78 ms with the child gone;
+  the next start on `--card` alone boots into `OTLIVE/PROJECT` in 7 s
+  with the trig placed on step 3 still there (the trig-3 LED off until
+  REC, lit in GRID RECORDING). As on the hardware, what you do not SAVE
+  (or SYNC TO CARD) is in RAM: quitting is switching the unit off.
+- **Samples** go the same two steps as before (`/samples/add`, then
+  RE-INSERT CARD), but the re-insert **no longer rebuilds** anything: the
+  server flushes and stops the child, mounts the image on the Mac
+  (`hdiutil attach -imagekey diskimage-class=CRawDiskImage`, `-nobrowse`,
+  verified to mount the builder's image as FDisk + DOS_FAT_16), copies
+  the pool's pending files into `<SET>/AUDIO` (VFAT long names), deletes
+  the files marked with `/samples/remove`, removes what macOS drops on a
+  FAT volume (`.fseventsd`, `.Spotlight-V100`, `.Trashes`, `._*`,
+  `.DS_Store` -- the unit's file browser would list them), detaches and
+  boots the child again on the same file. The pool is
+  **`<file.img>.pool/`** (never wiped; a file leaves it when it lands
+  on the card). `/samples` lists what is on the card by reading the
+  image's `<SET>/AUDIO` directly (`Fat16Image` in the server: MBR,
+  BPB, FAT, LFN entries; no mount, safe beside the running child) plus
+  the pool's pending files; `/samples/remove` of an on-card file marks
+  it (a second call un-marks). Measured: a generated WAV added, the
+  re-insert + boot 9.1 s, the file listed `on_card`, the pool empty, 38
+  files in the image's AUDIO, the firmware's file browser (`T1` twice,
+  RIGHT, UP to the top of the list: `AAA persist 440.wav 0.08`, footer
+  `44.1k 16b 2Ch`; `shots-verify/J2`) showing it; still there after a
+  quit and a restart.
+- **Eject / insert** (`/card/eject`, `/card/insert`; the app's File
+  menu): eject = flush + stop the child, mount the image **browsable**
+  and open it in Finder (`?open=0` skips the `open`) -- copy samples,
+  projects or whole sets in and out as with a CF card in a reader; the
+  page shows the empty slot and where the volume is, every key answers
+  `ok: false` ("the card is ejected") and nothing respawns; insert =
+  clean, detach (with `-force` on a second try when a Finder window
+  holds a file), re-list, boot. Measured: ejected in 0.5 s at
+  `/Volumes/OCTABAM`, a WAV copied into `OTLIVE/AUDIO` by hand, inserted
+  and booted in 8.1 s with both files on the card and the image's root
+  clean (`OTLIVE` alone). A server started on a card the previous one
+  left mounted detaches it first (never two writers).
+- **Where the card lives, backing it up.** The app makes
+  `out/cards/<Set>-<Project>.img` (configurable: `--card` takes any
+  path). The image is the whole card, 64 MB by default (more when the
+  samples need it): **copy the `.img` to back it up** (and its `.json`
+  sidecar to keep the names; a copy without one is booted into the
+  first set and project found on it). Never in git (`out/` is ignored
+  and the image holds no firmware).
 
 ## Hearing the unit
 

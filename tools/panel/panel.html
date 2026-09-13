@@ -967,7 +967,15 @@ function renderPool() {
     `${n} file${n === 1 ? "" : "s"} on the card` +
     (waiting ? ` — ${waiting} at the next RE-INSERT CARD` : poolDirty && !d.removed ? " — changes waiting for RE-INSERT CARD" : "") +
     (poolBusy || d.busy ? " — the unit is busy (see the phase); RE-INSERT waits" : "");
-  $("#reinsert").disabled = poolBusy || !!d.busy || !poolData;
+  if (cardEjected) {
+    // O19: the ejected state -- where the card is, and the way back in
+    const st = $("#poolstate"); st.textContent = "";
+    const t = document.createElement("span");
+    t.textContent = `THE CARD IS EJECTED — mounted on the Mac at ${cardMount || "?"} (open in Finder: copy samples into <SET>/AUDIO, projects into <SET>/, or whole sets). Then `;
+    const ib = document.createElement("button"); ib.id = "insertbtn"; ib.textContent = "INSERT CARD"; ib.onclick = insertCard;
+    st.append(t, ib);
+  }
+  $("#reinsert").disabled = poolBusy || !!d.busy || !poolData || cardEjected;
   $("#addbtn").disabled = !poolData || !!d.busy;
 }
 async function uploadFiles(files) {
@@ -1017,12 +1025,32 @@ async function reinsert() {
 }
 // the phase poll feeds this: the card is out while the unit reboots, and
 // the list refreshes when the unit comes back (pending files become "on the card")
-function poolPhase(phase) {
+let cardEjected = false, cardMount = null;
+function poolPhase(phase, s) {
   const busy = phase !== "ready";
-  $("#card").classList.toggle("ejected", /re-insert|restart/.test(phase));
+  // O19: /status card_ejected = the card is out and mounted on the Mac (File >
+  // Eject Card in the app, or GET /card/eject): the slot shows it empty and
+  // the drawer says where it is and how to put it back
+  const ejected = !!(s && s.card_ejected);
+  $("#card").classList.toggle("ejected", ejected || /re-insert|restart|eject|insert/.test(phase));
+  if (ejected !== cardEjected || (s && s.card_mount) !== cardMount) {
+    cardEjected = ejected; cardMount = s ? s.card_mount || null : null;
+    $("#card").title = ejected
+      ? `COMPACT FLASH — the card is EJECTED and mounted on the Mac at ${cardMount || "?"}: copy samples, projects or sets in Finder, then INSERT CARD`
+      : "COMPACT FLASH — click: the card's AUDIO pool (add samples; RE-INSERT CARD reboots the unit); drop audio files here to add them";
+    if (ejected && !poolOpen) togglePool(true);
+    if (poolData) renderPool();
+  }
   if (busy === poolBusy) return;
   poolBusy = busy;
   if (poolOpen) loadPool(); else if (poolData) renderPool();
+}
+async function insertCard() {
+  const b = $("#insertbtn"); if (b) b.disabled = true;
+  let r;
+  try { r = await fetch("/card/insert").then(x => x.json()); } catch (e) { r = {ok: false, error: e.message}; }
+  if (r.ok) { poolLog(`card inserted: ${r.phase || "the unit boots"}`); hint(r.phase || "inserting the card"); }
+  else { poolLog(`insert failed: ${r.error || "?"}`, "bad"); if (b) b.disabled = false; }
 }
 $("#addinput").addEventListener("change", e => { uploadFiles(e.target.files); e.target.value = ""; });
 // drops: on the card slot or the open drawer; anywhere else the browser
@@ -1495,7 +1523,7 @@ async function poll() {
     $("#screen").classList.toggle("dim", busy);
     $("#note").classList.toggle("show", busy);
     $("#note span").textContent = busy ? `loading — ${phase}` : "";
-    poolPhase(phase);
+    poolPhase(phase, s);
     monPhase(s, phase);
     if (s.seq !== lastSeq) { lastSeq = s.seq; $("#screen").src = "/screen.png?" + s.seq; }
     if (Object.keys(mapLeds).length && !ledStreamOn) applyLeds(await fetch("/leds").then(x => x.json()));

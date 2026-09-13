@@ -3,12 +3,47 @@
 #include <algorithm>
 #include <cstdio>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 namespace ot
 {
 	AtaCard::AtaCard(std::vector<uint8_t> _image)
 		: m_img(std::move(_image))
 	{
 		m_nsect = static_cast<uint32_t>(m_img.size() / g_sector);
+	}
+
+	AtaCard::~AtaCard()
+	{
+		if(m_fd >= 0)
+		{
+			::fsync(m_fd);
+			::close(m_fd);
+		}
+	}
+
+	bool AtaCard::setWriteBack(const std::string& _path)
+	{
+		if(m_fd >= 0)
+		{
+			::fsync(m_fd);
+			::close(m_fd);
+			m_fd = -1;
+		}
+		const int fd = ::open(_path.c_str(), O_RDWR | O_CLOEXEC);
+		if(fd < 0)
+			return false;
+		m_fd = fd;
+		m_wbPath = _path;
+		return true;
+	}
+
+	bool AtaCard::flush()
+	{
+		if(m_fd < 0)
+			return true;
+		return ::fsync(m_fd) == 0;
 	}
 
 	std::vector<uint16_t> AtaCard::identifyWords(const uint32_t _totalSectors)
@@ -195,7 +230,27 @@ namespace ot
 	{
 		const size_t off = static_cast<size_t>(m_wlba) * g_sector;
 		if(m_wlba < m_nsect)
+		{
 			std::copy(_data, _data + g_sector, m_img.begin() + off);
+			if(m_fd >= 0)
+			{
+				// O19: through to the file, whole sector, same offset. A
+				// short write is counted, never retried (the memory copy is
+				// still right; `card status` reports the count).
+				ssize_t done = 0;
+				while(done < static_cast<ssize_t>(g_sector))
+				{
+					const ssize_t n = ::pwrite(m_fd, _data + done, g_sector - done, static_cast<off_t>(off + done));
+					if(n <= 0)
+						break;
+					done += n;
+				}
+				if(done == static_cast<ssize_t>(g_sector))
+					++m_wbSectors;
+				else
+					++m_wbErrors;
+			}
+		}
 		++m_writes;
 		++m_wlba;
 		if(--m_wremaining <= 0)

@@ -41,6 +41,21 @@ into out/_panel_takes_<port>/take-NNN.wav -- /audio/status, /audio/pcm,
 /audio.wav, /audio/enable (README "Hearing the unit"). Playing costs ~3x
 the wall time of a child without the cores.
 
+The card (13 Sep 2026, O19): `--card <file.img>` boots an EXISTING image
+as it is, with the child's write-back on (`--card-rw`: every sector the
+firmware writes lands in the file), so the unit's own SAVE PROJECT and the
+samples put on the card survive a quit -- the file is the card. A missing
+file is created once from --project (the per-port build below) with a
+sidecar `<file.img>.json` (set / project names, pending removals); later
+boots read the sidecar. The pool is then `<file.img>.pool/` (pending
+additions, never wiped); /samples/commit copies it onto the card through
+an hdiutil mount while the child is stopped (no rebuild); /card/eject
+mounts the card on the Mac for Finder and /card/insert boots it again.
+Without --card nothing changes: a fresh per-port image every start.
+
+    .venv/bin/python3 tools/panel/panel_server.py --card out/cards/OTLIVE-PROJECT.img \
+        --project out/_projects/otlive/OTLIVE/PROJECT --set OTLIVE --name PROJECT
+
 Then open http://localhost:8563/. Unmapped keys: the MAP drawer lists every
 table entry; click one, watch the screen, name it. The mapping lives in the
 browser (localStorage) and exports as JSON -- send a completed map back as
@@ -48,14 +63,17 @@ a PR to key_map.json.
 """
 import argparse
 import collections
+import datetime
 import filecmp
 import io
 import json
 import os
 import pathlib
+import plistlib
 import queue
 import re
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -815,7 +833,8 @@ def _ext80(b):
 
 
 def sample_header(path):
-    """What the file's own header says, stdlib only: {"kind": "WAV" | "AIFF" |
+    """What the file's own header says (`path`, or the file's first bytes as
+    a bytes object -- the card reader hands those over), stdlib only: {"kind": "WAV" | "AIFF" |
     "AIFC", "channels", "rate", "bits", "pcm", "tag"} from the RIFF/WAVE fmt
     chunk or the FORM/AIFF COMM chunk; None for anything else (mp3, flac,
     aac, a truncated file). "pcm": integer PCM (WAV format tag 1, or 0xfffe
@@ -826,7 +845,7 @@ def sample_header(path):
     into STATIC 6; afconvert keeps such a header anyway, so converting it
     changed nothing), the AIFC compression code for an AIFC, None for AIFF."""
     try:
-        with open(path, "rb") as f:
+        with (io.BytesIO(path) if isinstance(path, (bytes, bytearray)) else open(path, "rb")) as f:
             head = f.read(12)
             if len(head) < 12:
                 return None
@@ -905,11 +924,11 @@ class SamplePool:
     characters outside [A-Za-z0-9._ -] replaced. A name already in the pool
     (case-insensitively) is refused unless the bytes are identical."""
 
-    def __init__(self, path):
+    def __init__(self, path, wipe=True):
         self.path = pathlib.Path(path)
-        if self.path.exists():
+        if wipe and self.path.exists():
             shutil.rmtree(self.path)
-        self.path.mkdir(parents=True)
+        self.path.mkdir(parents=True, exist_ok=True)
         self.lock = threading.Lock()
 
     def names(self):
@@ -1051,6 +1070,306 @@ class SamplePool:
         return {"ok": True, "name": have.name}
 
 
+# -- the persistent card (O19, 13 Sep 2026) ------------------------------------
+#
+# With --card the image file IS the card: the child boots it with --card-rw
+# (AtaCard::setWriteBack: every sector the firmware writes is pwrite()n to
+# the file as the WRITE completes), so SAVE PROJECT on the unit lands in it
+# and the next boot on the same file finds it. What the server needs of the
+# card without a mount -- the AUDIO folder's listing, the sets and projects
+# for the sidecar -- comes from Fat16Image below, a read-only walk of the
+# FAT16 volume the builder writes (emu_card._Fat16: MBR + one partition at
+# LBA 2048, 512-byte sectors, LFN entries). Changing the card goes through
+# an hdiutil mount (card_attach / card_detach), ONLY while the child is
+# stopped: a re-insert copies the pool's pending files into <SET>/AUDIO
+# and deletes the marked ones; an eject leaves it mounted for Finder.
+
+CARD_DROPPINGS = (".fseventsd", ".Spotlight-V100", ".Trashes", ".TemporaryItems",
+                  ".metadata_never_index", ".DS_Store", ".VolumeIcon.icns")
+
+
+class Fat16Image:
+    """A read-only walk of the card image's first partition (FAT16, as
+    emu_card.build_image lays it out; macOS writes the same). Stdlib only,
+    no mount: safe beside a running child (which writes whole sectors
+    through, O19). listdir(cluster) parses 8.3 + VFAT long names."""
+
+    def __init__(self, path):
+        self.f = open(path, "rb")
+        try:
+            mbr = self._sectors(0, 1)
+            if len(mbr) < 512 or mbr[510:512] != b"\x55\xaa":
+                raise ValueError("no MBR signature")
+            self.part = struct.unpack_from("<I", mbr, 446 + 8)[0]
+            bpb = self._sectors(self.part, 1)
+            bps, spc, reserved, nfats, root_entries, total16, _media, spf = struct.unpack_from("<HBHBHHBH", bpb, 11)
+            total32 = struct.unpack_from("<I", bpb, 32)[0]
+            if bps != 512 or not spc or not spf:
+                raise ValueError(f"unexpected BPB (bytes/sector {bps}, spc {spc}, spf {spf})")
+            self.spc = spc
+            self.total = total16 or total32
+            self.fat_start = self.part + reserved
+            self.root_start = self.fat_start + nfats * spf
+            self.root_sectors = root_entries * 32 // 512
+            self.data_start = self.root_start + self.root_sectors
+            self.label = bpb[43:54].decode("ascii", "replace").strip()
+            fat = self._sectors(self.fat_start, spf)
+            self.fat = struct.unpack(f"<{len(fat) // 2}H", fat)
+        except Exception:
+            self.f.close()
+            raise
+
+    def close(self):
+        self.f.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+
+    def _sectors(self, lba, n):
+        self.f.seek(lba * 512)
+        return self.f.read(n * 512)
+
+    def chain(self, c):
+        out, seen = [], set()
+        while 2 <= c < 0xfff8 and c < len(self.fat) and c not in seen:
+            out.append(c); seen.add(c)
+            c = self.fat[c]
+        return out
+
+    def _cluster(self, c):
+        return self._sectors(self.data_start + (c - 2) * self.spc, self.spc)
+
+    def read(self, entry, limit=None):
+        """The file's bytes (the first `limit` of them)."""
+        want = entry["size"] if limit is None else min(entry["size"], limit)
+        out = bytearray()
+        for c in self.chain(entry["cluster"]):
+            if len(out) >= want:
+                break
+            out += self._cluster(c)
+        return bytes(out[:want])
+
+    def listdir(self, cluster=0):
+        """The entries of a directory (0 = the root): name (long, else 8.3),
+        short, dir, hidden, cluster, size. `.` and `..` are left out."""
+        if cluster == 0:
+            raw = self._sectors(self.root_start, self.root_sectors)
+        else:
+            raw = b"".join(self._cluster(c) for c in self.chain(cluster))
+        entries, lfn = [], {}
+        for i in range(0, len(raw), 32):
+            e = raw[i:i + 32]
+            if len(e) < 32 or e[0] == 0:
+                break
+            if e[0] == 0xe5:
+                lfn = {}
+                continue
+            attr = e[11]
+            if attr == 0x0f:
+                lfn[e[0] & 0x1f] = e[1:11] + e[14:26] + e[28:32]
+                continue
+            if attr & 0x08:
+                lfn = {}
+                continue                    # the volume label
+            stem = e[:8].decode("latin-1").rstrip()
+            ext = e[8:11].decode("latin-1").rstrip()
+            short = stem + ("." + ext if ext else "")
+            if e[0] == 0x05:
+                short = "\xe5" + short[1:]
+            name = None
+            if lfn:
+                u = b"".join(lfn[k] for k in sorted(lfn))
+                name = u.decode("utf-16-le", "replace").split("\x00")[0].rstrip("\uffff")
+            lfn = {}
+            if short in (".", ".."):
+                continue
+            entries.append({"name": name or short, "short": short, "dir": bool(attr & 0x10),
+                            "hidden": bool(attr & 0x02),
+                            "cluster": struct.unpack_from("<H", e, 26)[0],
+                            "size": struct.unpack_from("<I", e, 28)[0]})
+        return entries
+
+    def find(self, *parts):
+        """The entry at the path `parts` (case-insensitive on long and short
+        names), or None."""
+        cluster, entry = 0, None
+        for part in parts:
+            low = part.lower()
+            entry = next((e for e in self.listdir(cluster) if e["name"].lower() == low or e["short"].lower() == low), None)
+            if entry is None:
+                return None
+            cluster = entry["cluster"]
+        return entry
+
+    def sets(self):
+        """{set: [project, ...]}: every root folder with its sub-folders
+        that hold a project.work or bank01.work (AUDIO and dot folders
+        left out)."""
+        out = {}
+        for e in self.listdir(0):
+            if not e["dir"] or e["name"].startswith("."):
+                continue
+            projects = []
+            for sub in self.listdir(e["cluster"]):
+                if not sub["dir"] or sub["name"].startswith(".") or sub["name"].upper() == "AUDIO":
+                    continue
+                names = {x["name"].lower() for x in self.listdir(sub["cluster"])}
+                if names & {"project.work", "project.strd", "bank01.work", "bank01.strd"}:
+                    projects.append(sub["name"])
+            out[e["name"]] = projects
+        return out
+
+
+def card_audio_listing(image, set_name, header_bytes=16384):
+    """What is in <SET>/AUDIO on the card image: {name: {"bytes", "format"}}
+    (the format from the file's own header, sample_header on its first
+    bytes); dot files and folders are left out. {} when the folder is not
+    there."""
+    out = {}
+    try:
+        with Fat16Image(image) as img:
+            audio = img.find(set_name, "AUDIO")
+            if audio is None or not audio["dir"]:
+                return out
+            for e in img.listdir(audio["cluster"]):
+                if e["dir"] or e["name"].startswith(".") or e["hidden"]:
+                    continue
+                info = sample_header(img.read(e, header_bytes)) if e["size"] else None
+                out[e["name"]] = {"bytes": e["size"], "format": sample_format(info, e["name"])}
+    except (OSError, ValueError, struct.error) as e:
+        print(f"panel: card listing failed: {type(e).__name__}: {e}")
+    return out
+
+
+def card_attach(image, readonly=False, browse=False, timeout=120):
+    """hdiutil attach of a raw card image; (device, mount point). Verified
+    13 Sep 2026: `-imagekey diskimage-class=CRawDiskImage` mounts the
+    builder's image as FDisk + DOS_FAT_16 at /Volumes/<label> (`-mountpoint`
+    answers "no mountable file systems" for this image, so the default
+    mount point is taken from the plist). Never while the child runs on it."""
+    cmd = ["hdiutil", "attach", "-imagekey", "diskimage-class=CRawDiskImage", "-plist"]
+    if readonly:
+        cmd.append("-readonly")
+    if not browse:
+        cmd.append("-nobrowse")
+    cmd.append(str(image))
+    r = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    if r.returncode:
+        raise RuntimeError(f"hdiutil attach rc {r.returncode}: {r.stderr.decode(errors='replace').strip()}")
+    d = plistlib.loads(r.stdout)
+    dev = mnt = None
+    for e in d.get("system-entities", []):
+        if e.get("mount-point"):
+            mnt = e["mount-point"]
+        if e.get("content-hint") == "FDisk_partition_scheme":
+            dev = e.get("dev-entry")
+    if not mnt:
+        for e in d.get("system-entities", []):
+            if e.get("dev-entry"):
+                subprocess.run(["hdiutil", "detach", e["dev-entry"]], capture_output=True)
+                break
+        raise RuntimeError("hdiutil attached the image but mounted no volume")
+    return dev or mnt, mnt
+
+
+def card_mounted_at(image, timeout=60):
+    """(device, mount point) if macOS has this image attached (an eject the
+    last server left behind), else None -- from `hdiutil info -plist`."""
+    try:
+        r = subprocess.run(["hdiutil", "info", "-plist"], capture_output=True, timeout=timeout)
+        d = plistlib.loads(r.stdout) if r.returncode == 0 else {}
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    want = str(pathlib.Path(image).resolve())
+    for img in d.get("images", []):
+        if str(img.get("image-path", "")) != want:
+            continue
+        dev = mnt = None
+        for e in img.get("system-entities", []):
+            if e.get("mount-point"):
+                mnt = e["mount-point"]
+            if e.get("content-hint") == "FDisk_partition_scheme":
+                dev = e.get("dev-entry")
+        return (dev or mnt, mnt)
+    return None
+
+
+def card_detach(what, timeout=120):
+    """hdiutil detach (the device or the mount point); a second try with
+    -force when a Finder window or a Quick Look still holds a file."""
+    r = subprocess.run(["hdiutil", "detach", str(what)], capture_output=True, timeout=timeout)
+    if r.returncode == 0:
+        return "detached"
+    err = r.stderr.decode(errors="replace").strip()
+    r = subprocess.run(["hdiutil", "detach", "-force", str(what)], capture_output=True, timeout=timeout)
+    if r.returncode == 0:
+        return f"detached with -force ({err})"
+    raise RuntimeError(f"hdiutil detach rc {r.returncode}: {r.stderr.decode(errors='replace').strip() or err}")
+
+
+def card_clean(mnt):
+    """Remove what macOS drops on a mounted FAT volume (.fseventsd,
+    .Spotlight-V100, .Trashes, .DS_Store, ._AppleDouble files) before the
+    unit sees the card again: its file browser lists every entry, and a
+    root folder would show up as a set. Returns the paths removed."""
+    gone = []
+    root = pathlib.Path(mnt)
+    for name in CARD_DROPPINGS:
+        p = root / name
+        if p.is_dir() and not p.is_symlink():
+            shutil.rmtree(p, ignore_errors=True); gone.append(str(p))
+        elif p.exists() or p.is_symlink():
+            try:
+                p.unlink(); gone.append(str(p))
+            except OSError:
+                pass
+    for p in root.rglob("._*"):
+        if p.is_file():
+            try:
+                p.unlink(); gone.append(str(p))
+            except OSError:
+                pass
+    for p in root.rglob(".DS_Store"):
+        try:
+            p.unlink(); gone.append(str(p))
+        except OSError:
+            pass
+    return gone
+
+
+def card_no_droppings(mnt):
+    """Ask macOS not to index or log the mounted card: .metadata_never_index
+    and .fseventsd/no_log at its root (both removed again by card_clean)."""
+    root = pathlib.Path(mnt)
+    try:
+        (root / ".metadata_never_index").touch()
+        (root / ".fseventsd").mkdir(exist_ok=True)
+        (root / ".fseventsd" / "no_log").touch()
+    except OSError:
+        pass
+
+
+def sidecar_path(card):
+    return pathlib.Path(str(card) + ".json")
+
+
+def sidecar_load(card):
+    try:
+        return json.loads(sidecar_path(card).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def sidecar_save(card, meta):
+    p = sidecar_path(card)
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps(meta, indent=2) + "\n")
+    tmp.replace(p)
+
+
 def build_card(project, set_name, name, tree, pool):
     """The card image: the project dir (when given) plus EVERY pool file as
     AUDIO/<name>, staged under `tree` (wiped and remade) and sized to fit.
@@ -1079,8 +1398,28 @@ class Panel:
     def __init__(self, image, card, pump_ms=25.0, project=None, internal_clock=True,
                  play_pump_ms=10.0, backend="routea", port_bin=PORT_BIN, port_args=(),
                  card_file=None, backend_note="", auto=False, pool=None, card_builder=None,
-                 staged_audio=None, sound=False, takes_dir=None):
+                 staged_audio=None, sound=False, takes_dir=None, card_persistent=False,
+                 card_rw=False, card_meta=None):
         self.image = image
+        # The persistent card (O19, 13 Sep 2026): card_file is the user's
+        # own image, booted as it is with --card-rw (card_rw: the binary
+        # knows the flag); card_meta is its sidecar (set, project,
+        # removals), card_files the AUDIO listing read from the image
+        # (refreshed while the child is stopped), card_removals the on-card
+        # files marked for deletion at the next re-insert, card_ejected /
+        # card_mount the eject state (mounted on the Mac, no child).
+        self.card_persistent = bool(card_persistent)
+        self.card_rw = bool(card_rw)
+        self.card_meta = dict(card_meta or {})
+        self.card_files = {}
+        self.card_removals = set(self.card_meta.get("removals", []))
+        self.card_ejected = False
+        self.card_mount = None
+        self.card_dev = None
+        self.card_flushed_at = 0.0
+        self.card_flush_note = None
+        if self.card_persistent and card_file is not None:
+            self.card_files = card_audio_listing(card_file, (project or ("", ""))[0])
         # Sound (12 Sep 2026): with `sound` the port child is spawned with
         # --dsp and its main output is drained here (see AudioRing above,
         # _audio_start, _drain_audio). sound_wanted is what the NEXT child
@@ -1297,6 +1636,8 @@ class Panel:
         if self.port_bin.endswith(".py"):
             argv = [sys.executable, self.port_bin]        # the fake, or any Python stand-in
         argv += ["--image", str(self.image), "--card", str(self.card_file), "--interactive"]
+        if self.card_rw:
+            argv.append("--card-rw")        # O19: the file is the card (write-back)
         if self.project:
             set_name, name = self.project
             # The port loads the project in its own boot (--mount posts the
@@ -1425,15 +1766,7 @@ class Panel:
         clock dialog is closed; /status "booted" is false meanwhile (it
         read true through a re-insert with the screen blank, 12 Sep 2026).
         True when the port is up again."""
-        self._close_take(None)          # a take open across a reboot ends here (the child's ring is gone)
-        self.audio_on = False
-        if self.proc is not None:
-            self.proc.kill()
-        self.booted = False
-        self._new_link()
-        self.led_bits = bytearray(64); self.led_ids = {}
-        with self.lock:
-            self.frame = b""; self.screen_txt = ""
+        self._stop_child()
         for attempt in range(3):
             try:
                 self._boot_port(phase)
@@ -1446,16 +1779,183 @@ class Panel:
         return False
 
     REINSERT_PHASE = "re-inserting the card (reboot, ~40 s)"
+    EJECT_PHASE = "ejecting the card (flush, stop)"
+    INSERT_PHASE = "inserting the card (boot, ~40 s)"
+    CARD_FLUSH_S = 3.0          # O19: `card flush` (fsync) at least this often while idle, and after every action batch
+
+    def _stop_child(self):
+        """The child gone and the panel blank, before a boot on the same
+        card or a mount of it: with write-back on, `card flush` then
+        `quit` (the child fsyncs before its `ok`), else the kill the
+        respawn always did. Every caller re-boots or mounts afterwards."""
+        self._close_take(None)          # a take open across a reboot ends here (the child's ring is gone)
+        self.audio_on = False
+        proc, self.proc = self.proc, None
+        if proc is not None:
+            if self.card_rw and proc.alive():
+                try:
+                    proc.command("card flush", "card", timeout=10.0)
+                except (PortDied, PortError):
+                    pass
+                proc.quit()             # `quit` -> ok (flushed), then the kill
+            else:
+                proc.kill()
+        self.booted = False
+        self._new_link()
+        self.led_bits = bytearray(64); self.led_ids = {}
+        with self.lock:
+            self.frame = b""; self.screen_txt = ""
+
+    def _card_flush(self, rt, force=False):
+        """O19: `card flush` on the child (an fsync of the image file; every
+        written sector is already in the file) after an action batch and
+        every CARD_FLUSH_S idle -- and the firmware's own SET / PROJECT
+        names (0x100f8480 / 0x100f8378) into the sidecar when they changed
+        (PROJECT > CHANGE on the unit), so the next boot loads what the
+        user was in. Nothing without --card-rw."""
+        if not self.card_rw or self.backend != "port" or rt is None or self.card_ejected:
+            return
+        now = time.perf_counter()
+        if not force and now - self.card_flushed_at < self.CARD_FLUSH_S:
+            return
+        self.card_flushed_at = now
+        try:
+            rep = rt.proc.command("card flush", "card", timeout=10.0)
+            self.card_flush_note = rep[5:].strip() or None
+            if self.card_persistent and self.booted:
+                names = []
+                for addr in (ec.FW_SET_NAME, ec.FW_PROJECT_NAME):
+                    raw = bytes(rt.uc.mem_read(addr, 0x40))
+                    # the set is kept as an absolute path ("/OTLIVE", emu_card.set_names)
+                    names.append(raw.split(b"\0", 1)[0].decode("ascii", "replace").lstrip("/"))
+                if all(names) and tuple(names) != tuple(self.project or ("", "")):
+                    print(f"panel: the unit is in {names[0]}/{names[1]} now (was {self.project}); sidecar updated")
+                    self.project = (names[0], names[1])
+                    self.card_files = {}       # another set: re-listed at the next stop
+                    self._save_sidecar()
+        except PortError as e:
+            self.card_flush_note = f"card flush refused: {e}"
+        # PortDied propagates: the loop respawns
+
+    def _save_sidecar(self):
+        if not self.card_persistent or self.card_file is None:
+            return
+        meta = dict(self.card_meta)
+        if self.project:
+            meta["set"], meta["project"] = self.project
+        meta["removals"] = sorted(self.card_removals)
+        meta["pool"] = str(self.pool.path) if self.pool is not None else None
+        meta["saved"] = datetime.datetime.now().isoformat(timespec="seconds")
+        self.card_meta = meta
+        try:
+            sidecar_save(self.card_file, meta)
+        except OSError as e:
+            print(f"panel: sidecar not written: {e}")
+
+    def refresh_card_files(self):
+        """Re-read the card's AUDIO listing from the image (the child stopped
+        or idle; the reader never mounts)."""
+        if self.card_persistent and self.card_file is not None and self.project:
+            self.card_files = card_audio_listing(self.card_file, self.project[0])
+        return self.card_files
+
+    def card_name_on(self, name):
+        """The on-card file called `name`, case-insensitively, or None."""
+        low = name.lower()
+        return next((n for n in self.card_files if n.lower() == low), None)
 
     def pending(self):
         """(added, removed): pool files not on the card as they are, and card
-        files no longer in the pool -- what the next commit changes."""
+        files no longer in the pool -- what the next commit changes. On the
+        persistent card the pool IS the pending list (a file moves onto the
+        card at the re-insert) and the removals are the marked names."""
         if self.pool is None:
             return [], []
+        if self.card_persistent:
+            return self.pool.names(), sorted(self.card_removals)
         now = self.pool.manifest()
         added = [n for n, st in now.items() if self.card_manifest.get(n) != st]
         removed = [n for n in self.card_manifest if n not in now]
         return added, removed
+
+    def samples_files(self):
+        """/samples "files": on the persistent card the image's AUDIO listing
+        (on_card true; a name the pool also holds is shown from the pool,
+        which replaces it at the re-insert) plus the pool's pending files;
+        otherwise the pool as before."""
+        if not self.card_persistent:
+            return self.pool.files()
+        pool = self.pool.files()
+        low = {f["name"].lower() for f in pool}
+        out = [{"name": n, "bytes": f["bytes"], "format": f["format"], "on_card": True,
+                "removing": n in self.card_removals}
+               for n, f in sorted(self.card_files.items(), key=lambda kv: kv[0].lower()) if n.lower() not in low]
+        for f in pool:
+            out.append({**f, "on_card": False, "removing": False})
+        return out
+
+    def remove_sample(self, name):
+        """/samples/remove: a pool file is taken out; on the persistent card
+        an on-card file is MARKED for deletion at the next re-insert (and a
+        marked one un-marked by a second call)."""
+        if self.pool.find(name) is not None:
+            return self.pool.remove(name)
+        if self.card_persistent:
+            on = self.card_name_on(name)
+            if on is not None:
+                if on in self.card_removals:
+                    self.card_removals.discard(on)
+                    self._save_sidecar()
+                    return {"ok": True, "name": on, "note": "kept: the removal mark is off again"}
+                self.card_removals.add(on)
+                self._save_sidecar()
+                return {"ok": True, "name": on, "note": "on the card: removed at the next re-insert "
+                                                        "(/samples/remove of the same name un-marks it)"}
+        return {"ok": False, "error": f"{name}: not in the pool" + (" or on the card" if self.card_persistent else "")}
+
+    def _commit_persistent(self):
+        """The re-insert on the persistent card (on the emu thread): flush
+        and stop the child, mount the image (nobrowse), copy the pool into
+        <SET>/AUDIO, delete the marked files, clean macOS's droppings,
+        detach, re-list, boot the child on the same file. A mount that
+        fails leaves the card as it was (the pool keeps its files) and the
+        unit is still rebooted."""
+        added, removed = self.pending()
+        set_name = self.project[0] if self.project else "OCTABAM"
+        self._stop_child()
+        note = None
+        if added or removed:
+            dev, mnt = card_attach(self.card_file, readonly=False, browse=False)
+            copied, deleted = [], []
+            try:
+                card_no_droppings(mnt)
+                audio = pathlib.Path(mnt) / set_name / "AUDIO"
+                audio.mkdir(parents=True, exist_ok=True)
+                have = {q.name.lower(): q for q in audio.iterdir()}
+                for n in removed:
+                    q = have.get(n.lower())
+                    if q is not None and q.is_file():
+                        q.unlink(); deleted.append(n)
+                for n in added:
+                    q = have.get(n.lower())
+                    if q is not None and q.name != n and q.is_file():
+                        q.unlink()          # the same name in another case: one entry on the card
+                    shutil.copyfile(self.pool.path / n, audio / n)
+                    copied.append(n)
+                card_clean(mnt)
+            finally:
+                card_detach(dev)
+            for n in copied:
+                try:
+                    (self.pool.path / n).unlink()   # on the card now
+                except OSError:
+                    pass
+            self.card_removals.clear()
+            note = f"{len(copied)} copied, {len(deleted)} deleted"
+        self.refresh_card_files()
+        self._save_sidecar()
+        self.reinserts += 1
+        return note
 
     def commit_card(self):
         """Re-insert the card: rebuild the image from the pool (every file)
@@ -1467,12 +1967,14 @@ class Panel:
         under route A a fresh attach on the new bytes and the same boot
         preamble. Adds, removes and a second commit are refused meanwhile
         (card_busy)."""
-        if self.pool is None or self.card_builder is None:
+        if self.pool is None or (self.card_builder is None and not self.card_persistent):
             return False, "no sample pool"
         if self.card_busy:
             return False, "a re-insert is already in progress"
         if self.sound_busy:
             return False, "a sound switch (reboot) is in progress"
+        if self.card_ejected:
+            return False, "the card is ejected (mounted on the Mac): insert it first"
         if not self.booted:
             return False, f"the unit is still booting ({self.phase})"
         self.card_busy = True
@@ -1483,6 +1985,23 @@ class Panel:
             # for ~40 s and ACTION_LIMIT is 20 (it would kill it mid-boot).
             self.busy_since = None
             t0 = time.perf_counter()
+            if self.card_persistent:
+                # O19: no rebuild -- the pool's files are copied onto the
+                # user's card through a mount while the child is stopped
+                try:
+                    note = self._commit_persistent()
+                    self._reboot_port(self.REINSERT_PHASE)
+                    self.fault = None
+                    print(f"panel: card re-inserted ({note or 'no change'}; {len(self.card_files)} files in AUDIO)"
+                          f" in {time.perf_counter() - t0:.1f} s")
+                except Exception as e:
+                    self.fault = f"card re-insert: {type(e).__name__}: {e}"
+                    print(f"panel: {self.fault}")
+                    if self.proc is None or not self.proc.alive():
+                        self._reboot_port(self.REINSERT_PHASE)   # the card as it was
+                finally:
+                    self.card_busy = False
+                return
             try:
                 card, staged, audio_dir = self.card_builder()
                 self.card, self.staged_audio = card, audio_dir
@@ -1514,6 +2033,79 @@ class Panel:
                 self.card_busy = False
         self.actions.put(act)
         return True, self.REINSERT_PHASE
+
+    def eject_card(self, open_finder=True):
+        """/card/eject (O19): flush + stop the child, mount the image on the
+        Mac (browsable, so Finder shows it; `open` it too unless told not
+        to) and stay that way -- no child, every action refused -- until
+        /card/insert. The user copies samples, projects or whole sets in
+        and out as with a CF card in a reader. Persistent card only."""
+        if not self.card_persistent or self.backend != "port":
+            return False, "no persistent card (--card) to eject"
+        if self.card_ejected:
+            return False, f"the card is already ejected (mounted at {self.card_mount})"
+        if self.card_busy or self.sound_busy:
+            return False, f"the unit is busy ({self.phase})"
+        if not self.booted:
+            return False, f"the unit is still booting ({self.phase})"
+        self.card_busy = True
+        self.phase = self.EJECT_PHASE
+
+        def act():
+            self.busy_since = None
+            try:
+                self._stop_child()
+                dev, mnt = card_attach(self.card_file, readonly=False, browse=True)
+                card_no_droppings(mnt)
+                self.card_ejected, self.card_mount, self.card_dev = True, mnt, dev
+                self.phase = f"card ejected: mounted at {mnt} -- INSERT CARD to boot"
+                self.fault = None
+                print(f"panel: card ejected, mounted at {mnt} ({dev})")
+                if open_finder:
+                    subprocess.Popen(["open", mnt])
+            except Exception as e:
+                self.fault = f"card eject: {type(e).__name__}: {e}"
+                print(f"panel: {self.fault}")
+                self.card_ejected, self.card_mount, self.card_dev = False, None, None
+                self._reboot_port("booting again (the eject failed)")
+            finally:
+                self.card_busy = False
+        self.actions.put(act)
+        return True, self.EJECT_PHASE
+
+    def insert_card(self):
+        """/card/insert (O19): clean the volume, detach it, re-list the
+        card and boot the child on it. A detach that fails (a file open
+        in Finder) leaves the card ejected and says why in /status fault."""
+        if not self.card_ejected:
+            return False, "the card is not ejected"
+        if self.card_busy:
+            return False, f"the unit is busy ({self.phase})"
+        self.card_busy = True
+        self.phase = self.INSERT_PHASE
+
+        def act():
+            self.busy_since = None
+            t0 = time.perf_counter()
+            try:
+                gone = card_clean(self.card_mount)
+                how = card_detach(self.card_dev or self.card_mount)
+                self.card_ejected, self.card_mount, self.card_dev = False, None, None
+                self.refresh_card_files()
+                self._save_sidecar()
+                print(f"panel: card inserted ({how}; {len(gone)} macOS files removed; {len(self.card_files)} files in AUDIO)")
+                self._reboot_port(self.INSERT_PHASE)
+                self.fault = None
+                print(f"panel: booted on the inserted card in {time.perf_counter() - t0:.1f} s")
+            except Exception as e:
+                self.fault = f"card insert: {type(e).__name__}: {e}"
+                print(f"panel: {self.fault}")
+                if self.card_ejected:
+                    self.phase = f"card ejected: mounted at {self.card_mount} -- INSERT CARD to boot ({e})"
+            finally:
+                self.card_busy = False
+        self.actions.put(act)
+        return True, self.INSERT_PHASE
 
     def _instrument(self, rt):
         """Route A: time every rt.run(ms=...) for the speed meter (the port's
@@ -1660,18 +2252,25 @@ class Panel:
                     act = self.actions.get(timeout=self.PACE_POLL_S)
                 except queue.Empty:
                     act = None
+                ran = False
                 while act is not None:
                     self.busy_since = time.perf_counter()
                     try:
                         act()
-                        self._drain_audio(self.rt)   # what the action's own runs rendered
+                        ran = True
+                        if self.rt is not None and not self.card_ejected:
+                            self._drain_audio(self.rt)   # what the action's own runs rendered
                     finally:
                         self.busy_since = None
                     try:
                         act = self.actions.get_nowait()
                     except queue.Empty:
                         act = None
+                if self.card_ejected or self.rt is None:
+                    continue            # O19: the card is on the Mac; no child to serve
                 rt = self.rt        # after the actions: a respawn / re-insert / sound switch replaces it
+                if ran:
+                    self._card_flush(rt, force=True)    # O19: the batch's writes on disk
                 if rt is not armed:
                     if not rt.paced:
                         rt.pace(True, self.PACE_RATE)   # a fresh child: arm its pacer
@@ -1701,8 +2300,11 @@ class Panel:
                     self.fault = f"port: run stopped: {st.get('stop')}"
                 self._snapshot(self._uc())
                 self._parse_leds(rt)
+                self._card_flush(rt)
             except PortDied as e:
                 self.busy_since = None
+                if self.card_ejected:
+                    continue            # a stale action hit the stopped child: nothing to respawn on
                 if not self._respawn(str(e)):
                     return
             except Exception as e:
@@ -2334,6 +2936,8 @@ class Panel:
 
     def do(self, fn, timeout=30.0):
         """Run fn(rt) on the emu thread, return (ok, result-or-error)."""
+        if self.card_ejected:
+            return False, f"the card is ejected (mounted at {self.card_mount}): insert it first"
         done = threading.Event()
         box = {}
         def act():
@@ -2491,10 +3095,16 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": "no sample pool"}, 500)
             return
         if path == "/samples":
+            if p.card_persistent and not p.card_ejected and not p.card_busy:
+                p.refresh_card_files()          # O19: the image as it is now (no mount)
             added, removed = p.pending()
             self._json({"pool": str(p.pool.path), "staged": str(p.staged_audio) if p.staged_audio else None,
-                        "files": p.pool.files(), "pending": added, "removed": removed,
-                        "busy": p.card_busy, "phase": p.phase})
+                        "files": p.samples_files(), "pending": added, "removed": removed,
+                        "busy": p.card_busy, "phase": p.phase,
+                        # O19: the card itself
+                        "card": str(p.card_file) if p.card_file else None,
+                        "card_mode": "persistent" if p.card_persistent else "fresh",
+                        "card_rw": p.card_rw, "card_ejected": p.card_ejected})
             return
         if p.card_busy:
             self._json({"ok": False, "error": "the card is being re-inserted (reboot in progress)",
@@ -2526,7 +3136,7 @@ class Handler(BaseHTTPRequestHandler):
                 if tmp.exists():
                     tmp.unlink()
         elif path == "/samples/remove":
-            r = p.pool.remove(arg("name"))
+            r = p.remove_sample(arg("name"))
         elif path == "/samples/commit":
             ok, res = p.commit_card()
             self._json({"ok": ok, "phase": res} if ok else {"ok": False, "error": res, "phase": p.phase})
@@ -2681,9 +3291,42 @@ class Handler(BaseHTTPRequestHandler):
                             "clock": p.clock_note,          # what the boot-time YES found
                             "sound": p.sound,               # the child runs the DSP cores and its main out is captured
                             "sound_rt": p.sound_rt,         # O17: ... under --dsp-rt (real time); False = the lockstep --dsp (~0.2x) or no cores
-                            "sound_note": p.sound_note})
+                            "sound_note": p.sound_note,
+                            # O19: the card
+                            "card": str(p.card_file) if p.card_file else None,
+                            "card_mode": "persistent" if p.card_persistent else "fresh",
+                            "card_rw": p.card_rw,             # the child writes through to the file
+                            "card_ejected": p.card_ejected,
+                            "card_mount": p.card_mount,
+                            "project": {"set": p.project[0], "name": p.project[1]} if p.project else None})
         elif path.startswith("/samples"):
             self._samples(path, args)
+        elif path == "/card":
+            # O19: the card as a whole: file, sidecar, names, write-back, the
+            # eject state, the AUDIO listing and the sets on it (the image
+            # read directly, no mount)
+            sets = {}
+            if p.card_file and not p.card_ejected:
+                try:
+                    with Fat16Image(p.card_file) as img:
+                        sets = img.sets()
+                except (OSError, ValueError, struct.error) as e:
+                    sets = {"error": f"{type(e).__name__}: {e}"}
+            self._json({"card": str(p.card_file) if p.card_file else None,
+                        "mode": "persistent" if p.card_persistent else "fresh",
+                        "sidecar": str(sidecar_path(p.card_file)) if p.card_persistent and p.card_file else None,
+                        "meta": p.card_meta, "project": p.project, "rw": p.card_rw,
+                        "flush": p.card_flush_note, "ejected": p.card_ejected, "mount": p.card_mount,
+                        "pool": str(p.pool.path) if p.pool else None,
+                        "audio": p.card_files, "removals": sorted(p.card_removals), "sets": sets,
+                        "busy": p.card_busy, "phase": p.phase})
+        elif path == "/card/eject":
+            ok, res = p.eject_card(open_finder=args.get("open", "1") != "0")
+            self._json({"ok": ok, "phase": res, "mount": p.card_mount} if ok
+                       else {"ok": False, "error": res, "phase": p.phase, "mount": p.card_mount})
+        elif path == "/card/insert":
+            ok, res = p.insert_card()
+            self._json({"ok": ok, "phase": res} if ok else {"ok": False, "error": res, "phase": p.phase})
         elif path.startswith("/audio"):
             self._audio(path, args)
         elif path == "/peek":
@@ -2812,6 +3455,11 @@ def main():
     ap.add_argument("--project", default=None, help="project dir to stage onto the card")
     ap.add_argument("--set", default="OCTABAM")
     ap.add_argument("--name", default=None)
+    ap.add_argument("--card", default=None, metavar="IMG",
+                    help="a PERSISTENT card image (O19): booted as it is with write-back, so SAVE PROJECT on the "
+                         "unit and the samples put on it survive a quit; created once from --project when missing "
+                         "(a sidecar IMG.json keeps the set/project names; the pool of pending samples is IMG.pool/). "
+                         "Without it: a fresh per-port image every start, as before")
     ap.add_argument("--port", type=int, default=8563)
     ap.add_argument("--no-rtc", action="store_true",
                     help="leave the DSPI RTC unmodelled (the firmware then reads 2000-00-00 00:00:00)")
@@ -2861,24 +3509,91 @@ def main():
     # them every sample slot stays invalid (RTOS_FORK section 10.12) -- the
     # UI still works, the audio does not. --audio dirs go through add()
     # (converted when the unit would not read them).
-    pool = SamplePool(ROOT / "out" / f"_panel_pool_{a.port}")
     project_dir = pathlib.Path(a.project).resolve() if a.project else None
-    if project_dir is not None:
-        pool.seed(project_dir.parent / "AUDIO", convert=False)
-    for d in a.audio:
-        pool.seed(d, convert=True)
-    # One staging tree per server port: stage_project wipes and remakes its
-    # tree, and two panels started together on the shared default raced on
-    # it (FileExistsError in mkdir, 12 Sep 2026). The same builder rebuilds
-    # the card for /samples/commit.
-    tree = ROOT / "out" / f"_panel_stage_{a.port}"
-    builder = lambda: build_card(a.project, a.set, a.name, tree, pool)  # noqa: E731
-    card, staged, staged_audio = builder()
-    project = (a.set, staged) if a.project else None
-    if a.project:
-        print(f"staged {project_dir.name} as {a.set}/{staged} with {len(pool.names())} samples (pool {pool.path})")
+    card_path = pathlib.Path(a.card).expanduser().resolve() if a.card else None
+    card_meta = {}
+    if card_path is None:
+        pool = SamplePool(ROOT / "out" / f"_panel_pool_{a.port}")
+        if project_dir is not None:
+            pool.seed(project_dir.parent / "AUDIO", convert=False)
+        for d in a.audio:
+            pool.seed(d, convert=True)
+        # One staging tree per server port: stage_project wipes and remakes its
+        # tree, and two panels started together on the shared default raced on
+        # it (FileExistsError in mkdir, 12 Sep 2026). The same builder rebuilds
+        # the card for /samples/commit.
+        tree = ROOT / "out" / f"_panel_stage_{a.port}"
+        builder = lambda: build_card(a.project, a.set, a.name, tree, pool)  # noqa: E731
+        card, staged, staged_audio = builder()
+        project = (a.set, staged) if a.project else None
+        if a.project:
+            print(f"staged {project_dir.name} as {a.set}/{staged} with {len(pool.names())} samples (pool {pool.path})")
+        else:
+            print(f"empty project card with {len(pool.names())} samples (pool {pool.path})")
     else:
-        print(f"empty project card with {len(pool.names())} samples (pool {pool.path})")
+        # O19: the persistent card. Its pool (pending additions) lives beside
+        # it and is never wiped; a missing image is built once, exactly as
+        # the per-port card is, from --project + its sibling AUDIO + --audio,
+        # and the sidecar records the names the child boots with.
+        pool = SamplePool(card_path.with_name(card_path.name + ".pool"), wipe=False)
+        builder, staged_audio = None, None
+        if not card_path.exists():
+            seed = SamplePool(ROOT / "out" / f"_panel_pool_{a.port}")
+            if project_dir is not None:
+                seed.seed(project_dir.parent / "AUDIO", convert=False)
+            for d in a.audio:
+                seed.seed(d, convert=True)
+            tree = ROOT / "out" / f"_panel_stage_{a.port}"
+            card, staged, _ = build_card(a.project, a.set, a.name, tree, seed)
+            card_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = card_path.with_name(card_path.name + ".tmp")
+            tmp.write_bytes(card)
+            tmp.replace(card_path)
+            card_meta = {"set": a.set, "project": staged, "created": datetime.datetime.now().isoformat(timespec="seconds"),
+                         "from_project": str(project_dir) if project_dir else None,
+                         "image_bytes": len(card), "removals": [], "pool": str(pool.path)}
+            sidecar_save(card_path, card_meta)
+            print(f"card: created {card_path} ({len(card) >> 20} MB) from "
+                  f"{project_dir.name + ' as ' if project_dir else 'an empty '}{a.set}/{staged or '-'} "
+                  f"with {len(seed.names())} samples; sidecar {sidecar_path(card_path)}")
+            project = (a.set, staged) if a.project else None
+        else:
+            # a card the previous server left ejected (mounted on the Mac):
+            # never boot the child on a volume macOS is writing -- clean and
+            # detach it first, as /card/insert would
+            was = card_mounted_at(card_path)
+            if was is not None:
+                dev, mnt = was
+                try:
+                    gone = card_clean(mnt) if mnt else []
+                    how = card_detach(dev)
+                    print(f"card: {card_path} was still mounted at {mnt}: {how} ({len(gone)} macOS files removed)")
+                except Exception as e:
+                    sys.exit(f"panel: {card_path} is mounted at {mnt} and could not be detached ({e}); "
+                             f"eject it in Finder (or `hdiutil detach {dev}`) and start again")
+            card_meta = sidecar_load(card_path)
+            set_name, name = card_meta.get("set"), card_meta.get("project")
+            if not (set_name and name):
+                set_name, name = (a.set if a.set != "OCTABAM" else None) or set_name, a.name or name
+            if not (set_name and name):
+                try:
+                    with Fat16Image(card_path) as img:
+                        sets = img.sets()
+                    set_name, projects = next(((k, v) for k, v in sets.items() if v), (None, []))
+                    name = projects[0] if projects else None
+                    print(f"card: no sidecar; the image holds {sets}")
+                except (OSError, ValueError, struct.error) as e:
+                    print(f"card: {card_path} is not a readable card image ({e})")
+            project = (set_name, name) if set_name and name else None
+            card_meta.update({"set": set_name, "project": name, "pool": str(pool.path)})
+            card_meta.setdefault("removals", [])
+            sidecar_save(card_path, card_meta)
+            added = []
+            for d in a.audio:
+                added += pool.seed(d, convert=True)
+            print(f"card: booting {card_path} as it is ({project[0] + '/' + project[1] if project else 'no project'}; "
+                  f"{len(pool.names())} pending in {pool.path}{', ' + str(len(added)) + ' from --audio' if added else ''})")
+        card = None
 
     if not a.no_rtc:
         install_rtc()           # route A only; the port's DSPI answers 0 (the 2000-00-00 dialog)
@@ -2897,7 +3612,21 @@ def main():
             backend = "routea"
             note = f"{note}; running route A"
             print(f"panel: {note}")
-    if backend == "port":
+    card_rw = False
+    if card_path is not None and backend != "port":
+        sys.exit(f"panel: --card needs the port backend ({note or 'route A has no write-back'})")
+    if backend == "port" and card_path is not None:
+        # O19: the user's own image, booted as it is; write-back when the
+        # binary knows the flag (an older out/emu/ot_emu boots it read-only
+        # and /status card_rw says so)
+        card_file = card_path
+        pb = pathlib.Path(a.port_bin)
+        card_rw = pb.suffix == ".py" or b"--card-rw" in pb.read_bytes()
+        if not card_rw:
+            note = ((note + "; ") if note else "") + \
+                f"{pb} has no --card-rw (built before O19): the card is booted read-only, SAVE on the unit stays in RAM"
+            print(f"panel: {note}")
+    elif backend == "port":
         # The port reads the card from a file: the same bytes route A would
         # attach, one file per server port so two panels do not share it.
         card_file = ROOT / "out" / f"_panel_card_{a.port}.img"
@@ -2915,19 +3644,41 @@ def main():
                           card_file=card_file, backend_note=note, auto=a.backend == "auto",
                           play_pump_ms=25.0 if backend == "port" else 10.0,
                           pool=pool, card_builder=builder, staged_audio=staged_audio,
-                          sound=sound, takes_dir=takes_dir)
+                          sound=sound, takes_dir=takes_dir, card_persistent=card_path is not None,
+                          card_rw=card_rw, card_meta=card_meta)
     Handler.html = (pathlib.Path(__file__).parent / "panel.html").read_bytes()
     print(f"panel: http://localhost:{a.port}/   image={image}   backend={backend}"
-          f"   sound={'on' if Handler.panel.sound_wanted else 'off'} (takes in {takes_dir})")
+          f"   sound={'on' if Handler.panel.sound_wanted else 'off'} (takes in {takes_dir})"
+          f"   card={card_file} ({'persistent, write-back ' + ('on' if card_rw else 'OFF') if card_path else 'fresh per port'})")
+
+    # O19: SIGTERM (the app's quit, a kill) ends serve_forever through the
+    # finally below instead of killing the interpreter outright, so the
+    # child gets `card flush` + `quit` (it fsyncs before its ok) and the
+    # sidecar is written. Python's default action for SIGTERM is to die at
+    # once -- the app's README said so, and it was true.
+    def _term(signum, frame):
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, _term)
     if (host_nice() or 0) > 0:
         print(f"panel: running at nice {host_nice()} (a zsh `&` job: BG_NICE) -- the unit will be slower "
               f"whenever anything else wants the CPU; start the server in the foreground, or `unsetopt BG_NICE`")
     try:
         srv.serve_forever()
     finally:
-        Handler.panel._close_take(None)     # a take open at exit stays a valid WAV
-        if Handler.panel.proc is not None:
-            Handler.panel.proc.quit()
+        pn = Handler.panel
+        pn._close_take(None)     # a take open at exit stays a valid WAV
+        if pn.card_ejected and pn.card_mount:
+            # the card stays mounted on the Mac (the user may be copying):
+            # say so; the next start on it needs it detached first
+            print(f"panel: exiting with the card still mounted at {pn.card_mount} -- `hdiutil detach` it before the next start")
+        if pn.proc is not None:
+            if pn.card_rw:
+                try:
+                    pn.proc.command("card flush", "card", timeout=10.0)
+                except (PortDied, PortError):
+                    pass
+            pn.proc.quit()
+        pn._save_sidecar()
 
 
 if __name__ == "__main__":

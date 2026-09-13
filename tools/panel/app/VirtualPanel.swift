@@ -45,6 +45,22 @@
 // save flow, so the page never navigates away. VIRTUAL_PANEL_SAVE=<path>,
 // VIRTUAL_PANEL_SOUND=0|1, VIRTUAL_PANEL_SAVE_DIR=<dir> and
 // VIRTUAL_PANEL_NAV=open:|go:<path> drive it from scripts.
+//
+// The card (13 Sep 2026, O19): the server's --card <img> boots a PERSISTENT
+// card image with the child's write-back on, so SAVE PROJECT on the unit and
+// the samples put on the card survive a quit. File > New Card from Project...
+// creates out/cards/<Set>-<Project>.img from a project folder (once) and
+// boots it; Open Card... picks an .img; the last card is remembered
+// (UserDefaults cardPath) and booted at launch -- with none ever chosen the
+// old projectDir behaviour (a fresh per-port image) stays. Show Card in
+// Finder reveals the .img. Eject Card = /card/eject: the server flushes,
+// stops the child and mounts the image on the Mac; the volume is opened in
+// Finder to copy samples / projects / sets in and out; Insert Card =
+// /card/insert detaches and boots again. Quit stops the server with SIGTERM,
+// which the server now handles: `card flush` + `quit` to the child.
+// VIRTUAL_PANEL_CARD=<img> boots that card for one launch (not remembered);
+// VIRTUAL_PANEL_PORT_BIN=<bin> passes --port-bin (a build of ot_emu that
+// knows --card-rw before out/emu is rebuilt).
 import Cocoa
 import UniformTypeIdentifiers
 import WebKit
@@ -139,8 +155,17 @@ final class PanelServer {
     /// The command line for a project directory (nil = the empty card, which
     /// boots to SET DATE/TIME). --set is the parent folder, --name the folder:
     /// out/_projects/otlive/OTLIVE/PROJECT -> --set OTLIVE --name PROJECT.
-    func arguments(project: URL?) -> [String] {
+    /// With a `card` (O19) the server boots that image as it is (--card); the
+    /// project arguments only matter when the image does not exist yet (it
+    /// is created from them once). VIRTUAL_PANEL_PORT_BIN adds --port-bin.
+    func arguments(project: URL?, card: URL? = nil) -> [String] {
         var a = [repo.appendingPathComponent("tools/panel/panel_server.py").path, "--port", String(port)]
+        if let b = ProcessInfo.processInfo.environment["VIRTUAL_PANEL_PORT_BIN"], !b.isEmpty {
+            a += ["--port-bin", b]
+        }
+        if let c = card {
+            a += ["--card", c.path]
+        }
         if let p = project {
             a += ["--project", p.path,
                   "--set", p.deletingLastPathComponent().lastPathComponent,
@@ -149,14 +174,14 @@ final class PanelServer {
         return a
     }
 
-    func commandLine(project: URL?) -> String {
-        ([repo.appendingPathComponent(".venv/bin/python3").path] + arguments(project: project)).joined(separator: " ")
+    func commandLine(project: URL?, card: URL? = nil) -> String {
+        ([repo.appendingPathComponent(".venv/bin/python3").path] + arguments(project: project, card: card)).joined(separator: " ")
     }
 
-    func spawn(project: URL?) throws {
+    func spawn(project: URL?, card: URL? = nil) throws {
         let p = Process()
         p.executableURL = repo.appendingPathComponent(".venv/bin/python3")   // the arm64 venv (EMAC-fixed Unicorn)
-        p.arguments = arguments(project: project)
+        p.arguments = arguments(project: project, card: card)
         p.currentDirectoryURL = repo
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = "/opt/homebrew/bin:" + (env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin")
@@ -175,18 +200,20 @@ final class PanelServer {
         }
         try p.run()
         process = p
-        Log.write("spawned pid \(p.processIdentifier): \(commandLine(project: project))")
+        Log.write("spawned pid \(p.processIdentifier): \(commandLine(project: project, card: card))")
     }
 
-    /// SIGTERM the spawned server and wait for it (SIGKILL after 3 s).
-    /// Python has no SIGTERM handler, so the default action ends it at once
-    /// even mid-Unicorn-burst. No-op for an attached server.
+    /// SIGTERM the spawned server and wait for it (SIGKILL after 5 s). The
+    /// server handles SIGTERM since O19: it sends the child `card flush` +
+    /// `quit` (the child fsyncs the card image before its ok) and writes the
+    /// card's sidecar, then exits -- measured 125 ms on 13 Sep 2026. No-op
+    /// for an attached server.
     func stop() {
         guard let p = process else { return }
         process = nil
         guard p.isRunning else { return }
         p.terminate()
-        let deadline = Date().addingTimeInterval(3)
+        let deadline = Date().addingTimeInterval(5)
         while p.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.05) }
         if p.isRunning { kill(p.processIdentifier, SIGKILL); p.waitUntilExit() }
         Log.write("server pid \(p.processIdentifier) stopped (\(Self.ending(of: p)))")
@@ -334,6 +361,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
                          WKUIDelegate, NSMenuDelegate {
     static let projectKey = "projectDir"   // UserDefaults: the Open Project... choice
     static let saveDirKey = "saveDir"      // UserDefaults: where the last recording was saved
+    static let cardKey = "cardPath"        // UserDefaults: the card image (O19) booted at launch
 
     let repo: URL
     let server: PanelServer
@@ -361,6 +389,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     var statusProbing = false
     var saveDir: URL?                      // VIRTUAL_PANEL_SAVE_DIR: saves land there, no save panel
     var navHook = ""                       // VIRTUAL_PANEL_NAV: fired once the page has loaded
+    // the card (O19)
+    var cardItem: NSMenuItem!              // File > Eject Card / Insert Card (the title follows /status)
+    var showCardItem: NSMenuItem!          // File > Show Card in Finder (enabled with a persistent card)
+    var cardPathFromStatus: String?        // /status "card"
+    var cardPersistent = false             // /status "card_mode" == persistent
+    var cardEjected = false                // /status "card_ejected"
+    var cardMount: String?                 // /status "card_mount"
+    var cardRw: Bool?                      // /status "card_rw"
+    var launchCard: URL?                   // VIRTUAL_PANEL_CARD: this launch's card, not remembered
     var navHookMarker = ""
     var interceptedNavs = 0                // audio/wav navigations turned into the save flow
 
@@ -380,6 +417,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             self.stopPolling()
             self.panelShown = false
             self.showPlaceholder("the panel server exited: \(how)", failed: true)
+        }
+        // VIRTUAL_PANEL_CARD=<img>: this launch boots that card (created from
+        // the project if missing), the remembered choice untouched.
+        if let c = ProcessInfo.processInfo.environment["VIRTUAL_PANEL_CARD"], !c.isEmpty {
+            launchCard = URL(fileURLWithPath: c)
+            Log.write("VIRTUAL_PANEL_CARD: \(c) (this launch only)")
         }
         startServer()
         // VIRTUAL_PANEL_ADD=<path>[:<path>...]: the add flow without the UI,
@@ -552,7 +595,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
 
         let fileItem = NSMenuItem(); main.addItem(fileItem)
         let file = NSMenu(title: "File")
-        file.addItem(withTitle: "Open Project...", action: #selector(openProject(_:)), keyEquivalent: "o").target = self
+        file.delegate = self
+        // the card (O19): a persistent image the unit saves into
+        file.addItem(withTitle: "New Card from Project...", action: #selector(newCardFromProject(_:)), keyEquivalent: "n").target = self
+        let openCard = file.addItem(withTitle: "Open Card...", action: #selector(openCard(_:)), keyEquivalent: "O")
+        openCard.keyEquivalentModifierMask = [.command, .shift]
+        openCard.target = self
+        showCardItem = file.addItem(withTitle: "Show Card in Finder", action: #selector(showCardInFinder(_:)), keyEquivalent: "")
+        showCardItem.target = self
+        cardItem = file.addItem(withTitle: "Eject Card", action: #selector(ejectOrInsertCard(_:)), keyEquivalent: "e")
+        cardItem.target = self
+        cardItem.isEnabled = false
+        file.addItem(.separator())
+        // the old way: a project folder onto a fresh per-port card (nothing persists)
+        file.addItem(withTitle: "Open Project (scratch card)...", action: #selector(openProject(_:)), keyEquivalent: "o").target = self
         file.addItem(withTitle: "Reload", action: #selector(reload(_:)), keyEquivalent: "r").target = self
         file.addItem(.separator())
         let add = file.addItem(withTitle: "Add Samples to Card...", action: #selector(addSamples(_:)), keyEquivalent: "A")
@@ -614,6 +670,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         return fm.fileExists(atPath: d.path) ? d : nil
     }
 
+    /// The card to boot (O19): VIRTUAL_PANEL_CARD for this launch, else the
+    /// remembered New Card / Open Card choice (a remembered file that is gone
+    /// is forgotten and logged); nil = the old behaviour (projectDir() on a
+    /// fresh per-port card).
+    func cardPath() -> URL? {
+        if let c = launchCard { return c }
+        if let p = UserDefaults.standard.string(forKey: Self.cardKey) {
+            if FileManager.default.fileExists(atPath: p) { return URL(fileURLWithPath: p) }
+            Log.write("remembered card is gone, ignoring: \(p)")
+            UserDefaults.standard.removeObject(forKey: Self.cardKey)
+        }
+        return nil
+    }
+
+    /// out/cards/<Set>-<Project>.img for a project folder (its parent is the set).
+    func defaultCard(for project: URL) -> URL {
+        let set = project.deletingLastPathComponent().lastPathComponent
+        return repo.appendingPathComponent("out/cards/\(set)-\(project.lastPathComponent).img")
+    }
+
     /// Attach if something already answers on the port, else spawn and poll.
     /// Also Reload's path when the server is not ours: a probe that fails
     /// then means it is gone and a fresh one is spawned, rather than waiting.
@@ -631,14 +707,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
                 self.loadPanel()
                 return
             }
-            self.launch(project: self.projectDir())
+            let card = self.cardPath()
+            // a card that exists boots as it is; a missing one (VIRTUAL_PANEL_CARD
+            // naming a new file) is created from the project the old default gives
+            let project = card.map { FileManager.default.fileExists(atPath: $0.path) ? nil : self.projectDir() } ?? self.projectDir()
+            self.launch(project: project, card: card)
         }
     }
 
-    func launch(project: URL?) {
-        let what = project.map { "project \($0.deletingLastPathComponent().lastPathComponent)/\($0.lastPathComponent)" } ?? "empty card"
+    func launch(project: URL?, card: URL? = nil) {
+        var what = project.map { "project \($0.deletingLastPathComponent().lastPathComponent)/\($0.lastPathComponent)" } ?? "empty card"
+        if let c = card { what = "card \(c.lastPathComponent)" + (project == nil ? "" : " (new, from \(what))") }
         do {
-            try server.spawn(project: project)
+            try server.spawn(project: project, card: card)
         } catch {
             Log.write("spawn failed: \(error)")
             showPlaceholder("could not start the panel server: \(error.localizedDescription) -- is .venv built (scripts/setup.sh)?", failed: true)
@@ -648,20 +729,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         startPolling()
     }
 
-    /// Open Project...: a spawned server is replaced; an attached one is not
-    /// ours to restart, so say what to run instead.
-    func restartServer(project: URL?) {
+    /// Open Project... / New Card / Open Card: a spawned server is replaced;
+    /// an attached one is not ours to restart, so say what to run instead.
+    func restartServer(project: URL?, card: URL? = nil) {
         if server.attached {
             sheet("The server on port \(server.port) was not started by this app",
                   "Restart it yourself with the project, then choose File > Reload:\n\n"
-                  + server.commandLine(project: project))
+                  + server.commandLine(project: project, card: card))
             return
         }
         stopPolling()
         probeGen += 1          // drop a startServer probe still in flight
         server.stop()
         panelShown = false
-        launch(project: project)
+        launch(project: project, card: card)
     }
 
     func startPolling() {
@@ -744,9 +825,160 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         panel.beginSheetModal(for: window) { [weak self] resp in
             guard let self = self, resp == .OK, let dir = panel.url else { return }
             UserDefaults.standard.set(dir.path, forKey: Self.projectKey)
-            Log.write("project chosen (remembered): \(dir.path)")
+            UserDefaults.standard.removeObject(forKey: Self.cardKey)   // back to the scratch card until a card is chosen again
+            self.launchCard = nil
+            Log.write("project chosen (remembered; the card forgotten): \(dir.path)")
             self.restartServer(project: dir)
         }
+    }
+
+    // MARK: the card (O19)
+
+    /// New Card from Project...: a project folder saved on a unit -> a card
+    /// image out/cards/<Set>-<Project>.img (created by the server once, from
+    /// the project and its sibling AUDIO), remembered and booted. An image
+    /// of that name that exists is offered as it is (Open) or replaced.
+    @objc func newCardFromProject(_ sender: Any?) {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Make Card"
+        panel.message = "A project folder saved on a unit (SET/PROJECT): a card image is made from it under out/cards/ and booted. The unit then saves into that card."
+        let projects = repo.appendingPathComponent("out/_projects")
+        if FileManager.default.fileExists(atPath: projects.path) { panel.directoryURL = projects }
+        panel.beginSheetModal(for: window) { [weak self] resp in
+            guard let self = self, resp == .OK, let dir = panel.url else { return }
+            let card = self.defaultCard(for: dir)
+            if FileManager.default.fileExists(atPath: card.path) {
+                self.sheet("A card for this project already exists",
+                           "\(card.path)\n\nOpen it as it is (what the unit saved into it stays), or replace it with a fresh card from the project folder?",
+                           buttons: ["Open Existing", "Replace", "Cancel"]) { b in
+                    if b == 2 { return }
+                    if b == 1 {
+                        for suffix in ["", ".json"] {
+                            try? FileManager.default.removeItem(atPath: card.path + suffix)
+                        }
+                        Log.write("card replaced: \(card.path)")
+                    }
+                    self.useCard(card, project: b == 1 ? dir : nil, source: "New Card from Project")
+                }
+                return
+            }
+            self.useCard(card, project: dir, source: "New Card from Project")
+        }
+    }
+
+    /// Open Card...: an existing .img (its sidecar, or the sets on it, name the project).
+    @objc func openCard(_ sender: Any?) {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Insert"
+        panel.message = "A card image (.img) made by Virtual Panel, or any MBR + FAT16 card image with a set on it"
+        if #available(macOS 11.0, *) {
+            panel.allowedContentTypes = [UTType(filenameExtension: "img") ?? .data, .diskImage, .data]
+        }
+        let cards = repo.appendingPathComponent("out/cards")
+        if FileManager.default.fileExists(atPath: cards.path) { panel.directoryURL = cards }
+        panel.beginSheetModal(for: window) { [weak self] resp in
+            guard let self = self, resp == .OK, let img = panel.url else { return }
+            self.useCard(img, project: nil, source: "Open Card")
+        }
+    }
+
+    /// Remember the card and restart the server on it (`project` only when
+    /// the image is to be created from it).
+    func useCard(_ card: URL, project: URL?, source: String) {
+        UserDefaults.standard.set(card.path, forKey: Self.cardKey)
+        launchCard = nil
+        Log.write("card chosen (\(source), remembered): \(card.path)" + (project.map { " from \($0.path)" } ?? ""))
+        restartServer(project: project, card: card)
+    }
+
+    /// Show Card in Finder: the .img the server runs on (/status "card").
+    @objc func showCardInFinder(_ sender: Any?) {
+        guard let c = cardPathFromStatus, cardPersistent else {
+            sheet("No card file", "The unit runs on a scratch card (a fresh per-port image). File > New Card from Project... makes one that persists.")
+            return
+        }
+        Log.write("show card: \(c)")
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: c)])
+    }
+
+    /// Eject Card / Insert Card (the one item, its title from /status):
+    /// eject = GET /card/eject?open=0 (the server flushes, stops the child,
+    /// mounts the image), then the volume opened in Finder here; insert =
+    /// GET /card/insert (the server cleans macOS's droppings, detaches,
+    /// boots). Refusals are sheets with the server's error.
+    @objc func ejectOrInsertCard(_ sender: Any?) {
+        if cardEjected {
+            Log.write("card: GET /card/insert")
+            server.get("/card/insert", timeout: 30) { [weak self] ok, r, why in
+                guard let self = self else { return }
+                if ok, let r = r, r["ok"] as? Bool == true {
+                    Log.write("card inserted: \(r["phase"] as? String ?? "ok")")
+                } else {
+                    let e = (r?["error"] as? String) ?? why
+                    Log.write("card insert failed: \(e)")
+                    self.sheet("The card could not be inserted", e + "\n\nClose what holds files on the volume (a Finder window, Quick Look) and try again.")
+                }
+                self.statusProbing = false
+                self.pollStatusOnce()
+            }
+            return
+        }
+        sheet("Eject the card?",
+              "The unit is switched off and its card is mounted on this Mac (the volume opens in Finder): copy samples into <SET>/AUDIO, projects into <SET>/, or whole sets. File > Insert Card puts it back and boots the unit (~40 s). Save your project on the unit first (PROJECT > SAVE) if it matters -- as with a real card.",
+              buttons: ["Eject", "Cancel"]) { [weak self] b in
+            guard b == 0, let self = self else { Log.write("card eject: cancelled"); return }
+            Log.write("card: GET /card/eject?open=0")
+            self.server.get("/card/eject", query: [("open", "0")], timeout: 30) { [weak self] ok, r, why in
+                guard let self = self else { return }
+                if ok, let r = r, r["ok"] as? Bool == true {
+                    Log.write("card ejecting: \(r["phase"] as? String ?? "ok")")
+                    self.openMountWhenEjected(deadline: Date().addingTimeInterval(60))
+                } else {
+                    let e = (r?["error"] as? String) ?? why
+                    Log.write("card eject failed: \(e)")
+                    self.sheet("The card could not be ejected", e)
+                }
+            }
+        }
+    }
+
+    /// The eject is an emulator-thread action (flush, stop, hdiutil): poll
+    /// /status until card_ejected, then open the mount point in Finder.
+    func openMountWhenEjected(deadline: Date) {
+        server.probe(timeout: 2.0) { [weak self] ok, st in
+            guard let self = self, !self.quitting else { return }
+            if ok, let st = st, st["card_ejected"] as? Bool == true, let m = st["card_mount"] as? String {
+                Log.write("card ejected, mounted at \(m): opening in Finder")
+                NSWorkspace.shared.open(URL(fileURLWithPath: m, isDirectory: true))
+                self.noteStatus(st)
+                return
+            }
+            if ok, let f = st?["fault"] as? String, f.hasPrefix("card eject") {
+                Log.write("card eject: \(f)")
+                self.sheet("The card could not be ejected", f)
+                return
+            }
+            if Date() > deadline { Log.write("card eject: not ejected after 60 s"); return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.openMountWhenEjected(deadline: deadline) }
+        }
+    }
+
+    func updateCardItems() {
+        guard let item = cardItem else { return }
+        let title = cardEjected ? "Insert Card" : "Eject Card"
+        let enabled = cardPersistent && !quitting && (cardEjected || phase == "ready")
+        if title != item.title || enabled != item.isEnabled {
+            Log.write("card item: \(title), \(enabled ? "enabled" : "disabled")")
+        }
+        item.title = title
+        item.isEnabled = enabled
+        showCardItem?.isEnabled = cardPersistent && cardPathFromStatus != nil
     }
 
     /// cmd-R (or SIGUSR1). Our own server: reload the page, or keep polling
@@ -1018,7 +1250,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         }
         soundOn = sound
         phase = ph
+        // the card (O19)
+        let ejected = st?["card_ejected"] as? Bool ?? false
+        let mount = st?["card_mount"] as? String
+        let persistent = (st?["card_mode"] as? String) == "persistent"
+        let rw = st?["card_rw"] as? Bool
+        if ejected != cardEjected || mount != cardMount || persistent != cardPersistent || rw != cardRw {
+            Log.write("status: card \(st?["card"] as? String ?? "-") \(persistent ? "persistent" : "scratch"), write-back \(rw.map { $0 ? "on" : "off" } ?? "?")"
+                      + (ejected ? ", EJECTED at \(mount ?? "?")" : ""))
+        }
+        cardEjected = ejected; cardMount = mount; cardPersistent = persistent; cardRw = rw
+        cardPathFromStatus = st?["card"] as? String
         updateSoundItem()
+        updateCardItems()
     }
 
     func updateSoundItem() {
