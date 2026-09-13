@@ -530,8 +530,28 @@ namespace
 					reply("err usage: cfstatus");
 					continue;
 				}
-				std::snprintf(buf, sizeof buf, "cfstatus instructions=%llu ms=%.3f", static_cast<unsigned long long>(_m.instructions()), _rtos.ms());
+				std::snprintf(buf, sizeof buf, "cfstatus instructions=%llu ms=%.3f pc=%08x", static_cast<unsigned long long>(_m.instructions()), _rtos.ms(), _m.pc());
 				reply(buf);
+				continue;
+			}
+			if(cmd == "edmastatus")
+			{
+				// O17b diagnostic: the eDMA's booked completions (channel@sample, gated ones included), its IRQ lines,
+				// the gated-wait count, and INTC0's mask on the frame source and the eDMA channels
+				if(w.size() != 1)
+				{
+					reply("err usage: edmastatus");
+					continue;
+				}
+				std::string out = "edmastatus outstanding=" + std::to_string(_rtos.edma().outstanding()) + " gatedwaits=" + std::to_string(_rtos.edma().gatedWaits()) + " irq=";
+				for(uint32_t ch = 0; ch < 16; ++ch)
+					out += _rtos.edma().irq(ch) ? "1" : "0";
+				double nextDue = 0.0;
+				out += " nextdue=" + (_rtos.edma().nextDue(nextDue) ? std::to_string(nextDue) : std::string("none"));
+				out += " src1masked=" + std::to_string(_rtos.intc0().masked(1) ? 1 : 0) + " src8masked=" + std::to_string(_rtos.intc0().masked(8) ? 1 : 0)
+					+ " src1asserting=" + std::to_string(_rtos.intc0().assertedSource(1) ? 1 : 0) + " src8asserting=" + std::to_string(_rtos.intc0().assertedSource(8) ? 1 : 0)
+					+ " framepending=" + std::to_string(_rtos.framePending() ? 1 : 0) + " sample=" + std::to_string(_rtos.sample());
+				reply(out);
 				continue;
 			}
 			if(cmd == "pacestatus")
@@ -1115,7 +1135,7 @@ int main(int _argc, char** _argv)
 		}
 		if(dspRt)
 		{
-			std::printf("dsp-rt     : each core under the JIT on its own worker thread, run to the ColdFire's booked due count and never past it (O17); the shared window aliased through the MMU (six views); rtstatus reports it\n");
+			std::printf("dsp-rt     : each core under the JIT on its own worker thread, up to a frame ahead of the ColdFire's booked due count, core 0's bank word fenced on the frame handler's end (O17b); the shared window aliased through the MMU (six views); rtstatus reports it\n");
 			if(dspTrace || !dspPcWatch.empty() || !dspStopwatch.empty() || !dspWatch.empty() || !dspMap.empty() || !dspWrites.empty() || dspNoIdle)
 				std::printf("dsp-rt     : note: --dsp-trace/--dsp-pcwatch/--dsp-stopwatch/--dsp-watch/--dsp-map/--dsp-writes/--dsp-no-idle are the interpreter's per-instruction instruments and do not observe the JIT workers (OT_RT_FF=0 is the rt fast-forward's switch)\n");
 		}

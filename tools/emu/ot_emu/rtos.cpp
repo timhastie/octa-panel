@@ -50,6 +50,8 @@ namespace ot
 		, m_intc0("INTC0", 64)
 		, m_intc1("INTC1", 128)
 	{
+		if(const char* const e = std::getenv("OT_FENCE_TRACE"); e && std::atoi(e) != 0)
+			m_fenceTrace = true;
 		// INTC1 source 43 = PIT0 (vector 171, the scheduler); 44 = PIT1 (the
 		// storage layer's delay timer). INTC0 source 1 is the DSP frame clock
 		// and 27/28 the serial blocks -- both are later milestones, and their
@@ -195,7 +197,28 @@ namespace ot
 
 	void Rtos::peripheralWrite(const uint32_t _addr, const uint8_t _size, const uint32_t _val, const bool _replay)
 	{
-		if(_addr >= g_intc0 && _addr < g_intc0 + 0x100) m_intc0.write(_addr - g_intc0, _size, _val);
+		if(_addr >= g_intc0 && _addr < g_intc0 + 0x100)
+		{
+			// O17b: the frame handler masks its own source (INTC0 source 1)
+			// for the whole host-port exchange and unmasks it at the end --
+			// that unmask is "frame handled", the protocol's own end-of-frame
+			// mark, and the real-time DSP mode's fence opens on it.
+			const bool was = m_intc0.masked(1);
+			m_intc0.write(_addr - g_intc0, _size, _val);
+			const bool now = m_intc0.masked(1);
+			if(was != now)
+			{
+				if(m_fenceTrace)
+					std::fprintf(stderr, "ftrace %.3f cf src1 %s pc=%08x\n", m_sample, now ? "MASK" : "UNMASK", m_machine.pc());
+				if(auto* co = m_machine.coprocessor())
+				{
+					if(now)
+						co->frameHandling();
+					else
+						co->frameHandled();
+				}
+			}
+		}
 		else if(_addr >= g_intc1 && _addr < g_intc1 + 0x100) m_intc1.write(_addr - g_intc1, _size, _val);
 		else if(_addr >= g_pit0 && _addr < g_pit0 + 0x10) m_pit0.write(_addr - g_pit0, _size, _val, m_sample);
 		else if(_addr >= g_pit1 && _addr < g_pit1 + 0x10) m_pit1.write(_addr - g_pit1, _size, _val, m_sample);
@@ -326,6 +349,13 @@ namespace ot
 				m_framePending = false;
 				++m_frameCount;
 			}
+			if(_vec >= m_intc0.vectorBase() && _vec < m_intc0.vectorBase() + 64)
+			{
+				if(m_fenceTrace)
+					std::fprintf(stderr, "ftrace %.3f cf ack vec=%02x src=%u\n", m_sample, _vec, _vec - m_intc0.vectorBase());
+				if(auto* co = m_machine.coprocessor(); co && (_vec == m_intc0.vectorBase() + 1 || (_vec >= m_intc0.vectorBase() + 8 && _vec < m_intc0.vectorBase() + 24)))
+					co->cpuNote('a', _vec);		// the frame and the eDMA channels only (the timers would flood the record)
+			}
 			if(m_card && _vec == m_intc1.vectorBase() + g_ataSource)
 				++m_ataInterrupts;
 			if(m_acks.size() < 100000)
@@ -355,6 +385,7 @@ namespace ot
 		m_edma.setDataHooks(
 			[this, co](const uint32_t _ch)
 			{
+				co->cpuNote('k', _ch);		// O17b: the kick, in the protocol record
 				const auto daddr = m_edma.tcdField(_ch, 0x10, 4);
 				const auto saddr = m_edma.tcdField(_ch, 0, 4);
 				m_kickSel[_ch & 15] = co->selected();
@@ -377,6 +408,7 @@ namespace ot
 			},
 			[this, co](const uint32_t _ch)
 			{
+				co->cpuNote('d', _ch);		// O17b: the completion, in the protocol record
 				const auto saddr = m_edma.tcdField(_ch, 0, 4);
 				const auto daddr = m_edma.tcdField(_ch, 0x10, 4);
 				// ⚠️ An OUTBOUND block's DSP-side state is only meaningful HERE,
@@ -426,6 +458,7 @@ namespace ot
 					return;
 				const auto bytes = m_edma.tcdField(_ch, 8, 4) * m_edma.minorLoops(_ch);
 				std::vector<uint16_t> hw;
+				hw.reserve(bytes / 2);
 				m_hostWordsShort += co->pullHalfwords(saddr, m_kickSel[_ch & 15], hw, bytes / 2);
 				for(size_t i = 0; i < hw.size(); ++i)
 					m_machine.write16(daddr + 2 * static_cast<uint32_t>(i), hw[i]);
@@ -1255,6 +1288,8 @@ namespace ot
 	void Rtos::setFrame(const bool _on)
 	{
 		m_frame = _on;
+		if(auto* co = m_machine.coprocessor())
+			co->setFrameClock(_on);		// O17b: the rt mode's fence applies only while frames are taken
 		// Route A's `rt.next_frame = rt.sample + FRAME_PERIOD`: the first
 		// boundary is one period from HERE, not from a clock that has been
 		// running since the boot. Route A also switches to its exact

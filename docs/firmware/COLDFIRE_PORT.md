@@ -5191,3 +5191,363 @@ no ThreadSanitizer line on the child's stderr.
 - The macOS `sample`, `lldb -p` and TSan's symbolizer hang on this
   process (the MMU-backed DSP memory's six 64 MB views); `OT_SELFPROF` is
   what profiles it.
+
+## Milestone O17b — the fenced deep lead: `--dsp-rt` plays faster than real time ✅ (13 Sep 2026, branch `panel-ui`)
+
+O17 left the unit at 0.62–0.65x with sound, and named the cost: the cores
+could run at most ~2 samples ahead of the ColdFire's clock (8 stalled the
+frame protocol), so the ColdFire waited for them through every idle skip
+(1.3–1.6 s per 4 s of play) and every read-back pull (0.7 s), and its own
+emulation (~0.7 s per emulated second) barely overlapped the cores' frame
+work. This milestone lets the workers run **a whole frame ahead** (16
+samples = 66,560 DSP instructions, `OT_RT_LEAD=frame`, the numeric knob
+kept) and puts **one fence** at the only timing-assumptive point of the
+protocol instead of a fixed lead. With it, plus the host port's rings and
+DMA made cheap, the same binary plays the OTLIVE fixture at **1015–1058
+emulated ms per wall s flat out with LTO** (`bench.py --dsp --dsp-rt`,
+four runs; O17: 664), and the panel's paced child holds `rt` 0.999 over a
+10 s PLAY and a median 0.981 over a 3-minute one with the test harness
+polling it. The strict oracle is 28/28 byte-identical on every old mode
+(the lockstep modes got faster too), the C++ handshakes are TSan-clean
+after one fix, shutdown is 22 ms. What is not met, both by a little: the
+A/B against the lockstep take is 1.34 dB quieter in RMS (the contract
+said 1 dB; O17's own take was 0.74 dB), and the paced 3-minute `rt` is
+0.98, not 1.00 ± 0.02 — for reasons measured below. `dsp.cpp`, `dsp.h`, `machine.h`, `rtos.cpp/.h`,
+`main.cpp`, `tools/patches/dsp56300.patch` (vendor/dsp56300 in place:
+`hdi08.h/.cpp`, `dma.h/.cpp`, `dsp.h`, `jit.h`), `tools/panel/README.md`.
+
+### The protocol, measured (`OT_FENCE_TRACE=1`, lockstep `--dsp`, the OTLIVE fixture playing)
+
+Every host-port transaction, every INTC0 mask change of the frame source
+and every INTC0 acknowledgement on stderr with its sample. One frame,
+identical in all 110 traced:
+
+| Δ samples from the bank word | who | what |
+|---|---|---|
+| 0.000 | core 0 | `P:0x73` writes the bank id into HOTX (the edge) |
+| 0.004 | ColdFire | ack vector 0x41; the handler **masks INTC0 source 1** (`pc 4000aae0`) |
+| 0.004 / 0.015 | ColdFire | `0x8c` (frame) and `0x89` (read-back, 512 words) to core 0 |
+| 0.70 | ColdFire | pulls 256 + 128 + 128 words from core 0 (eDMA ch 1 → 6 → 7), ack 0x4f |
+| 0.71 | ColdFire | `0x89` to core 1, pulls 256 words (ch 1), ack 0x49 |
+| 0.72 … 1.30 | ColdFire | `0x88` + push 672 (core 0), 672 (core 1), 64 (core 0), 128 (core 1), 128 (core 0) halfwords; ch 0 completes and acks after each |
+| 1.30 … 3.2 | ColdFire | eDMA channels 2–5 kicked and completed 30 times (the EMAC mixer's own moves) |
+| 3.24 | ColdFire | `0x88` + push 512 halfwords (core 0, the forwarded read-backs), ack 0x48 |
+| 3.37 | ColdFire | **unmasks source 1** (`pc 40004bc8`) — the exchange is over |
+| 16.00 | core 0 | the next bank word |
+
+So the ColdFire's whole exchange is **3.4 samples** of its clock, ISR-driven
+(the eDMA completion chain), and the firmware's own end-of-frame mark is
+the unmask of the source it masked at entry. That unmask is what the
+fence opens on. The dispatcher's other side, read off the payloads: at
+each ring boundary core 0 selects a bank (`P:0x54`/`0x64`) and **patches
+the host handlers' masks** (`move x0,p:>$58c` / `p:>$59b` at `P:0x75`/
+`0x77`, `x0 = $3fff` or `$5fff`), so a host word `0x6080` lands in the
+bank the DSP is NOT processing — the frame it processes reads the bank the
+previous exchange filled, and every command taken after the patch lands in
+the other bank. Core 1 does the same from the mailbox word (`P:0x59`,
+`p:>$371`/`p:>$380`). So "finished handling frame N" has to cover the
+whole exchange, not only the pulls: a command taken after the patch would
+be masked into the wrong bank.
+
+### The design, as built (`dsp.cpp`, THE FENCE AND THE SERVICE; `Rtos::peripheralWrite`)
+
+- **The fence.** `Rtos::peripheralWrite` watches INTC0 source 1's mask
+  across every INTC0 write and tells the co-processor `frameHandling()`
+  (masked: the handler entered) and `frameHandled()` (unmasked: the
+  exchange is over; `Coprocessor`, `machine.h`). Core 0's bank-word write
+  (`P:0x73`) **closes** the fence (the HDI08 write callback, as O17
+  identifies the edge); `frameHandled()` opens it. A worker whose next
+  block starts at `P:0x73` while the fence is closed stops there: its
+  clock is frozen (its ESAI does not tick), it publishes its position, and
+  the lag bound, the skew bound and the idle skip count it as idle — it
+  cannot come until the ColdFire opens it, and the ColdFire must go on to
+  do so. `P:0x73` is declared a **volatile P address** in core 0's JIT
+  (`Jit::addVolatileP`, vendored): a volatile address is never linked as
+  a child block and every block generated later stops before it, so the
+  worker regains control exactly there (the `bra int_000073` at `P:0x63`
+  used to jump straight into it).
+- **The fence applies only while the ColdFire takes frames** — the frame
+  clock on (`Coprocessor::setFrameClock`, from `Rtos::setFrame`) or an
+  exchange in flight (`frameHandling` without its `frameHandled`; STOP
+  lands inside an exchange one time in five). ❌ Measured before this
+  rule: the firmware's `ICR = 0x81` (INIT, an interface reset) drains the
+  port during the boot, core 0 looped through frames nobody took, froze at
+  its second bank word for the whole load, and spent the first seconds of
+  PLAY 1.1 G instructions behind the ColdFire's clock with the sequencer
+  running 4.7x too fast (`exec0 52 M` against `due 1169 M` at `ready`).
+- **The service.** A held or idle worker still serves the host. A host
+  command (`kick`), pushed words (`svc`, new) or a pull (`pred`) makes it
+  run its pending interrupts through their handlers to their `rti`
+  (`DSP::execInterrupts` per vector, then `exec()` until the PC is back
+  and the mode is not `LongInterrupt`, then `execDefaultPreventInterrupt`)
+  and its peripheral service (the vendored `execPeripherals`: the host
+  DMA's drain and FIFO fill, the ESAI and the timers as of the counter),
+  with the main line held where it is (`rtService`). The chip's DMA and
+  interrupts run beside the core; nothing a handler does depends on the
+  main line. A worker in the skew wait (spinning for the other core)
+  yields to the same three requests and serves them with one block. The
+  bank take (`rxTake` outside a pull) sends a `svc` too: HTDE, the bit
+  `P:0x97` polls, is set by the core's own service.
+- **Gated edge delivery.** An edge is no longer applied when raised. The
+  worker puts its executed count (the DSP's own clock, in due units) on a
+  16-deep SPSC ring; `Coprocessor::edgePending()` — asked every 64
+  instructions of a burst — is true only when the ColdFire's clock has
+  reached the oldest edge, and `rtApplyEdges` applies exactly those. The
+  idle skip (`rtTickSamples`) is bounded by a produced edge: at or behind
+  it the edge is delivered first (no skip), ahead of it the skip ends on
+  the sample boundary after it; with no edge yet the whole skip is posted
+  with the workers armed to stop at the first bank word inside it, as O17
+  had it. So the frame interrupt arrives at the sample the DSP's clock
+  says — lockstep's timing — however far ahead the DSP produced it
+  (`edgelate mean 25.7, max 67` DSP instructions in bursts: the burst's
+  grain; `skipedgelate mean 2127`: the sample grain). ❌ Without the gate a
+  frame-deep lead delivers frame N+1 as soon as the handler finishes frame
+  N: the sequencer would run at the exchange's rate (3.4 samples a frame),
+  not the DSP's.
+- **The poll lead** (`OT_RT_POLLLEAD`, 2 samples). The lead is for
+  executed work; the poll fast-forward (an idle step is ~40 ns for 520
+  instructions, i.e. the DSP's clock races at ~13 G instructions per wall
+  second inside a poll) is bounded differently. The one poll whose end is
+  the ColdFire's act — the HTDE wait after the bank word, `P:0x97`, the
+  take — never carries core 0's clock more than the poll lead past the
+  ColdFire's clock, and at that bound the core waits idle for the ColdFire
+  to move. ❌ Measured with the frame lead on it (three stalls in ~200 s
+  of play, `stall_hunt.py`): in the microseconds the ColdFire took to get
+  to the take, core 0 burned a whole frame of its own clock at `P:0x97`,
+  missed its next ring boundary (the DSR2 equality window is one word),
+  took a 32-sample frame, DMA2 ran dry (`dsr2=008070 dco2=0000ff`, the
+  dispatcher's poll never saw the boundary again) and the frame protocol
+  stopped for good. The DSP's own waits — the ring boundary at `P:0x4b`,
+  the mailbox at `P:0xa3` / `0x57` / `0x8d` — keep the work lead (the
+  skew bound already ties the mailbox waits to the other core). `P:0x4b`
+  is a volatile address too: the fast-forward must fire at the poll's
+  head, before the `movep DSR2` read, and the JIT linked the loop's `bra`
+  into it — O17 had executed that poll, ~30k instructions a frame.
+- **The host port's rings and DMA** (vendored, `tools/patches/dsp56300.patch`,
+  22 files, 56 hunks, `git apply --check` on a scratch worktree of
+  `3c01813f` clean and the applied diff byte-identical to the patch):
+  - `HDI08`'s two rings are the lock-free `RingBuffer<TWord, 8192, false>`:
+    both are single-producer / single-consumer and no caller pushes into
+    a full ring or pops an empty one unasked, so the locking ring's
+    semaphore pair (two contended atomic read-modify-writes per word, on
+    both threads) was pure cost — the frame's 2,944 words paid ~70 ns a
+    word each side. The lockstep modes use the same rings and got faster
+    (below); their bytes did not move (the oracle).
+  - **Burst transfers on the host port** (`DmaChannel::burstFromHost` /
+    `burstToHost`, driven from `HDI08::exec` when a FIFO is configured):
+    a request-triggered single-counter channel reading HORX or writing
+    HOTX moves up to the FIFO's depth of words in one call with the
+    per-word peripheral dispatch, callbacks and delay resets taken out
+    (`popRXFast` / `pushTXFast`); the block-end bookkeeping is
+    `execTransfer`'s. The per-word path is kept for any other shape.
+  - The host side pushes a block's words into the ring in one call (the
+    lane model resolved once: every halfword lands on TXM:TXL and sends)
+    and pops a pull's words in one call (`readTXBulk`: one delay reset for
+    the batch instead of one per word on a line the core's thread reads at
+    every block). `OT_RT_BULK=0` is the per-word path.
+- **Posts** every sample (`OT_RT_POSTQ`/`READQ` 4160, were 32): with a
+  frame of lead the workers do not need the count more often, and O17's
+  1.4 M posts per emulated second (~200 ns each on a line both workers
+  spin on) become 28 k.
+- **The DO-loop time slice** (`OT_RT_DOITER` 64, was 0): a DO loop yields
+  its block every 64 iterations so a stopped-core service or a periph
+  service is never further away than a few microseconds; measured 1033
+  against 993–1016 unbounded, interleaved.
+- **Workers spin while the host is active** (a command, push or pull
+  within 2 ms) instead of parking after 200 µs: a parked core's wake cost
+  core 1's read-back pull tens of microseconds once a frame.
+- **Diagnostics.** `rtstatus` grew: the fence's state (`fence= inexch=
+  frameon= edgesq= c0fenced=`), `fenceopens`/`fencewaits`, the services
+  (`svc0/1`, `svcint0/1`), the ColdFire's waits by cause in wall seconds
+  (`cfwait skip= lag= pull= pullword= kick= push= post= fenceopen=`), each
+  worker's wall time split (`busy= idle= fence=`), core 0's HSR/HCR/HPCR,
+  peripheral target, TCR, DCR2/DSR2/DCO2 and counter (as the worker last
+  published them, with the MIPS and at every idle transition — never a
+  look at the worker's data from the ColdFire's thread), the knobs, and
+  the last 200 protocol events (`proto:` —
+  commands, pushes, pulls, eDMA kicks and completions, the frame and eDMA
+  acks, edges with their lateness, handled/masked, the frame clock; a
+  1024-deep ring always on in the rt mode). `cfstatus` adds `pc=`.
+  `edmastatus` (new) prints the eDMA's booked completions, IRQ lines,
+  gated-wait count and INTC0's mask on the frame source. Env knobs:
+  `OT_FENCE_TRACE=1` (the per-frame trace above, any mode),
+  `OT_RT_WAITLOG=1` (every ColdFire wait over 5 ms and every skew timeout
+  with both cores' state), `OT_RT_POLLHIST=1` (where the fast-forward
+  fired, per core, at exit), `OT_RT_FENCE=0`, `OT_RT_DSR2FF=0`.
+
+### Measured (13 Sep 2026, the M5, macOS 26.5; LTO builds unless said; logs under `out/_agents/rt-fence-build/`)
+
+**The O17 baseline with the new instrumentation** (this binary with O17's
+knobs: lead 2 samples, no fence, posts every 32, per-word host paths,
+`P:0x4b` executed, DO loops unbounded — `fin-o17knobs-4s`), 4 s of PLAY in
+16 × `run 250`, the deltas over the play: **771 emulated ms per wall s**;
+the ColdFire's waits **1.71 s of the 5.19 s wall**: idle-skip catch-up
+1.133 s (22,926 skips), pulls 0.214 s (49,812; 0.004 s of it waiting for a
+word), pushes 0.271 s, posts 0.079 s (1.44 M), kicks 0.014 s, lag 0.001 s;
+core 0 busy 2.78 s, core 1 2.07 s. (The frozen O17 binary itself: 664;
+its pulls 1.370 s per 49,828 = 27.5 µs each, its posts 5.65 M.)
+
+**The steps**, `--dsp-rt` flat out, each on the LTO-off build unless said
+(`rtdrive.py`, 4 s of PLAY):
+
+| step | emulated ms per wall s | what moved |
+|---|---|---|
+| O17 knobs, LTO off | 597 | — |
+| the fence + the frame lead (and the frame-clock gating) | 663 | skip waits 1.24 → 0.25 s; pushes 1.60 s (!) |
+| + lock-free rings | 832 | pushes 1.60 → 0.30 s, pulls 0.56 → 0.44 s, core 0 busy 3.44 → 2.80 s |
+| + burst DMA | 929 | pulls 0.44 → 0.08 s, waiting for a word 0.110 → 0.006 s |
+| the same, LTO | 976 → **1086 / 1109** | (`bench.py`) |
+| + the poll lead on every poll (the stall fix, first cut) | 970–995 | the DSR2 poll idled at the bound |
+| + the poll lead on the host wait only, `P:0x4b` fast-forwarded | 889–990 | core 1 sat in the skew wait through the pulls |
+| + the skew wait yields to the host, DO loops sliced | **1018–1044** (hunts), **1042 / 1058** (`bench.py`) | — |
+
+**Final, flat out** (`bench.py`, four runs on the last two builds of the
+tree — the second differs only in `rtstatus`'s published fields and the
+`edmastatus` reply): **1058, 1042, 1030 and 1015 emulated ms per wall s**
+(0.118–0.123 s wall per 16th at 120 BPM); the lockstep `--dsp` 208 (O17:
+197), no `--dsp` 1357. Boot to `ready`: **6.8–7.1 s** with
+`--dsp-rt` (14.8 s lockstep, 5.8 s without the cores). Eight-second PLAY
+cycles with STOP/PLAY in between (`stall_hunt.py`, 3 × 8 cycles): 981–1044
+per cycle.
+
+**The wait breakdown after** (`fin-rt-4s`, the deltas over 4 s of PLAY,
+3.82 s wall = 1048): the ColdFire's waits **0.263 s**: pulls 0.089 s
+(49,836; 0.006 s waiting for a word, 12,260 waits), pushes 0.152 s
+(74,754), kicks 0.014 s (112,131), posts 0.007 s (111,615), idle-skip
+catch-up **0.000 s** (1 skip waited), lag 0.001 s. The other 3.55 s is the
+ColdFire's own emulation of 388.8 M instructions (110 M per wall s). Core 0
+busy 1.26 s, fenced 0.77 s (12,451 of 12,459 frames reached the fence
+before the exchange ended), idle 2.46 s; core 1 busy 1.31 s. Per frame:
+0.285 ms of ColdFire emulation + 0.021 ms of waits = 0.306 ms against the
+0.363 ms the unit has. **The pull wait before/after**: 27.5 µs per pull on
+the O17 binary → 1.8 µs (0.12 µs of it waiting for the DSP).
+
+**The fence is what keeps the protocol in order.** The same binary with
+`OT_RT_FENCE=0` and the frame lead: 1059 ms per wall s, and **454 bank
+words inside read-back pulls in 4 s** (`edgesinpull`; 0 with the fence).
+
+**The stall that the poll lead removed** (three captures, `hunt-2/4/13`):
+the bank words 32 samples apart, the exchange with two ~30-sample gaps at
+pushes (drain gates held), the next edge 48 samples late, then core 0 at
+`P:0x4b` or `P:0x97` for good — DMA2 finished, the ESAI dead. **The stall
+that the yielding skew wait removed** (`hunt-bg-3`, the 1024-event ring):
+core 0 spinning in `rtSkewWait` for core 1 did not drain the 64-word push,
+its gated completion came 8.4 samples late (after the EMAC phase that
+normally follows it within 0.04 samples), and the handler's ISR chain
+never issued the last push: `outstanding=0`, source 1 still masked, the
+ColdFire idle at main's spin (one capture in 8 hunts, 336 s of PLAY, with
+the poll lead alone). After both fixes: **0 stalls in 3 hunts of 8 cycles
+(192 s of PLAY with STOP/PLAY cycles)**, the 3-minute panel PLAY below,
+its three 10-second probes, and the 20 s under TSan.
+
+**The gate: 28 PASS, 0 FAIL, twice** (`tools/emu/ot_emu/oracle/oracle.sh
+out/emu/ot_emu.ref-73c2815 <cand> --build-dir <lto>`, strict, no
+tolerance; reports `out/_oracle/reports/20260913-030632-rt-fence-final.txt`
+and `…-033122-rt-fence-final2.txt` for the final source (sha
+`32b162a40ade…`), 37–38 s wall, ctest 7/7): boot logs, serial, goldens, `run3_core0.wav`, the
+UART stream, peeks, run stamps and `interdsp.pcm` byte-identical. The
+lockstep jobs got faster from the rings alone: `interdsp` boot 23.8 →
+15.8 s and its 4.49 s of `run` 28.2 → 20.7 s, `render` 30.8 → 21.3 s.
+⚠️ The x86 Homebrew `bash` (`/usr/local/bin/bash`, under Rosetta) ran the
+script for 13 minutes without printing a line; `/bin/bash` ran it in 37 s
+— the O15d Rosetta accident in another costume.
+
+**A/B against the lockstep take** (`rtdrive.py` with and without `--rt` on
+this binary, `abcorr.py`; `fin-ab-lockstep`, `fin-ab-rt`): 199,358 frames
+both; onset 82 vs 80 (**−2 samples**); the music itself sits 126 samples
+later in the rt take (the best lag); RMS over the overlap **−4.39 vs
+−5.73 dBFS (1.34 dB)**, both peaking at full scale; envelope correlation
+0.939 over the whole overlap in 50 ms windows, 0.31 in 10 ms windows over
+the first 2 s. Where the level goes: the lockstep take has 20 % of its
+samples at full scale in every 0.5 s window (the fixture clips, the
+sample at level 64), the rt take 3–17 % — the same loops with lower peaks,
+not gaps: no 10 ms window with signal is under half the lockstep level, and
+0.45 % of the 16-sample frames are under 0.35x (O17's own take: 0.54 %,
+−5.12 dBFS, a 0.74 dB difference). 🟡 Not located: the DSP's output
+limiter runs on its own history and the cores' interleave differs, and the
+A/B cannot tell that from a frame of the mix landing a frame off. It is a
+miss on the contract's 1 dB; the audio is the same music at the same
+time.
+
+**Thread sanitizer** (`-fsanitize=thread -O1 -DNDEBUG`, Debug, LTO off;
+`TSAN_OPTIONS=symbolize=0 log_path=…`, addresses symbolized with `atos -l
+0x100000000`; `tsan_drive.py`: boot, `frame on`, `audio start`, PLAY, 80 ×
+`run 250` with `audio read` and three `rtstatus`, STOP, `quit`): the first
+run (`tsan-run/`) booted to `ready` in 257 s, played its 20 s (55,295 edges,
+none inside a pull) and reported **two races, both in the new `rtstatus`
+peeks** — the ColdFire's thread reading DSR2 through
+`Peripherals56362::read` against `DmaChannel::dualModeIncrement` on core
+0's thread, and reading the instruction counter against `DSP::idleStep` —
+then aborted at exit as macOS TSan does with reports pending (rc −6).
+Fixed: the worker publishes those registers with its MIPS
+(`RtCore::hsr/hpcr/tgt/tcr/dcr2/dsr2/dco2/ctr`) and `rtstatus` reads the
+atomics. The second run on the fixed binary (`tsan-run2/`): `ready` in
+258 s, 20 s of PLAY in 740 s of wall (55,292 edges, `edgesinpull` 0,
+`faulted` 00, `dropped` 0, 884,732 audio frames captured), `quit`, **rc 0,
+no `tsan.log` written and no ThreadSanitizer line on stderr**.
+
+**Shutdown** (`shutdown_verify.py`, during a paced PLAY with audio on):
+`quit` 22 ms, EOF 22 ms, SIGTERM 23 ms; no process left with the card in
+its arguments.
+
+**The panel, paced, 3 minutes** (`panel_verify.py 8582`, `panel_server.py
+--port 8582 --sound on`, this binary as `--port-bin`, the OTLIVE fixture;
+`panel-rt-8582.log`): `ready` after 7.1 s with `sound_rt` true; idle
+`/status rt` median 1.000 (0.996–1.008); **PLAY 180 s**: 178,860 emulated
+ms in 181.36 s wall = **986 per wall s** (per-second 913–1104, median
+984), `/status rt` n=180 **median 0.981 (0.905–1.080)** — under the
+target's 1.00 ± 0.02, with the test's own load on the same machine
+(`/leds` polled 29,638 times, the headphones-monitor mirror fetching
+`/audio/pcm`, a status poll per second; the server's own pump on top);
+the pacer re-anchored 10 times and ended with `lag` 0. The same child
+over a 10 s PLAY after the MIXER / double-tap / encoder items: **1000
+emulated ms per wall s, `rt` median 0.999 (0.995–1.003)**. Audio: end
+613,750 → 8,501,474 frames = **44,100 per emulated second** (target
+44,100), captured 8,501,474, **dropped 0**; the take
+`out/_panel_takes_8582/take-002.wav`, 7,896,152 frames = 179.05 s,
+decodes. `rtstatus` after the PLAY: edges 418,514 applied 418,514,
+**edgesinpull 0, faulted 00, dropped 0, pullshort 0**, `waitto` 0.
+**The LED chase in wall time** (`/leds` at ~165 polls a second, every
+LED-state change stamped; `panel-rt-8582.leds.tsv`): 1,633 changes in
+181 s, the trig-row running light's 16-step sweep recurring every
+**1,941 / 1,944 / 2,027 ms (medians of the three sweep patterns, 69–75
+sweeps each, 1,852–2,125 ms)** = 121–127 ms of wall per 16th against the
+fixture's 125 ms (120 BPM; the sequencer's own step period in emulated
+time is unchanged at 125.1 ms). MIXER opens and closes the mixer page,
+the T1 double tap opens the slot list, the LEVEL encoder redraws, the
+card re-insert reboots to `ready` in 7.6 s with `--dsp-rt` and
+`sound_rt` true.
+
+### What it does not do
+
+- **The A/B's level.** 1.34 dB quieter than the lockstep take in RMS on
+  the clipping fixture (the contract asked for 1 dB; O17's take was 0.74
+  dB). Same onset (−2 samples), same loops at the same time, no gaps; the
+  DSP's output limiter and the cores' interleave are the suspects, not
+  located. A non-clipping fixture would separate "quieter" from "less
+  clipped".
+- **Paced under the panel with a test harness polling it**, `rt` sits at
+  0.98 (median over 3 minutes), not 1.00 ± 0.02; the same child without
+  the harness holds 0.999. Flat out the margin over real time is 4–6 %
+  with LTO (a PGO build, `pgo.sh`, was not measured here), so any other
+  load on the machine shows up in `rt`.
+- **The stall proofs are statistical**: 0 in 576 s of hunting plus the
+  3-minute panel PLAY after the two fixes, against three and one
+  captures before them. The captures are in `hunt-2/4/13` and
+  `hunt-bg-3`; `stall_hunt.py` (8-second PLAY/STOP cycles, stopping at
+  the first frozen frame count with `rtstatus`, `cfstatus` and
+  `edmastatus`) is the instrument to run again.
+- The fence, the poll lead and the volatile blocks know payload A
+  (`P:0x73`, `P:0x97`, `P:0x4b`); a payload that moves them gets O17's
+  behaviour (the lead then only as safe as the fixed lead was).
+- `rtstatus`'s counters are the workers' published atomics, read without a
+  rendezvous: a consistent-enough snapshot for a diagnostic, not a
+  rendezvous (as O17's were).
+- The idle-skip catch-up, the lag bound and the fence cost the ColdFire
+  nothing measurable while playing; what remains is its own emulation
+  (0.285 ms of the 0.306 ms a frame takes). The next lever is the
+  ColdFire (PGO: O15d measured +13–17 % on the `--dsp` rate), not the
+  cores.
+- The batch keeps the lockstep interpreter; `--dsp-rt` is `--interactive`
+  only, cue and core 1 are not captured, the DSP-side instruments do not
+  observe the workers — all as O17.

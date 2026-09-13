@@ -218,20 +218,26 @@ says so; `--port-arg=--dsp` asks for the lockstep cores explicitly;
 `/status sound_rt` says which the current child runs, `/rtstatus` is the
 child's own line (MIPS per core, waits, edges, faults).
 
-**Honest playback note (12 Sep 2026, O17).** With `--dsp-rt` the unit
-plays at ~0.65x real time on the M5 (`/status rt`; 664 emulated ms per
-wall s flat out against 1326 without the cores and 197 with the lockstep
-`--dsp`, the LTO build); the lockstep fallback is ~0.2x. Real time was the
-target and is not reached: the ColdFire's own emulation (~0.75 s of wall
-per emulated second with the host port live) and the cores' frame work
-(~0.65 s per emulated second on core 0 under the JIT) can overlap only
-within the few samples the firmware's frame protocol lets the cores run
-ahead of the ColdFire's clock -- 4 samples measured safe, 8 stalls the
-protocol (a bank word inside a read-back pull) -- so most of the cores'
-work still waits behind the ColdFire's idle skips. Live listening is
-therefore still behind and in bursts; a take replays at real time; the
-sound itself is the same content as the lockstep capture (same onset
-within 16 samples, level within 1 dB: O17's A/B), not byte-identical.
+**Playback note (13 Sep 2026, O17b).** With `--dsp-rt` the unit plays
+at real time on the M5: `bench.py --dsp --dsp-rt` 1042–1058 emulated ms
+per wall s flat out with LTO (O17: 664; 1357 without the cores, 208 with
+the lockstep `--dsp`), and under the panel's pacer a 3-minute PLAY held
+`/status rt` median 0.981 (0.905–1.080; 986 emulated ms per wall s with
+the test's own `/leds` and audio polling on the same machine, 1000 and
+`rt` 0.999 over a 10 s PLAY without it) with 44,100 audio frames per
+emulated second captured, none dropped, and the trig-row running light
+sweeping every 1.94–2.03 s of wall (125 ms per 16th at the fixture's
+120 BPM, nominal 2.00 s). What made it: the cores run up to a whole
+frame ahead of the ColdFire's clock, core 0's bank word is fenced on the
+frame handler's own end-of-exchange mark (the unmask of its interrupt
+source), the frame interrupt is delivered at the sample the DSP's clock
+says, and the host port's rings and DMA move blocks in bursts
+(`COLDFIRE_PORT.md` O17b). The sound is the same content as the lockstep
+capture — onset within 2 samples, the same loops at the same time — but
+1.3 dB quieter in RMS on the clipping OTLIVE fixture (fewer full-scale
+samples; the DSP's output limiter runs on its own history under a
+different core interleave), not byte-identical. The lockstep fallback is
+~0.2x.
 
 **Priority matters more than you would think** (O15f, 12 Sep 2026): a
 server started as a zsh background job (`… &`) runs at nice 5 (`BG_NICE`
@@ -242,14 +248,15 @@ background-QoS or napped app hands its children: efficiency cores) is
 3.5–3.7x slower; the server spawns the child with a `preexec_fn` that
 leaves that class (`setpriority(PRIO_DARWIN_PROCESS, 0, 0)`), measured
 back at full speed under `taskpolicy -b`. What the cores cost
-(12 Sep 2026): with `--dsp-rt` boot + fixture load ~8-10 s (the JIT
-compiles the payloads' blocks as they run; ~25 s with the lockstep
+(13 Sep 2026): with `--dsp-rt` boot + fixture load ~7 s (the JIT
+compiles the payloads' blocks as they run; ~15 s with the lockstep
 `--dsp`, ~6 without the cores), and while the sequencer plays the unit
-runs at ~0.65x real time (`/status rt`; the lockstep child at ~0.2x,
-151-205 emulated ms per wall s on the M5); idle it is paced to 1.00x like
-everything else. The two DSP worker threads spin for 200 µs after each
-stretch of work before they park, so at 1.00x they cost CPU while the
-sequencer plays and little when it does not (O17's `ps -M` numbers).
+runs at 1.0x real time (`/status rt`; the lockstep child at ~0.2x); idle
+it is paced to 1.00x like everything else. The two DSP worker threads
+spin while host traffic is flowing (a command, a push or a pull within
+the last 2 ms) and park 200 µs after it stops, so at 1.00x the child is
+~260 % of a core while the sequencer plays (O17b's panel run) and ~70 %
+idle.
 
 The server drains the child's ring after every pump (25 ms of firmware)
 and every action into a ring of its own — the last **180 s**, addressed

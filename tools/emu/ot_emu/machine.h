@@ -100,6 +100,18 @@ namespace ot
 		// host-word hook) on the CPU's thread. Both false for every other mode.
 		virtual bool realtime() const { return false; }
 		virtual bool edgePending() const { return false; }
+		// O17b: the CPU has finished handling a frame -- the frame handler
+		// re-enabled its own interrupt source (INTC0 source 1 unmasked after
+		// the whole host-port exchange). The fence in the real-time mode opens
+		// on it (dsp.cpp, THE FENCE); every other mode ignores it.
+		virtual void frameHandled() {}
+		virtual void frameHandling() {}		// ... and the mark of its start (the source masked by the handler)
+		// O17b: the CPU's frame clock switched on or off (Rtos::setFrame). The
+		// fence only means something while the CPU takes frames.
+		virtual void setFrameClock(bool) {}
+		// O17b: a mark from the CPU's side for the co-processor's protocol
+		// record (an interrupt acknowledged: kind 'a', the vector). Diagnostic.
+		virtual void cpuNote(char, uint32_t) {}
 		// O9b: called when core `_core` puts a word in its host port OUTSIDE a
 		// read-back pull -- the DSP's bank id, which on hardware is what the
 		// frame interrupt announces (the frame handler reads it with no ready

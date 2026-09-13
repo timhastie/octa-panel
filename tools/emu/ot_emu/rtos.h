@@ -604,6 +604,7 @@ namespace ot
 		std::string m_why;
 		Quirks m_quirks;
 		bool m_installed = false;
+		bool m_fenceTrace = false;		// O17b diagnostic (OT_FENCE_TRACE=1): the frame source's mask changes and the INTC0 acks on stderr
 		bool m_gateDirty = true;
 		uint32_t m_injectedLevel = 0, m_injectedVector = 0;   // the line currently offered
 	};

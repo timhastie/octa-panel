@@ -117,7 +117,19 @@ namespace ot
 		const std::string& rtWhy() const { return m_rtWhy; }	// ... or why not
 		std::string rtStatus();								// one line: MIPS per core, worker CPU, frames, waits, edges, faults (dsp.cpp)
 		bool realtime() const override { return m_rt; }
-		bool edgePending() const override { return m_rt && m_edgePending.load(std::memory_order_relaxed) != 0; }
+		// O17b: an edge is pending for the CPU when the DSP has produced one AND
+		// the CPU's clock has reached it (the lockstep timing: the interrupt
+		// arrives at the sample the DSP's clock says, never earlier)
+		bool edgePending() const override
+		{
+			if(!m_rt || m_edgeW.load(std::memory_order_acquire) == m_edgeR)
+				return false;
+			return static_cast<double>(m_edgeRing[m_edgeR % g_edgeRing].load(std::memory_order_relaxed)) <= m_due;
+		}
+		void frameHandled() override;
+		void frameHandling() override { if(m_rt) { m_inExchange.store(true, std::memory_order_seq_cst); protoNote('m', 0, 0); } }
+		void setFrameClock(bool _on) override;
+		void cpuNote(const char _kind, const uint32_t _val) override { if(m_rt) protoNote(_kind, 0, _val); }
 
 		bool read(uint32_t _addr, uint8_t _size, uint32_t& _out) override;
 		bool write(uint32_t _addr, uint8_t _size, uint32_t _val) override;
@@ -325,6 +337,27 @@ namespace ot
 			std::atomic<uint32_t> pc{0};					// the last block-entry PC (a status field, published with the MIPS)
 			std::atomic<uint64_t> executedInstr{0}, skipped{0}, blocks{0}, skewWaits{0}, skewTimeouts{0}, edgeStops{0};
 			std::atomic<double> mips{0.0}, xmips{0.0}, cpuS{0.0}, busy{0.0};
+			// O17b: THE FENCE and the SERVICE (dsp.cpp, THE FENCE). `fenced`:
+			// core 0 is stopped before its bank-word write (P:0x73) until the
+			// ColdFire has finished the previous frame; `svc`: the host pushed
+			// words / asked for a pull while the worker was idle or fenced --
+			// run the core's interrupt handlers and its peripheral service
+			// (drain / fill) without running its main line.
+			std::atomic<bool> fenced{false}, svc{false};
+			std::atomic<uint64_t> fenceWaits{0}, services{0}, svcInterrupts{0};
+			// the worker's wall time, split (seconds, published with the MIPS):
+			// executing blocks (services included), idle at the lead target
+			// (spinning then parked), stopped at the fence
+			std::atomic<double> busyS{0.0}, idleS{0.0}, fenceS{0.0};
+			// the core's own registers as the worker last published them (with
+			// the MIPS, every 0.25 s and at every idle transition): HSR, HPCR,
+			// the peripheral target clock minus the counter, TCR, DCR2/DSR2/DCO2,
+			// the counter -- rtstatus reads these, never the worker's data
+			// (TSan, 13 Sep 2026: two reports, both a look at DSR2 and the
+			// counter from the ColdFire's thread against the DMA's writes)
+			std::atomic<uint32_t> hsr{0}, hpcr{0}, tcr{0}, dcr2{0}, dsr2{0}, dco2{0};
+			std::atomic<int64_t> tgt{0};
+			std::atomic<uint64_t> ctr{0};
 			alignas(128) std::mutex mx;
 			std::condition_variable cv;
 			pthread_t thread{};
@@ -345,27 +378,86 @@ namespace ot
 		std::atomic<bool> m_bootDone[2]{{false}, {false}};
 		std::atomic<bool> m_hookArmed{false};
 		std::atomic<int> m_pullCore{-1};		// the core a read-back pull is running past the due count; the other follows it
-		// the bank-word edge (core 0, P:0x73): raised on the worker, applied on the ColdFire thread
-		std::atomic<uint32_t> m_edgePending{0};
-		std::atomic<uint64_t> m_edgeExec{0};	// executed (counter + offset) at the last edge
+		// the bank-word edge (core 0, P:0x73): raised on the worker, applied on
+		// the ColdFire thread. O17b: a ring of the edges' executed counts
+		// (counter + offset, the DSP's own clock in due units), SPSC -- the
+		// worker writes at m_edgeW, the ColdFire reads from m_edgeR -- because
+		// an edge is now applied only when the ColdFire's clock REACHES it
+		// (Coprocessor::edgePending is gated on m_due >= the oldest edge);
+		// with the fence at most one is pending, the ring is for OT_RT_FENCE=0.
+		static constexpr uint32_t g_edgeRing = 16;
+		std::array<std::atomic<uint64_t>, g_edgeRing> m_edgeRing{};
+		std::atomic<uint32_t> m_edgeW{0};
+		std::atomic<uint32_t> m_edgeR{0};		// advanced by the ColdFire's thread only (the worker reads it for the ring's room)
+		std::atomic<uint64_t> m_edgesDropped{0};	// a full ring (OT_RT_FENCE=0 only)
+		std::atomic<int64_t> m_edgeGateSumI{0};	// sum over the edges of (edge exec - the posted due at the raise): the DSP's lead at its edges, DSP instructions
+		std::vector<uint32_t> m_pushScratch, m_pullScratch;		// the bulk push's words (pushHalfwords), the fast pull's (pullHalfwords)
+		double m_edgeLastApplied = 0.0;			// the executed count of the last edge applied (the bank-take latency's base)
 		std::atomic<bool> m_bankTakePending{false};
+		// O17b: THE FENCE (dsp.cpp). Closed by core 0's bank-word write, opened
+		// by the ColdFire's frameHandled() (INTC0 source 1 unmasked at the end
+		// of the frame handler's exchange). OT_RT_FENCE=0 removes it (the O17
+		// behaviour with a deep lead: measured to stall the protocol).
+		bool m_fence = true;
+		std::atomic<bool> m_fenceOpen{true};
+		std::atomic<bool> m_inExchange{false};	// the frame handler is inside its exchange (INTC0 source 1 masked by it): the fence holds through it even after the frame clock went off (STOP lands mid-frame one time in five)
+		std::atomic<bool> m_frameOn{false};		// the CPU's frame clock (setFrameClock): the fence holds only while it is on or an exchange is in flight -- during the boot and the load the firmware's ICR INIT drains the port and the DSP loops through frames nobody takes (measured 13 Sep 2026: fenced there, core 0 froze at its second bank word for the whole load and spent the first seconds of PLAY 1.1 G instructions behind)
+		std::atomic<int64_t> m_lastHostNs{0};	// the wall clock (ns) of the last host command / push / pull: a worker idle within g_rtHostBusyNs of it keeps spinning instead of parking (a parked core's wake costs tens of microseconds, which core 1's read-back pull paid once per frame)
+		static constexpr int64_t g_rtHostBusyNs = 2000000;
+		bool m_rtWaitLog = false;				// OT_RT_WAITLOG=1: every ColdFire-side wait over 5 ms and every skew timeout on stderr with both cores' state
+		bool m_rtPollHist = false;				// OT_RT_POLLHIST=1: per core, the PCs the fast-forward fired at and the instructions it skipped there (stderr at exit)
+		std::vector<std::pair<uint32_t, uint64_t>> m_pollHist[2];	// worker-owned until the join
+		// O17b: the last protocol events (always on in the rt mode, a ring of
+		// 64: kind, core, value, the due count) -- `rtstatus` prints the tail
+		// so a stall can be read without a trace running
+		struct ProtoEvent { char kind; uint8_t core; uint32_t val; double due; };
+		std::array<ProtoEvent, 1024> m_proto{};
+		std::atomic<uint32_t> m_protoW{0};
+		void protoNote(char _kind, int _core, uint32_t _val)
+		{
+			const uint32_t w = m_protoW.load(std::memory_order_relaxed);
+			m_proto[w % m_proto.size()] = {_kind, static_cast<uint8_t>(_core), _val, m_due};
+			m_protoW.store(w + 1, std::memory_order_release);
+		}
+		uint64_t m_fenceOpens = 0, m_fenceOpenWakes = 0;
+		double m_fenceOpenS = 0.0;			// ColdFire: wall seconds inside frameHandled (the wake)
 		// the idle skip (tickSamples): the workers stop at the first edge inside it
 		std::atomic<bool> m_skipArmed{false}, m_skipEdge{false};
 		// knobs (OT_RT_*, read once at setup; dsp.cpp says what each is)
-		uint64_t m_rtLagMax = 4160, m_rtLead = 8320, m_rtSkew = 512, m_rtPostQuantum = 32, m_rtReadQuantum = 32, m_rtCheckQuantum = 512, m_rtTickPost = 512;	// m_rtLead: how far the cores may run AHEAD of the due count (the file comment in dsp.cpp: the DSP timeline is unchanged by it, the ColdFire sees the edge that much earlier)
+		uint64_t m_rtLagMax = 4160, m_rtLead = 66560, m_rtSkew = 512, m_rtPostQuantum = 4160, m_rtReadQuantum = 4160, m_rtCheckQuantum = 512, m_rtTickPost = 512;	// m_rtLead: how far the cores may run AHEAD of the due count -- O17b: a whole frame (OT_RT_LEAD=frame, the default); the fence, not the lead, is what keeps the frame protocol in order
+		// O17b: THE POLL LEAD. The lead is for executed work; a poll's idle
+		// step (the fast-forward) never carries a core's clock more than this
+		// far past the ColdFire's clock, and a core at that bound in a poll
+		// waits (idle) for the ColdFire to move. ❌ Measured with the frame
+		// lead on the polls too (13 Sep 2026): core 0 at P:0x97 -- waiting
+		// for the host to take its bank word -- burned a whole frame of its
+		// own clock in the microseconds the ColdFire took to get there (an
+		// idle step is ~40 ns for 520 instructions), missed its next ring
+		// boundary, DMA2 ran dry, and the frame protocol stopped for good.
+		uint64_t m_rtPollLead = 8320;
 		double m_rtSpinUs = 20.0;
 		bool m_rtFastForward = true, m_rtGuard = false, m_rtReadWait = false;
+		bool m_rtBulk = true;		// O17b: the bulk push / the fast pull (OT_RT_BULK=0: the per-word paths, for the baseline measurement)
 		uint32_t m_rtDoIter = 0;
 		// ColdFire-side bookkeeping
 		uint64_t m_rtPosted = 0, m_rtChecked = 0, m_rtTicks = 0, m_rtAtPosted = ~0ull;	// m_rtAtPosted: the posted count the cores were last seen at (an observing touch point's cache)
 		uint64_t m_rtPosts = 0, m_rtWakes = 0, m_rtWaits = 0, m_rtWaitTimeouts = 0, m_rtSkipWaits = 0, m_rtEdgesApplied = 0, m_rtEdgesInPull = 0, m_rtGuardTicks = 0, m_rtGuardWindows = 0;
 		double m_rtWaitS = 0.0, m_rtSkipWaitS = 0.0, m_rtEdgeLateSum = 0.0, m_rtEdgeLateMax = 0.0;
+		// O17b: the ColdFire thread's waits by cause (wall seconds; rtstatus):
+		// inside the per-word HOTX waits of a pull (m_rtPullS is the whole
+		// pull), the host-command kicks (the wake of a parked worker), the
+		// posts, and the pushes (the words into the ring, the wake)
+		double m_rtPullWordS = 0.0, m_rtKickS = 0.0, m_rtPostS = 0.0, m_rtPushS = 0.0;
+		uint64_t m_rtPullWordWaits = 0, m_rtKicks = 0, m_rtPushes = 0, m_rtPullsFast = 0, m_rtEdgesStale = 0;
+		double m_rtEdgeGateSum = 0.0;			// how far the ColdFire's clock was BEHIND an edge when it was raised (the DSP's lead at the edge), summed
 		uint64_t m_rtEdgeLateN = 0, m_rtIcrTreqDropped = 0, m_rtSkipEdges = 0, m_rtPulls = 0;
 		uint64_t m_gateCalls = 0, m_gateFalse = 0, m_gateBlocks = 0;	// the eDMA's drain gate (hostRingEmpty), both modes: a diagnostic on the OT_DSP_STATS line
 		double m_gateSpanSum = 0.0, m_gateOpenAt = -1.0, m_gateLateSum = 0.0;
 		double m_rtPullS = 0.0;
 		std::vector<std::string> m_rtShortLog;	// the first read-back words not in time, with both workers' state (a diagnostic in rtstatus)
 		bool m_rtTraceOn = false; std::vector<std::string> m_rtTrace; uint64_t m_rtTraceCtr0 = 0;	// OT_RT_TRACE=1: core 0's blocks after an eDMA push (stderr at exit)
+		bool m_fenceTrace = false;	// O17b diagnostic (OT_FENCE_TRACE=1): every host-port transaction, bank write and frame-handled mark on stderr with the due count in samples (any mode)
+		uint64_t m_frameHandledN = 0;
 		double m_rtSkipEdgeLateSum = 0.0, m_rtSkipEdgeLateMax = 0.0;
 		double rtTickSamples(double _n);		// the idle skip: whole samples, ended at the first edge inside it
 		std::atomic<uint64_t> m_edgesRaised{0}, m_edgesRaisedInPull{0};
@@ -383,6 +475,10 @@ namespace ot
 		void rtPredictEdge();					// the O16c prediction on the workers' published grid (the guard experiment)
 		void rtRefresh();						// ColdFire: executed / idleSkipped / faulted from the workers' published counters
 		void rtFault(int _i, const char* _why);
+		// O17b: run a stopped core's pending interrupts (host commands) through
+		// their handlers and its peripheral service (the host DMA's drain and
+		// fill) with its main line held at `_pcHold` (dsp.cpp, THE FENCE)
+		void rtService(int _i, uint32_t _pcHold);
 		void noteFrom(int _core, const char* _kind, uint32_t _val);
 		// O16b: the per-instruction body (stepCore minus its runnable checks)
 		// and its cold parts. `m_instrumented` is the one flag the hot path
