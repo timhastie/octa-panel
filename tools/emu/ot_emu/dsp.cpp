@@ -460,16 +460,23 @@ namespace ot
 				}
 				if(i == 0)
 				{
+					// O23: the ring group (8-word sample, 0..31) the main pair (ch 2)
+					// of this frame came from -- the -9 rule per slot, so a rotated
+					// frame's pair is placed by ITS ring words, not the frame's
+					// first -- names the half (group >> 4: 0 = X:0x8000-0x807f, the
+					// bank-B mixdown; 1 = 0x8080-0x80ff, bank A) and the sample
+					// (group & 15) whose stems the tap staged for it.
+					const int group = static_cast<int>(((dsr2 - 9 + ((2 - rot) & 7)) & 0xff) >> 3);
 					if(m_rt)
 					{
 						// O17: the pipe's ring is filled on this core's thread and
 						// drained on the ColdFire's (takeAudioStream): one mutex.
 						std::lock_guard<std::mutex> g(m_streamMx);
 						if(m_streamMode != StreamMode::Off)
-							streamPush(words);
+							streamPush(words, group);
 					}
 					else if(m_streamMode != StreamMode::Off)
-						streamPush(words);
+						streamPush(words, group);
 				}
 			};
 			auto silence1 = [&c](uint64_t&, dsp56k::Audio::RxFrame& _f)
@@ -820,6 +827,10 @@ namespace ot
 		m_cores[0]->dsp->getJit().addVolatileP(0xa5);
 		m_cores[1]->dsp->getJit().addVolatileP(0x59);
 		m_cores[1]->dsp->getJit().addVolatileP(0x8f);
+		// O23: THE STEM TAP's block entry (rtWorker): the instruction after the
+		// mixdown's loop on either path (`bra` from P:0x291, the fall-through
+		// from P:0x2d3) -- one more block boundary a frame, always
+		m_cores[0]->dsp->getJit().addVolatileP(g_stemTapPc);
 		if(m_frameTraceOn)
 		{
 			// O17c diagnostic: the output stage's head and tail as block entries, so the frame trace sees them
@@ -910,6 +921,7 @@ namespace ot
 		uint64_t statCtr = dsp.getInstructionCounter(), statSkipped = 0, statBlocks = 0;
 		uint64_t spins = 0;
 		uint32_t last = ~0u, prevPc = ~0u;	// prevPc: the entry PC of the last block executed (O17c, THE WAITS)
+		uint64_t lastStemTap = ~0ull;		// O23: the counter at the last stem tap (one per arrival at P:0x2d5)
 		int run = 0, same = 0;
 		auto tStat = Clock::now(), tSpin = tStat, tState = tStat;
 		// the wall-time split: 0 busy (executing blocks or a service), 1 idle at
@@ -1247,6 +1259,14 @@ namespace ot
 			}
 			if(m_frameTraceOn)
 				frameTraceLine(c, pc, ctr + off, static_cast<double>(dueNow));
+			// O23: THE STEM TAP -- P:0x2d5 is a volatile P address on core 0 (rtSetup),
+			// so the block after the mixdown is always entered here; once per
+			// arrival (the counter moves between two arrivals, never within one)
+			if(_i == 0 && pc == g_stemTapPc && ctr != lastStemTap && m_stemsOn.load(std::memory_order_acquire))
+			{
+				lastStemTap = ctr;
+				stemTap(c);
+			}
 			dsp.exec();
 			prevPc = pc;
 			++blocks;
@@ -2935,6 +2955,9 @@ namespace ot
 		// (Keying on "port non-empty outside a pull" instead fired on
 		// every command echo too: 5-6 ESAI frames per host frame.)
 		const bool bankWrite = i == 0 && pc == g_bankIdPc && m_hostWordHook;
+		// O23: THE STEM TAP, before the instruction at P:0x2d5 (the mixdown just ran)
+		if(i == 0 && pc == g_stemTapPc && m_stemsOn.load(std::memory_order_relaxed))
+			stemTap(c);
 		// O9b: nobody in either payload writes a timer register, yet core 1
 		// took TIMER0 Compare (vector 0x54 -- payload B's `move x0,y:(r4)+`)
 		// 230,027 times. Catch the first enable with the PCs before it.
@@ -3333,9 +3356,15 @@ namespace ot
 		m_streamCaptured = m_streamDropped = 0;
 		if(_mode != StreamMode::Off)
 			m_stream.assign(static_cast<size_t>(g_streamCapFrames) * streamWords(_mode), 0);
+		// O23: the stems are staged only while the Tracks mode is on (the
+		// tap's flag is read on core 0's thread; the staging is cleared here
+		// so a restarted stream never carries a previous run's half)
+		std::memset(m_stems, 0, sizeof m_stems);
+		m_stemTaps.store(0, std::memory_order_relaxed);
+		m_stemsOn.store(_mode == StreamMode::Tracks, std::memory_order_release);
 	}
 
-	void DspPair::streamPush(const int32_t* _words)
+	void DspPair::streamPush(const int32_t* _words, const int _group)
 	{
 		const auto n = streamWords(m_streamMode);
 		if(!n)
@@ -3348,11 +3377,66 @@ namespace ot
 			++m_streamDropped;
 		}
 		auto* dst = &m_stream[((m_streamHead + m_streamCount) % g_streamCapFrames) * n];
-		const uint32_t first = m_streamMode == StreamMode::All ? 0 : m_streamMode == StreamMode::Main ? 2 : 4;
-		for(uint32_t k = 0; k < n; ++k)
+		const uint32_t first = m_streamMode == StreamMode::Main ? 2 : m_streamMode == StreamMode::Cue ? 4 : 0;
+		const uint32_t esai = m_streamMode == StreamMode::Tracks ? g_audioSlots : n;
+		for(uint32_t k = 0; k < esai; ++k)
 			dst[k] = static_cast<int16_t>(_words[first + k] >> 8);		// 24-bit word -> 16-bit, as writeWav24's top bytes
+		if(m_streamMode == StreamMode::Tracks)
+		{
+			// O23: the 16 stem words staged for this sample's ring half (THE STEM TAP)
+			if(_group >= 0 && _group < 32)
+				std::memcpy(dst + g_audioSlots, m_stems[_group >> 4][_group & 15], sizeof(int16_t) * g_stemWords);
+			else
+				std::memset(dst + g_audioSlots, 0, sizeof(int16_t) * g_stemWords);
+		}
 		++m_streamCount;
 		++m_streamCaptured;
+	}
+
+	// O23: THE STEM TAP (dsp.h). Core 0 is at P:0x2d5: the mixdown of one ring
+	// half has just run. What it read is still in place -- the forwarded
+	// per-track blocks at X:$204 (0x4400 bank A / 0x2400 bank B: track k's 16
+	// stereo samples at +32k, L at +2j, R at +2j+1, 24-bit signed after the
+	// hi/lo join at P:0xed), the per-track main gains at Y:0x4a + 20j + k (the
+	// ramp of P:0x203-0x237; the cue mix overwrites Y:0x40-0x5f only later,
+	// at P:0x32d) -- and the half is named by X:$203 (the ring pointer r0 of
+	// the bank take: 0x8080 = the half 0x80-0xff, 0x8000 = 0x00-0x7f). The
+	// mixdown's arithmetic per term: `mpy/mac y0,x0` (a fractional 24x24
+	// product, the accumulator holds it <<1), `asl #2`, then the move of the
+	// accumulator to a 24-bit word (limited). The tap forms each track's term
+	// alone the same way, so the sum of the eight stems is the main word up
+	// to the per-term truncation (the mixdown truncates the sum once) and
+	// the two input terms / the click, which no track owns. Under the
+	// MASTER TRACK path (P:0x292, bit 10 of x:(r6+$7e)) the main pair is
+	// track 8 alone and tracks 1-7 feed it: the stems are then each track's
+	// term with its own gain, which is what the master receives, not what
+	// the main carries -- documented, not special-cased.
+	void DspPair::stemTap(Core& c)
+	{
+		const uint32_t* X = c.mem->getMemAreaPtr(dsp56k::MemArea_X);
+		const uint32_t* Y = c.mem->getMemAreaPtr(dsp56k::MemArea_Y);
+		const uint32_t ring = X[0x203] & 0xffffff;
+		const uint32_t fwd = X[0x204] & 0xffffff;
+		if((ring != 0x8000 && ring != 0x8080) || (fwd != 0x4400 && fwd != 0x2400))
+			return;			// not the dispatcher's frame state (a boot-time arrival): nothing staged
+		const int half = ring == 0x8080 ? 1 : 0;
+		auto* out = m_stems[half];
+		for(uint32_t j = 0; j < 16; ++j)
+		{
+			for(uint32_t k = 0; k < 8; ++k)
+			{
+				const int32_t g = static_cast<int32_t>(Y[0x4a + 20 * j + k] << 8) >> 8;		// 24-bit signed fractional
+				for(uint32_t ch = 0; ch < 2; ++ch)
+				{
+					const int32_t x = static_cast<int32_t>(X[fwd + 32 * k + 2 * j + ch] << 8) >> 8;
+					int64_t acc = (static_cast<int64_t>(x) * static_cast<int64_t>(g)) << 3;	// the product <<1, then asl #2
+					int64_t w = acc >> 24;								// the accumulator's 24-bit word (a1)
+					if(w > 0x7fffff) w = 0x7fffff; else if(w < -0x800000) w = -0x800000;		// the move's limiter
+					out[j][2 * k + ch] = static_cast<int16_t>(w >> 8);	// 16-bit, as the ESAI words
+				}
+			}
+		}
+		m_stemTaps.fetch_add(1, std::memory_order_relaxed);
 	}
 
 	size_t DspPair::takeAudioStream(std::vector<int16_t>& _out, const size_t _maxFrames)

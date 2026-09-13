@@ -212,15 +212,22 @@ namespace ot
 		// word >> 8: the pipe never carries more) in a ring of
 		// g_streamCapFrames frames; a client takes frames out as it goes,
 		// and when it does not the OLDEST are overwritten and counted.
-		enum class StreamMode : uint8_t { Off, Main, Cue, All };
-		static constexpr uint32_t g_streamCapFrames = 60 * 44100;	// 60 s: 10.6 MB for a pair, 42.3 MB for all eight
-		static uint32_t streamWords(const StreamMode _m) { return _m == StreamMode::All ? g_audioSlots : _m == StreamMode::Off ? 0 : 2; }
+		// O23 (13 Sep 2026): `Tracks` = the eight words of `All` followed by
+		// the EIGHT PER-TRACK STEMS (T1 L, T1 R, ... T8 L, T8 R): each track's
+		// contribution to the main pair, tapped from the mixdown's own inputs
+		// (dsp.cpp, THE STEM TAP) -- 24 words a frame, the first eight
+		// byte-identical to `All`.
+		enum class StreamMode : uint8_t { Off, Main, Cue, All, Tracks };
+		static constexpr uint32_t g_streamCapFrames = 60 * 44100;	// 60 s: 10.6 MB for a pair, 42.3 MB for all eight, 127 MB for the tracks
+		static constexpr uint32_t g_stemWords = 16;			// eight stereo stems
+		static uint32_t streamWords(const StreamMode _m) { return _m == StreamMode::Tracks ? g_audioSlots + g_stemWords : _m == StreamMode::All ? g_audioSlots : _m == StreamMode::Off ? 0 : 2; }
 		void setAudioStream(StreamMode _mode);		// Off stops and frees; any other mode (re)starts empty
 		StreamMode audioStream() const { return m_streamMode; }
 		// Move up to _maxFrames pending frames (interleaved, streamWords() each) onto _out; returns the frames moved.
 		size_t takeAudioStream(std::vector<int16_t>& _out, size_t _maxFrames);
 		struct StreamStatus { StreamMode mode; uint64_t captured, pending, dropped; };
 		StreamStatus streamStatus() const;		// O17: locked in the rt mode (the sink runs on core 0's thread)
+		uint64_t stemTaps() const { return m_stemTaps.load(std::memory_order_relaxed); }	// O23: stem taps made since `audio start tracks`
 		// Feed RX0 from the transport start (the first 0x8c) on: `_channels`
 		// interleaved channels onto slots 0..channels-1, silence past the end
 		// -- or the built-in tones (slot k = a sine at 500 x (k+1) Hz, -20 dBFS).
@@ -555,7 +562,25 @@ namespace ot
 		std::vector<int16_t> m_stream;
 		size_t m_streamHead = 0, m_streamCount = 0;		// frames
 		uint64_t m_streamCaptured = 0, m_streamDropped = 0;	// frames since `audio start`
-		void streamPush(const int32_t* _words);			// one de-rotated frame of eight 24-bit words
+		void streamPush(const int32_t* _words, int _group);	// one de-rotated frame of eight 24-bit words; _group = the ring group (0..31) of its main pair, -1 unknown
+		// O23: THE STEM TAP (dsp.cpp). Payload A's mixdown (P:0x238-0x2d4, both
+		// the plain and the master-track path) sums the eight per-track
+		// 16-sample stereo blocks the ColdFire forwarded (X:$204 = 0x4400 for
+		// bank A / 0x2400 for bank B, 32 words a track, L/R interleaved,
+		// 24-bit after the in-place hi/lo join at P:0xed) into ring words 2/3
+		// with one mono gain a track and sample (Y:0x4a + 20j + k, ramped at
+		// P:0x203-0x237), then `asl #2`. At P:0x2d5 -- the first instruction
+		// both paths reach after their loop -- everything is still in place
+		// (Y:0x40-0x5f is reused by the cue mix at P:0x32d), so the tap forms
+		// each track's own term there, once per ring half, into m_stems[half];
+		// the sink copies the 16 words of the sample it delivers. Core 0's
+		// thread in both modes (the interpreter's step / the rt worker's
+		// block entry: P:0x2d5 is a volatile P address under the JIT).
+		static constexpr uint32_t g_stemTapPc = 0x2d5;
+		std::atomic<bool> m_stemsOn{false};			// the Tracks mode is on (read on the worker)
+		std::atomic<uint64_t> m_stemTaps{0};		// taps made (rtstatus / audio status)
+		int16_t m_stems[2][16][g_stemWords] = {};	// [ring half][sample][T1 L, T1 R, ... T8 R], 16-bit
+		void stemTap(Core& c) __attribute__((noinline));
 		std::atomic<bool> m_pulling{false};	// O17: read on the worker (a bank write inside a pull is counted)
 		bool m_pcWatchOn = false; int m_pcWatchCore = 0; uint32_t m_pcWatchPc = 0; uint64_t m_pcWatchFrom = 0;	// with a `from`, the FIRST 24 arrivals after it are kept
 		std::vector<PcWatchHit> m_pcWatchHits;

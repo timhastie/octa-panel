@@ -50,9 +50,12 @@
 // devices (GET /audio/devices, fetched when the menu opens) -- Off, then
 // each device with a checkmark on the running one -- and sends the choice
 // as GET /audio/output?device=<name>: the server streams the unit's outputs
-// to it in real time (main L/R on channels 1-2, cue L/R on 3-4, the other
-// four ESAI words on 5-8; a 2-channel device gets main L/R; BlackHole for a
-// DAW). The line under the submenu shows the map. The choice is remembered
+// to it in real time (main L/R on channels 1-2, cue L/R on 3-4, the eight
+// tracks as stereo stems on 5-20 -- per-track outputs the hardware does not
+// have, O23 -- and the other four ESAI words on 21-24; a device with fewer
+// channels gets the first pairs, a 2-channel one main L/R; BlackHole 16ch
+// for a DAW carries main, cue and tracks 1-6, the 64ch edition everything).
+// The line under the submenu shows the map. The choice is remembered
 // (UserDefaults outputDevice) and re-sent whenever /status returns to ready
 // (a fresh server after Reload / Open Project knows nothing of it; the
 // server itself keeps the stream across its child's reboots and answers
@@ -682,7 +685,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         outItem.submenu = outputMenu
         outputMapItem = audio.addItem(withTitle: Self.mapLine(nil), action: nil, keyEquivalent: "")
         outputMapItem.isEnabled = false
-        outputMapItem.toolTip = "Where the unit's outputs land on the chosen device: main L/R on channels 1-2, cue L/R on 3-4, ESAI words 0/1 on 5-6 and 6/7 on 7-8 (as many pairs as the device has; a 2-channel device gets main L/R)."
+        outputMapItem.toolTip = "Where the unit's outputs land on the chosen device: main L/R on channels 1-2, cue L/R on 3-4, tracks 1-8 as stereo pairs on 5-20 (T1 on 5-6 ... T8 on 19-20), ESAI words 0/1 on 21-22 and 6/7 on 23-24 (as many pairs as the device has; a 2-channel device gets main L/R, BlackHole 16ch main, cue and tracks 1-6)."
         rebuildOutputMenu()
         audioMenu = audio
         audioItem.submenu = audio
@@ -1346,6 +1349,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         return nil
     }
 
+    /// The map a device with `channels` outputs gets (the server's OUTPUT_ORDER
+    /// for the `tracks` capture: main, cue, tracks 1-8, ESAI words 0/1, 6/7).
+    static func mapFor(channels: Int) -> String {
+        let pairs = channels / 2
+        var parts: [String] = ["main L/R > 1-2"]
+        if pairs >= 2 { parts.append("cue L/R > 3-4") }
+        if pairs >= 3 {
+            let tracks = min(8, pairs - 2)
+            parts.append(tracks == 1 ? "track 1 > 5-6" : "tracks 1-\(tracks) > 5-\(4 + 2 * tracks)")
+        }
+        if pairs >= 11 { parts.append("ESAI words 0/1 > 21-22") }
+        if pairs >= 12 { parts.append("6/7 > 23-24") }
+        return parts.joined(separator: ", ")
+    }
+
     /// The channel-map line under the submenu.
     static func mapLine(_ out: [String: Any]?) -> String {
         if let o = out, o["running"] as? Bool == true, let name = o["device"] as? String {
@@ -1353,7 +1371,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             let ch = o["channels"] as? Int ?? 0
             return "\(name): " + (map.isEmpty ? "\(ch) channels" : map.joined(separator: ", "))
         }
-        var line = "Output off -- main L/R > 1-2, cue L/R > 3-4, ESAI words 0/1 > 5-6, 6/7 > 7-8"
+        var line = "Output off -- main L/R > 1-2, cue L/R > 3-4, tracks 1-8 > 5-20, ESAI words 0/1 > 21-22, 6/7 > 23-24"
         if let n = out?["note"] as? String, !n.isEmpty { line += " (\(n))" }
         return line
     }
@@ -1399,8 +1417,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             item.target = self
             item.representedObject = name
             item.state = active == name ? .on : .off
-            item.toolTip = ch >= 8 ? "main L/R > 1-2, cue L/R > 3-4, ESAI words 0/1 > 5-6, 6/7 > 7-8"
-                         : ch >= 4 ? "main L/R > 1-2, cue L/R > 3-4" : "main L/R > 1-2"
+            item.toolTip = Self.mapFor(channels: ch)
         }
         outputMapItem?.title = Self.mapLine(outputState)
     }

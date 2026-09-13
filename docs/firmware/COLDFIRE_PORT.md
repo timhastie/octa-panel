@@ -6363,3 +6363,216 @@ ColdFire-side delay are bit-identical between the modes; O20's H2 "whole
   firmware's; no hardware reference exists here to check it against.
 - Plate and spring were not run; the O20 cards (effects on T5) were not
   re-rendered — they measure a silent track.
+
+## Milestone O23 — per-track outputs: the eight stems tapped from the DSP's mixdown, over the pipe and onto the output device ✅ (13 Sep 2026, branch `panel-ui`)
+
+The owner's ask: the hardware has only MAIN and CUE, but inside the DSP
+each track's audio exists as a block of samples after its effects and
+before it is summed into the buses — find those blocks, tap them every
+frame, and send them to the output device as extra channels. **Emulator
+side only: the firmware and the DSP programs are untouched** (what he
+flashes is what he tested). Everything under `out/_agents/mout/`
+(`map.py`, `analyze.py`, `server_verify.py`, `bench_audio.py`, the
+streams, the logs, `oracle.out`, `gates.out`).
+
+### The buffer map, from the disassembly (`out/dsp/payload_A.asm`) and confirmed by instruments
+
+**The stems exist as data, per track, not accumulated in place.** Payload
+A's frame on core 0 (the dispatcher P:0x40-0x25f, the mixdown P:0x238-
+0x2d4 across the small modules P:0x260-0x2bf, the rest of P:0x2bf):
+
+| step | P | what |
+|---|---|---|
+| the bank take | 0x4b-0x71 | waits `DSR2 == 0x8070` → bank A (`r0 = 0x8080`, `r2 = 0x4400`, `r4 = 0x4800`, `r5 = 0x4600`, `r6 = 0x4000`, `r7 = 0x4080`) or `0x80f0` → bank B (`r0 = 0x8000`, `r2 = 0x2400`, …); saved to `X:$203` (r0, the ring half), `X:$204` (r2), `X:$205` (r4), `X:$206` (r5), `X:$207` (r6), `X:$209` (r7). The DMA-in mask at P:0x75/0x77 (`x0 = 0x3fff` for bank A, `0x5fff` for B, patched into P:0x58c/0x59b) makes the host's `0x6400` land in the OTHER bank's `0x2400`/`0x4400`: the forward the ColdFire sends during frame N is consumed at frame N+1 — the "one frame later" of O21 |
+| the host exchange | 0x73-0xe6 | the bank word, the HTDE wait, core 1's mailbox, the input ring copy |
+| **the hi/lo join** | 0xe8-0xed (`func_56a`, n0 = 0x100) | the forwarded 512 host words at `X:$204` (8 tracks × 16 samples × L/R × hi,lo — the ColdFire's delay pass on the two cores' read-backs: core 1's positions 0-3 = T1-T4 in slots 0-3, core 0's = T5-T8 in slots 4-7, O21) become **256 24-bit words in place**: `extractu` the low byte from the lo word, `mac #$80` the hi word up 8 bits — so after it **track k's block is `X:$204 + 32k`, sample j's L at `+2j`, R at `+2j+1`, 24-bit signed** |
+| the level path | 0xf5-0x10a, 0x10b-0x165 | per slot three 16-bit host words from `X:$205` (r4's block) → `X:0..0x1d` (×256), squared into `Y:0..0x13` (the CFPRM square law), scaled by the tables at `X:0x6c00` and the two master squares |
+| the gain ramp | 0x203-0x237 | per slot (8 tracks + 2 inputs) a two-segment ramp over the 16 samples from the state at `X:0x3dd + 5k` into **`Y:0x40 + 20j + k` (the cue-bus gain of track k at sample j) and `Y:0x4a + 20j + k` (its MAIN gain)**, one mono gain a track (pan is upstream, in the block itself) |
+| **the mixdown** | 0x238-0x2d4 | `m0 = 0xff` (a 256-word modulo buffer at `X:$204`), per sample: `mpy/mac y0,x0` over the eight slots (`x:(r0)+n0` with `n0 = 0x1f` steps 32 words a slot, L then R under the same `y0`) plus the two input pairs (`x:(r2)+`), `asl #2`, `move a/b,x:(r1)+` → ring words 0/1 (the cue bus, gains `Y:0x40..`) then the same over `Y:0x4a..` → **ring words 2/3 = MAIN L/R**, `(r1)+n1` to the next sample's 8-word group. The plain path (P:0x259) and the MASTER TRACK path (P:0x292, bit 10 of `x:(r6+$7e)`: slots 0-6 summed into `X:0x4278..` for track 8 to process, main = slot 7 alone) both end at **P:0x2d5** |
+| after it | 0x2d5-0x2eb | `func_55a` × 4: the main pair and the input pairs packed hi/lo into `X:0x4700..` (the recorder's sources, the 128-word ch 6 read-back) |
+| the cue mix | 0x30a-0x359 | ring words 4/5 = `Y:0x40+2j` × words 0/1 + `Y:0x41+2j` × words 2/3 — **it overwrites `Y:0x40-0x5f` at P:0x32d**, i.e. sample 0's and part of sample 1's gains, which is why the tap must read them before it |
+| then | 0x36a-0x39f, 0x3a1… | the staging copy, the dispatch context, and the voices / effects of the NEXT frame's read-back |
+
+Confirmed on the tree2 clean card (`out/_agents/fx2/cards/clean7.img`,
+T3/T4/T7/T8 sounding, `map.py --peeks --frametrace`, lockstep):
+
+- `dsp peek 0 X 0x4400 256` / `0x2400 256` while bank A is current
+  (`X:$203 = 0x8080`, `X:$204 = 0x4400`): the 0x4400 block is the joined
+  form — 32-word windows rms **25 / 25 / 604,919 / 604,919 / 25 / 25 /
+  604,919 / 604,919** for slots 0-7 (24-bit units; T3/T4/T7/T8 carry
+  third/fourth-0.wav, T1/T2/T5/T6 ~0) — while 0x2400 holds the NEXT
+  frame's forward still in hi/lo form (every window ~2.3-2.6 × 10⁵: the
+  stale TXH byte above the 16 payload bits, O8); a peek with bank B
+  current shows the mirror (`0x2400` joined: 143 / 143 / 176,787 / …).
+  So a per-track block is complete from the join at P:0xed until the
+  next DMA-in into the same bank, one frame later.
+- `Y:0x4a + 20j + k` at j = 2, 8, 15: **0x16c800 = 0.178 on every slot**
+  (level 64: × 0.178 × 4 = 0.712, the 0.7032 fit gain of O14k); at j = 0
+  the words are the cue mix's (0x0e5f6b, 0x7f6a9a, …) — the clobber,
+  measured.
+- `--dsp-pcwatch 0:2d5`: one arrival per frame, **66,546 / 66,574 DSP
+  instructions apart** (the frame period), taps = frames in `audio status`.
+- `OT_DSP_FRAMETRACE=1`: at P:0x205 (the ramp, ~1,000 instructions before
+  the tap) **DSR2 = 0x807d / 0x807a for bank A and 0x80fd / 0x80fa for B**
+  (1,748 / 522 / 1,690 / 509 of 4,469 frames) — the mixdown lands about
+  half a sample before DMA2 enters the half it wrote; the return to the
+  poll (P:0x4b) is at 0x80af / 0x802f, ~6 samples in — the frame's voice
+  and effect work runs AFTER the mixdown, for the next frame.
+
+### The tap (`dsp.h` / `dsp.cpp`, THE STEM TAP; nothing outside the sink/tap)
+
+- `StreamMode::Tracks` (`audio start tracks`): **24 words a frame = the
+  eight de-rotated ring words of `all` (0/1 cue bus, 2/3 main L/R, 4/5 cue
+  L/R, 6/7 unused) followed by T1 L, T1 R, T2 L, … T8 L, T8 R**, 16-bit
+  (the 24-bit words >> 8), LE, in the same 60 s ring (127 MB at 24
+  words). `audio status` gains ` taps=<n>` in this mode only; every older
+  mode's bytes and lines are unchanged.
+- `DspPair::stemTap(Core&)` runs on core 0 with the PC at **P:0x2d5** —
+  in lockstep a compare in `stepBody` beside the bank-word one, gated by
+  an atomic flag set by `audio start tracks`; under `--dsp-rt` P:0x2d5 is
+  one more volatile P address (`rtSetup`), so the block after the mixdown
+  is always entered from `rtWorker`, where the tap fires once per arrival
+  (keyed on the instruction counter), on core 0's own thread — every
+  write it reads (the DMA-in, the join, the ramp) is that thread's, so
+  there is no race and no lock. It reads `X:$203` (the half: 0x8080 →
+  ring words 0x80-0xff, 0x8000 → 0x00-0x7f), `X:$204` (the block), and
+  forms each track's own term of the mixdown: `((x × g) << 1) << 2`, the
+  24-bit word of the accumulator with the move's limiter, >> 8 — into
+  `m_stems[half][16][16]`; a boot-time arrival with other values in
+  `X:$203/$204` stages nothing.
+- The ESAI sink names, per delivered frame, the ring group of its main
+  pair by the −9 rule per slot (`(DSR2 − 9 + ((2 − rot) & 7)) & 0xff) >> 3`,
+  a rotated frame's pair placed by ITS ring words), and `streamPush`
+  appends the 16 staged words of `m_stems[group >> 4][group & 15]` after
+  the eight ESAI words. The half's staging is written ~half a sample
+  before DMA2 enters it and next overwritten a frame later, after the
+  half has played out — the sink never reads a half being staged.
+- Cost: 256 multiplies and 640 word reads per frame at the tap, a 32-byte
+  copy per sample at the sink. Measured below: nothing.
+
+### The server, the app, the docs
+
+- `panel_server.py`: with a device on the child's capture is `audio start
+  tracks` (`OUTPUT_CAPTURE`; `_capture_start` falls back to `all`, then
+  `main`, on a child that lacks the mode, and `output.note` says so); the
+  drain de-interleaves main L/R (words 2/3 of 24) for the ring, the takes
+  and `/audio/pcm` exactly as before; `AudioOutput` opens up to **24
+  channels** and lays the pairs out in `OUTPUT_ORDER[24] = (1, 2, 4..11,
+  0, 3)`: **main L/R → 1-2, cue L/R → 3-4, tracks 1-8 → 5-20, ESAI words
+  0/1 → 21-22, 6/7 → 23-24**, as many as the device has (BlackHole 2ch:
+  main; 8 ch: main, cue, T1-T2; BlackHole 16ch: main, cue, T1-T6; 64ch:
+  all 24); `/audio/status` `capture` (`tracks`), `words` (24) and
+  `output.map` / `output.layout` report it. Checked for every width
+  (2/8/24 words × 2/8/16/24/64-channel devices) against the expected
+  word placement, without PortAudio.
+- `VirtualPanel.swift`: the map line and the per-device tooltips
+  (`mapFor(channels:)`); `bash tools/panel/app/build.sh`: 0 warnings.
+- `tools/panel/README.md` "Recording into a DAW" and the `/audio/status`
+  row, `tools/panel/app/README.md`.
+
+### Measured (13 Sep 2026, the M5, macOS 26.5, other agents' builds and runs on the machine throughout — load average ~4; the LTO binary `out/_agents/mout/build/ot_emu`, built from the working tree with the JIT agent's vendor change in progress)
+
+`map.py`: the clean7 card, PLAY, 3 s, `audio start tracks`, FUNC + T7
+at 1.6 s; `analyze.py` on the 24-word stream (`ls-tracks/`, `rt-tracks/`,
+`ls-all/`; the same on both modes):
+
+| measurement | lockstep `--dsp` | `--dsp-rt` |
+|---|---|---|
+| frames captured / taps | 150,159 / 8,943 (= the frames the ColdFire counted) | 150,158 / 8,949 |
+| RMS dBFS, whole stream: main L/R | −23.9 / −24.0 | the same |
+| T3, T4, T8 L/R | **−35.1 / −35.2** each | the same |
+| T7 L/R (muted from 1.6 s) | **−38.1 / −38.2** | the same |
+| T1, T2, T5, T6 L/R | −53.1 (below) | the same |
+| Σ of the eight stems vs main L/R | **−51.8 dB** over every sample but four (rms 7.6 against 2,944), every difference in **−7..0 LSB** — each stem's word truncated where the mixdown truncates the sum once; the four samples: one per hit onset, where **the main pair's limiter** holds 32767 and the stems sum to 38,560 (the limiter is the mixdown's, after the sum) | the same figures |
+| 1 s before → 1 s after the mute (from +100 ms) | T7 **−35.8 → −999 (exactly zero; last non-zero word 42 ms after the FUNC press = 2 ms after the T7 press)**; T3/T4/T8 −35.8 → −35.8, T1/T2/T5/T6 −53.8 → −53.8, main −23.5 → −25.9 (a quarter of the four gone) | the same |
+| the first eight words vs `audio start all` on the same sequence | **byte-identical**, 150,159 frames (lockstep) | — |
+| rt vs lockstep, onset-aligned, the 70,000 frames before the mute | main L/R and all sixteen stems **bit-identical**; the cue pair differs (19,111 of 70,000 samples, max 24,597) — pre-existing: the cue mix's table path under the JIT (the O21 class), captured by `all` before this milestone and never compared between the modes | |
+| speed while playing and reading every 40 ms | 177 emulated ms per wall s (`--dsp-pcwatch` on: the instrumented step) | 1,100 |
+
+The −53 dBFS of T1/T2/T5/T6 (the silent slot-1/2 tracks, O21) is
+entirely a ~96-sample transient at each hit onset that **all eight
+forwarded slots carry identically** (frames 82-178: the same words on T1
+and T3 until they diverge at frame 145; T1 is ±2 LSB elsewhere, max 14):
+the main pair's onset burst that clips at 32767 on this fixture and on
+the reference `interdsp` capture (samples 132-153 there) is that burst
+× 8 — a pre-existing feature of the emulated forward at a trig (the
+ColdFire's delay pass or the read-back at the retrigger; not determined,
+not this milestone's), visible per track now.
+
+The gates, all on the same binary:
+
+| gate | result |
+|---|---|
+| strict oracle vs `out/emu/ot_emu.ref-73c2815` (`--build-dir out/_agents/mout/build`) | **28 PASS, 0 FAIL**, 38 s (`out/_oracle/reports/20260913-130357-o23-stems.txt`; the interactive `audio.pcm` and `audio status` byte-identical) |
+| `rtdrive.py --rt` on the clean fixture (`out/_agents/audio/otlive2.img`), `fit.py` | **onset 82, gain 0.7032, residual −33.0 dB** |
+| `bench.py o23-stems --dsp --dsp-rt` (flat out, no capture) | 987 emulated ms per wall s (`per 16th 0.127 s`) under the machine's load; the A/B below |
+| the tap's cost, `bench_audio.py` (the bench with a capture on and never read), rt: none / `all` / `tracks` | 970 / 981 / 968 emulated ms per wall s — within the run-to-run band, `tracks` taps 11,469 in the 4 s |
+| the same, lockstep `--dsp`: none / `tracks` | 208 / 207 |
+| ctest | 7/7 (inside the oracle) |
+| the app | built, 0 warnings |
+
+An A/B of the flat-out bench under the same load, alternating O21's LTO
+binary (`out/_agents/fx2/build-lto/ot_emu`, no tap) with this one, no
+capture and with `tracks` on (`ab_and_server.out`; the load average rose
+from 3.7 to 6.7 during it — other agents' builds):
+
+| run | O21 LTO, no capture | this binary, no capture | this binary, `audio start tracks` |
+|---|---|---|---|
+| #1 | 1,016 | 998 | 796 (the load spike) |
+| #2 | 954 | 979 | 1,011 |
+
+The band is the machine's, not the tap's: the same binary reads 968-1,011
+with the stems on and 970-998 without, the O21 binary 954-1,016 — the
+1,208 of O17b is the PGO binary on an idle machine, the 1,015-1,042 of
+the O17b/O21 LTO builds their idle-machine figures.
+
+**The server** (`server_verify.py`: port 8596, `--port-bin` this binary,
+the tree2 fixture, `--sound on`, BlackHole 2ch, PLAY 60 s; run 1 with
+the load at ~6.7, `server-run1/`):
+
+| measurement | run 1 |
+|---|---|
+| ready | 7.6 s, the `--dsp-rt` child |
+| `/audio/status` before / 1.5 s after `device=BlackHole 2ch` | `capture main, words 2` / **`capture tracks, words 24`**, `output.layout ["main L/R"]`, `map ["main L/R -> 1-2"]` (a 2-channel device) |
+| PLAY 60 s, polled every 5 s | `/status rt` 0.99-1.025; **underruns 1 (inside the first 5 s, at the transport start), then 0 for 55 s; dropped 0, trimmed 0, pa_underflows 0** (run 3 below: 0 / 0 / 0 over the whole 60 s); buffered 68-83 ms; the drain's worst pump **3.0 ms** with 24-word reads (a 20 ms pump's reply is 85 KB of hex); `pushed` 2,722,821 / `played` 2,719,143 at +60 s |
+| `/audio/pcm?from&max=44100` mid-play | 200, 44,100 frames, 176,400 bytes = the main pair, 4 bytes a frame (the headphones monitor's feed, unchanged) |
+| the take | 60.258 s; `fit.py`: **onset 81, gain 0.7032, residual −33.0 dB** (the clean fit of O17c: the main pair the takes see is byte for byte what it was) |
+| `device=off` | the capture back to `main`, 2 words, within 1.5 s |
+
+A second run (port 8597, `server-run2/`) coincided with another agent's
+`ot_emu` at a full core beside the panel's child: `/status rt` fell to
+0.898, and the device stream showed what the pacer's shortfall always
+shows (README, "Drift") — 18 underruns, 3,660 frames dropped, the take
+58.7 s at +60 s — with the drain's worst pump still 3.2 ms, the take
+still −33.0 dB, the capture `tracks` / 24 words throughout: the child's
+pace, not the stems' cost (the tap's A/B above; the 24-word drain is 3 ms
+a pump). A third run (port 8598, `server-run3/`, no other
+emulator on the machine, load average ~4.5 from builds): **60 s with
+underruns 0, dropped 0, trimmed 0, pa_underflows 0**, `/status rt`
+0.989-1.016, buffered 57-118 ms, the drain's worst pump 37.8 ms once
+(no consequence at 100 ms of prime), the take 60.208 s at −33.0 dB, the
+capture `tracks` / 24 words throughout — the figure for a machine that
+has a core for the child.
+
+### What it does not do
+
+- The stems are the MAIN terms: a track routed to CUE only (its `Y:0x40 +
+  20j + k` gain) is not in its stem, and the two input pairs, the click
+  and the mixdown's limiter are in no stem. Under the MASTER TRACK
+  setting (P:0x292) tracks 1-7 feed track 8 instead of the main pair:
+  their stems are then what the master receives (each with its own
+  gain), track 8's is the main — not verified on a fixture (the OTLIVE
+  projects have no master track).
+- 16-bit over the pipe, as every capture; the DSP's words are 24-bit.
+- A device with more than 24 channels gets 24; the layout is fixed
+  (main, cue, tracks, the spare ESAI pairs), not chosen per device.
+- The cue pair under `--dsp-rt` differs from lockstep (above): the JIT's
+  rendering of the cue mix's table path, the O21 class, seen because the
+  `tracks` stream was compared word for word between the modes; not
+  this milestone's, not fixed.
+- The onset burst on all eight forwarded slots (the fixture's clipped hit
+  onset, now visible per track) is not explained here.
+- Not tried: a many-channel device (this Mac has BlackHole 2ch; the
+  layout beyond channel 2 is exercised by the width check, not by a
+  device), the panel page's monitor with stems (it keeps the main pair
+  by design), the batch `--audio-out` (the stems are the pipe's only).

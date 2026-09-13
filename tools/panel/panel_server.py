@@ -64,12 +64,15 @@ a PR to key_map.json.
 The output device (13 Sep 2026): /audio/devices lists the Mac's audio
 devices (PortAudio via the sounddevice package), /audio/output?device=
 <index|name|off> streams the unit's outputs to one of them in real time
-(main L/R on channels 1-2, cue L/R on 3-4, the other four ESAI words on
-5-8; a 2-channel device gets main L/R) -- BlackHole into a DAW, or the
+(main L/R on channels 1-2, cue L/R on 3-4, and -- O23, per-track outputs
+the hardware does not have -- tracks 1-8 as stereo stems on 5-20, then
+the other four ESAI words on 21-24; a device with fewer channels gets the
+first pairs, a 2-channel one main L/R) -- BlackHole into a DAW, or the
 speakers -- and /audio/status "output" says how it is going (README
-"Recording into a DAW"). With a device on, the child streams all eight
-ESAI words (`audio start all`) and the drain de-interleaves main L/R for
-the ring, the takes and /audio/pcm, which see exactly what they saw.
+"Recording into a DAW"). With a device on, the child streams the eight
+ESAI words plus the eight stems (`audio start tracks`, 24 words a frame;
+`all` on an older child) and the drain de-interleaves main L/R for the
+ring, the takes and /audio/pcm, which see exactly what they saw.
 """
 import argparse
 import collections
@@ -322,7 +325,7 @@ class PortProc:
         quit                ok, exit 0
         (failure)           err <message>, keeps serving
       and with --dsp (O14k, 12 Sep 2026; `err audio needs --dsp` without it):
-        audio start [main|cue|all]   ok        (core 0's ESAI frames into a 60 s ring)
+        audio start [main|cue|all|tracks]   ok   (core 0's ESAI frames into a 60 s ring; tracks = + the eight stems, O23)
         audio read [<maxframes>]     audio <frames> <hex>   (LE int16 stereo, released on read, never blocks)
         audio status                 audio status on= mode= captured= pending= rate=44100 dropped= cap=
         audio stop                   ok
@@ -643,16 +646,21 @@ class TakeWriter:
 # `emu` extra of pyproject.toml carries it -- `uv sync --extra emu`, or into
 # an existing venv `uv pip install --python .venv/bin/python3 sounddevice`)
 # on the device the user picks, fed from the same drain as the ring and the
-# takes. With a device on, the child's capture runs `audio start all`: ALL
-# EIGHT ESAI words per frame (O14k: words 2/3 = main L/R, 4/5 = cue L/R,
-# 0/1 and 6/7 whatever the DSP puts there, zero on the fixture). The drain
-# de-interleaves main L/R for the ring, the takes and /audio/pcm -- byte for
-# byte what `audio start main` gives -- and hands the whole frame to the
-# output, which lays it out on the device as main L/R -> channels 1-2, cue
-# L/R -> 3-4, words 0/1 -> 5-6, words 6/7 -> 7-8, as many of those pairs as
-# the device has channels for (a 2-channel device gets main L/R). The stream
-# is opened with exactly that many channels, so anything further on the
-# device is silent. The PortAudio callback (its own thread) pulls from a
+# takes. With a device on, the child's capture runs `audio start tracks`
+# (O23, 13 Sep 2026): the EIGHT ESAI words per frame (O14k: words 2/3 = main
+# L/R, 4/5 = cue L/R, 0/1 and 6/7 whatever the DSP puts there, zero on the
+# fixture) followed by the EIGHT PER-TRACK STEMS (T1 L, T1 R, ... T8 L,
+# T8 R: each track's own term of the DSP's main mix, tapped inside the
+# emulator's mixdown -- COLDFIRE_PORT.md O23), 24 words a frame; an older
+# child without `tracks` gets `all` (8 words). The drain de-interleaves main
+# L/R for the ring, the takes and /audio/pcm -- byte for byte what `audio
+# start main` gives -- and hands the whole frame to the output, which lays
+# it out on the device as main L/R -> channels 1-2, cue L/R -> 3-4, tracks
+# 1-8 -> 5-20 (T1 on 5-6 ... T8 on 19-20), words 0/1 -> 21-22, words 6/7 ->
+# 23-24, as many of those pairs as the device has channels for (a 2-channel
+# device gets main L/R, an 8-channel one main, cue and tracks 1-2, BlackHole
+# 16ch main, cue and tracks 1-6). The stream is opened with exactly that
+# many channels, so anything further on the device is silent. The PortAudio callback (its own thread) pulls from a
 # deque of chunks: it plays nothing until OUTPUT_PRIME_S is queued, puts out
 # zeros and counts an underrun when the queue runs dry (then primes again),
 # and the push drops the OLDEST frames beyond OUTPUT_CAP_S queued so the
@@ -669,8 +677,15 @@ OUTPUT_BLOCK = 512           # frames per PortAudio callback (11.6 ms)
 OUTPUT_PRIME_S = 0.10        # queued before the stream plays (the drain runs every PACE_POLL_S = 20 ms)
 OUTPUT_CAP_S = 0.25          # queued beyond this: the oldest frames are dropped, and counted
 OUTPUT_STALL_S = 3.0         # no callback for this long while frames arrive: the device is gone, the stream stops
-OUTPUT_ORDER = (1, 2, 0, 3)  # ESAI word pairs onto device channel pairs: main (2/3) -> 1-2, cue (4/5) -> 3-4, 0/1 -> 5-6, 6/7 -> 7-8
-OUTPUT_PAIR_NAMES = ("main L/R", "cue L/R", "ESAI words 0/1", "ESAI words 6/7")
+# The child's word pairs (pair k = words 2k/2k+1 of a frame) onto device channel
+# pairs, per capture mode: main (2/3) -> 1-2, cue (4/5) -> 3-4, then (O23) the
+# eight stems (pairs 4-11) -> 5-20, then ESAI words 0/1 and 6/7.
+OUTPUT_ORDER = {2: (0,), 8: (1, 2, 0, 3), 24: (1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 0, 3)}
+OUTPUT_PAIR_NAMES = {2: ("main L/R",), 8: ("main L/R", "cue L/R", "ESAI words 0/1", "ESAI words 6/7"),
+                     24: ("main L/R", "cue L/R") + tuple(f"track {k + 1} L/R" for k in range(8)) + ("ESAI words 0/1", "ESAI words 6/7")}
+OUTPUT_MAX_CHANNELS = 24
+CAPTURE_WORDS = {"main": 2, "all": 8, "tracks": 24}   # words a frame per `audio start <mode>`
+OUTPUT_CAPTURE = "tracks"                              # the capture a device is fed from (falls back to all, then main)
 
 _sd_lock = threading.Lock()
 _sd_state = {}
@@ -755,7 +770,7 @@ class AudioOutput:
         n = int(device["channels"])
         if n < 2:
             raise ValueError(f"{self.name} has {n} output channel(s); the unit's outputs need at least 2")
-        self.channels = min(8, n - n % 2)            # 2, 4, 6 or 8: the pairs the device has room for
+        self.channels = min(OUTPUT_MAX_CHANNELS, n - n % 2)   # 2..24, even: the pairs the device has room for
         self.units = self.channels // 2              # stereo pairs per device frame
         self.bpf = self.channels * 2                 # bytes per device frame (int16)
         self.q = collections.deque()                 # chunks in device frame layout
@@ -772,7 +787,7 @@ class AudioOutput:
         self.played = 0         # frames the callback took from the queue
         self.callbacks = 0
         self.pa_underflows = 0  # PortAudio's own output-underflow flag on a callback
-        self.words = 2          # words per frame of the last push: 2 = main only, 8 = all
+        self.words = 2          # words per frame of the last push: 2 = main only, 8 = all, 24 = tracks
         self.started = time.time()
         self.started_mono = time.monotonic()
         self.last_cb = None
@@ -786,20 +801,24 @@ class AudioOutput:
         self.running = True
 
     def channel_map(self):
-        m = [f"{OUTPUT_PAIR_NAMES[k]} -> {2 * k + 1}-{2 * k + 2}" for k in range(self.units)]
-        if self.words == 2 and self.units > 1:
-            m = m[:1] + [f"{self.channels - 2} further channels silent (the capture is main only)"]
+        """The device's channel pairs by name, for the words the child streams
+        now (the capture mode): what the stream carries, then what stays silent."""
+        names = OUTPUT_PAIR_NAMES.get(self.words, OUTPUT_PAIR_NAMES[2])
+        k = min(self.units, len(names))
+        m = [f"{names[i]} -> {2 * i + 1}-{2 * i + 2}" for i in range(k)]
+        if self.units > k:
+            m.append(f"{self.channels - 2 * k} further channels silent (the capture is {'main only' if self.words == 2 else 'main, cue and the ESAI words'})")
         return m
 
     def layout(self, data, words):
         """The child's frames (`words` int16 each) as device frames: the
-        pairs in OUTPUT_ORDER, as many as the device has channels for --
-        memoryview strides, nothing per sample. 2-word frames (the `main`
+        pairs in OUTPUT_ORDER[words], as many as the device has channels for
+        -- memoryview strides, nothing per sample. 2-word frames (the `main`
         capture) fill the first pair only."""
         n = len(data) // (words * 2)
         src = memoryview(data)[:n * words * 2].cast("i")     # one int32 per L/R pair
         su = words // 2
-        order = OUTPUT_ORDER if words == 8 else (0,)
+        order = OUTPUT_ORDER.get(words, (0,))
         if self.units == 1 and su == 1:
             return bytes(src)
         out = bytearray(n * self.bpf)
@@ -896,6 +915,7 @@ class AudioOutput:
                 "buffered_ms": round(qb / self.bpf / AUDIO_RATE * 1000.0, 1), "primed": self.primed,
                 "pushed": self.pushed, "played": self.played, "callbacks": self.callbacks,
                 "pa_underflows": self.pa_underflows, "words": self.words, "map": self.channel_map(),
+                "layout": list(OUTPUT_PAIR_NAMES.get(self.words, OUTPUT_PAIR_NAMES[2])[:self.units]),
                 "since": self.started, "note": self.note}
 
 
@@ -1729,7 +1749,7 @@ class Panel:
         self.take_seq = self._scan_takes()
         # The output device (13 Sep 2026, AudioOutput above): the stream the
         # drain feeds, if one is on; the capture mode the child runs (main =
-        # 2 words a frame, all = 8) and the words per frame the drain parses.
+        # 2 words a frame, all = 8, tracks = 24) and the words per frame the drain parses.
         self.output = None
         self.output_lock = threading.Lock()
         self.output_note = None           # why there is none / what the last attempt said
@@ -2906,32 +2926,39 @@ class Panel:
             self.sound = False
             self.sound_note = self.audio_note or SOUND_OFF_NOTE
             return
-        mode = "all" if self._output_live() else "main"
+        mode = OUTPUT_CAPTURE if self._output_live() else "main"
         try:
-            rt.proc.command(f"audio start {mode}", "ok")
+            mode = self._capture_start(rt, mode)
         except PortError as e:
-            if mode == "all":
-                # an older child without `all`: main L/R only; the output gets that and says so
-                self.output_note = f"the child refused `audio start all` ({e}): the output gets main L/R only"
-                print(f"panel: {self.output_note}")
-                mode = "main"
-                try:
-                    rt.proc.command("audio start main", "ok")
-                except PortError as e2:
-                    e = e2
-                else:
-                    e = None
-            if e is not None:
-                self.sound = False
-                self.audio_note = self.sound_note = f"sound off: the child refused `audio start main` ({e})"
-                return
-        self.audio_mode, self.audio_words = mode, 8 if mode == "all" else 2
+            self.sound = False
+            self.audio_note = self.sound_note = f"sound off: the child refused `audio start main` ({e})"
+            return
+        self.audio_mode, self.audio_words = mode, CAPTURE_WORDS[mode]
         self.audio_on = True
         self.sound = True
         self.audio_note = None
         self.sound_note = SOUND_ON_RT_NOTE if self.sound_rt else SOUND_ON_NOTE
         if not self.sound_rt and self.backend_note and "--dsp-rt child did not boot" in self.backend_note:
             self.sound_note += " -- the --dsp-rt child did not boot (backend_note says why)"
+
+    def _capture_start(self, rt, mode):
+        """`audio start <mode>` on the child, falling back down the list
+        (tracks -> all -> main) when the child does not know the mode (an
+        older --port-bin); the note says what the output gets. Returns the
+        mode started; raises PortError when even `main` is refused."""
+        chain = ["tracks", "all", "main"]
+        for m in chain[chain.index(mode):]:
+            try:
+                rt.proc.command(f"audio start {m}", "ok")
+            except PortError as e:
+                if m == "main":
+                    raise
+                self.output_note = (f"the child refused `audio start {m}` ({e}): the output gets "
+                                    + ("main, cue and the ESAI words, no per-track stems" if m == "tracks" else "main L/R only"))
+                print(f"panel: {self.output_note}")
+                continue
+            return m
+        raise PortError("no capture mode")
 
     def _drain_audio(self, rt):
         """Everything the child captured since the previous drain, into the
@@ -2955,15 +2982,17 @@ class Panel:
                 if len(data) != n * bpf:
                     raise PortError(f"audio read: {n} frames announced, {len(data)} bytes of PCM ({self.audio_mode})")
                 out = self.output
-                if self.audio_words == 8:
-                    # eight words a frame (O14k `all`): the whole frame to the
-                    # device; main L/R (words 2/3) on to the ring, the take and
-                    # /audio/pcm -- byte for byte what `main` gives; cue's peak beside
+                if self.audio_words > 2:
+                    # eight words a frame (O14k `all`) or 24 (O23 `tracks`): the
+                    # whole frame to the device; main L/R (words 2/3) on to the
+                    # ring, the take and /audio/pcm -- byte for byte what `main`
+                    # gives; cue's peak beside
                     pairs = memoryview(data).cast("i")         # one int32 per L/R pair
+                    su = self.audio_words // 2
                     if out is not None and out.running:
-                        out.push(data, 8)
-                    self.audio_peak_cue = pcm_peak(pairs[2::4].tobytes())
-                    data = pairs[1::4].tobytes()
+                        out.push(data, self.audio_words)
+                    self.audio_peak_cue = pcm_peak(pairs[2::su].tobytes())
+                    data = pairs[1::su].tobytes()
                 elif out is not None and out.running:
                     out.push(data, 2)
                 self.ring.append(data)
@@ -2994,16 +3023,17 @@ class Panel:
         return o is not None and o.running
 
     def _audio_switch(self, rt, mode):
-        """On the emu thread: the child's capture to `mode` (main | all).
-        What is pending is drained first; the frames the child renders
-        between that read and the restart (at most a pacer slice, ~10 ms)
-        do not reach the ring or an open take. No-op when already so, or
-        with the capture off. Returns the mode now."""
+        """On the emu thread: the child's capture to `mode` (main | all |
+        tracks; a mode the child lacks falls back, _capture_start). What is
+        pending is drained first; the frames the child renders between that
+        read and the restart (at most a pacer slice, ~10 ms) do not reach
+        the ring or an open take. No-op when already so, or with the
+        capture off. Returns the mode now."""
         if not self.audio_on or not isinstance(rt, PortRt) or mode == self.audio_mode:
             return self.audio_mode
         self._drain_audio(rt)
-        rt.proc.command(f"audio start {mode}", "ok")
-        self.audio_mode, self.audio_words = mode, 8 if mode == "all" else 2
+        mode = self._capture_start(rt, mode)
+        self.audio_mode, self.audio_words = mode, CAPTURE_WORDS[mode]
         self._dropped_base = self.audio_dropped     # the child's counter restarts with its ring
         self._dropped_at = 0.0
         return mode
@@ -3038,8 +3068,8 @@ class Panel:
         """/audio/output?device=<index|name|off>: the output stream onto that
         device (a running stream on the same device is left as it is: the
         app re-sends its choice at every ready), or off. The child's capture
-        follows -- all eight words with a device on, main L/R without --
-        through an emu-thread action. (ok, reply)."""
+        follows -- the eight ESAI words plus the eight stems (`tracks`) with
+        a device on, main L/R without -- through an emu-thread action. (ok, reply)."""
         spec = (spec or "").strip()
         with self.output_lock:
             cur = self.output
@@ -3090,7 +3120,7 @@ class Panel:
             self.output_note = None
             print(f"panel: audio output -> {out.name} ({out.channels} of {dev['channels']} channels: "
                   f"{'; '.join(out.channel_map())}; latency {out.status()['latency_ms']} ms)")
-        self._queue_capture("all")
+        self._queue_capture(OUTPUT_CAPTURE)
         return True, {"ok": True, "output": self.output_status(), "capture": self.audio_mode,
                       "note": f"output on {out.name}: " + "; ".join(out.channel_map())}
 
@@ -3157,8 +3187,9 @@ class Panel:
                 "takes_dir": str(self.takes_dir) if self.takes_dir else None,
                 "drain": dict(self.drain),
                 # the output device (13 Sep 2026): the child's capture mode (main = 2
-                # words a frame, all = 8 while a device is on), the cue pair's peak
-                # of the last 8-word read, and the stream itself
+                # words a frame; tracks = 24 -- the ESAI words and the eight stems, O23
+                # -- while a device is on, all = 8 on an older child), the cue pair's
+                # peak of the last multi-word read, and the stream itself
                 "capture": self.audio_mode, "words": self.audio_words,
                 "peak_cue": list(self.audio_peak_cue),
                 "output": self.output_status()}

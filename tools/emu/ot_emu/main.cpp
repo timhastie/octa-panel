@@ -107,14 +107,18 @@ namespace
 	// --main-level was posted only inside --sequencer -- so every voice was
 	// silent (O9b's trap). Now --main-level defaults to 64 here (main()).
 	//
-	//   audio start [main|cue|all] -> ok   DspPair::setAudioStream: main = words 2/3 as L,R (the default),
-	//                                      cue = 4/5, all = the eight words per frame; restarts empty if on
+	//   audio start [main|cue|all|tracks] -> ok   DspPair::setAudioStream: main = words 2/3 as L,R (the default),
+	//                                      cue = 4/5, all = the eight words per frame; restarts empty if on.
+	//                                      O23 (13 Sep 2026): tracks = the eight words of `all` followed by the
+	//                                      eight per-track stems (T1 L, T1 R, ... T8 L, T8 R: each track's term of
+	//                                      the main mix, dsp.h THE STEM TAP) -- 24 words a frame
 	//   audio read [<maxframes>]   -> audio <frames> <hex>   everything captured since the previous read
 	//                                      (at most <maxframes>): little-endian signed 16-bit interleaved
-	//                                      PCM, one L,R (or eight words) per frame, the 24-bit words >> 8;
+	//                                      PCM, one L,R (or eight / 24 words) per frame, the 24-bit words >> 8;
 	//                                      those frames are released. Never blocks: it answers what is there.
-	//   audio status               -> audio status on=0|1 mode=off|main|cue|all captured=<frames since start>
+	//   audio status               -> audio status on=0|1 mode=off|main|cue|all|tracks captured=<frames since start>
 	//                                      pending=<frames unread> rate=44100 dropped=<frames overwritten> cap=<ring frames>
+	//                                      [taps=<stem taps>]  (the last field in the tracks mode only)
 	//   audio stop                 -> ok   frees the ring
 	//
 	// The ring holds the last DspPair::g_streamCapFrames (60 s); `run`
@@ -963,10 +967,10 @@ namespace
 				if(sub == "start")
 				{
 					const auto mode = w.size() == 2 || w[2] == "main" ? Mode::Main
-						: w[2] == "cue" ? Mode::Cue : w[2] == "all" ? Mode::All : Mode::Off;
+						: w[2] == "cue" ? Mode::Cue : w[2] == "all" ? Mode::All : w[2] == "tracks" ? Mode::Tracks : Mode::Off;
 					if(w.size() > 3 || mode == Mode::Off)
 					{
-						reply("err usage: audio start [main|cue|all]");
+						reply("err usage: audio start [main|cue|all|tracks]");
 						continue;
 					}
 					_dsp->setAudioStream(mode);
@@ -992,11 +996,13 @@ namespace
 						continue;
 					}
 					const auto st = _dsp->streamStatus();
-					static const char* const g_modes[] = {"off", "main", "cue", "all"};
+					static const char* const g_modes[] = {"off", "main", "cue", "all", "tracks"};
 					std::snprintf(buf, sizeof buf, "audio status on=%d mode=%s captured=%llu pending=%llu rate=44100 dropped=%llu cap=%u",
 						st.mode != Mode::Off, g_modes[static_cast<int>(st.mode)],
 						static_cast<unsigned long long>(st.captured), static_cast<unsigned long long>(st.pending),
 						static_cast<unsigned long long>(st.dropped), ot::DspPair::g_streamCapFrames);
+					if(st.mode == Mode::Tracks)		// O23: the stem taps made (one per ring half); the older modes' line is unchanged
+						std::snprintf(buf + std::strlen(buf), sizeof buf - std::strlen(buf), " taps=%llu", static_cast<unsigned long long>(_dsp->stemTaps()));
 					reply(buf);
 					continue;
 				}
@@ -1027,7 +1033,7 @@ namespace
 					reply(out);
 					continue;
 				}
-				reply("err usage: audio start [main|cue|all] | audio read [<maxframes>] | audio status | audio stop");
+				reply("err usage: audio start [main|cue|all|tracks] | audio read [<maxframes>] | audio status | audio stop");
 				continue;
 			}
 			reply("err unknown command " + cmd);

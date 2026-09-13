@@ -392,7 +392,7 @@ the folder already holds and never wiped.
 | route | does |
 |---|---|
 | `GET /status` | adds `sound` (the child runs `--dsp` and its capture is on) and `sound_note` (why not, when not) |
-| `GET /audio/status` | `{sound, on, rate: 44100, captured, end, first, cap, dropped, peak: [l, r], take, takes, note}` — `end` = frames ever captured, `first` = the oldest still in the ring, `cap` = 7 938 000, `dropped` = frames the child overwrote unread, `peak` of the last non-empty read, `take` = `{n, recording, frames, seconds, file, start}` while one is open (else null), `takes` = every take as `{n, file, frames, seconds}`; plus `busy`/`phase` (a reboot in progress), `takes_dir`, and `drain` (what the drain itself costs the pump: reads, wall_ms, max_ms); since 13 Sep 2026 also `capture` (`main` \| `all`: the words per frame the child streams, `all` while an output device is on), `words` (2 \| 8), `peak_cue` (the cue pair's peak of the last 8-word read) and `output` (the device stream, "Recording into a DAW" below) |
+| `GET /audio/status` | `{sound, on, rate: 44100, captured, end, first, cap, dropped, peak: [l, r], take, takes, note}` — `end` = frames ever captured, `first` = the oldest still in the ring, `cap` = 7 938 000, `dropped` = frames the child overwrote unread, `peak` of the last non-empty read, `take` = `{n, recording, frames, seconds, file, start}` while one is open (else null), `takes` = every take as `{n, file, frames, seconds}`; plus `busy`/`phase` (a reboot in progress), `takes_dir`, and `drain` (what the drain itself costs the pump: reads, wall_ms, max_ms); since 13 Sep 2026 also `capture` (`main` \| `all` \| `tracks`: the words per frame the child streams, `tracks` while an output device is on -- O23, the eight ESAI words plus the eight per-track stems -- or `all` on an older child), `words` (2 \| 8 \| 24), `peak_cue` (the cue pair's peak of the last multi-word read) and `output` (the device stream with its `map` and `layout`, "Recording into a DAW" below) |
 | `GET /audio/pcm?from=<frame>&max=<frames>` | raw LE int16 stereo frames from `max(from, first)`, at most `max` (default 88 200, cap 441 000), `application/octet-stream` with `X-Audio-From` (where the body really starts), `X-Audio-Frames`, `X-Audio-End`, `X-Audio-Rate`; **204** with `X-Audio-End` when `from >= end`. Served from the ring on the HTTP thread: 1–2 ms for 2 s of audio |
 | `GET /audio.wav?take=N` | that take as `audio/wav`, `Content-Disposition: attachment; filename="octatrack-take-NNN.wav"`; a missing take is a 404 JSON |
 | `GET /audio.wav?from=&to=` | ring frames as `octatrack-main-out.wav` (default: everything held); an empty range is a 404 JSON |
@@ -446,31 +446,52 @@ curl 'http://localhost:8563/audio/output?device=off'
 ```
 
 **The channel map.** With a device on the child's capture switches to
-`audio start all` -- ALL EIGHT ESAI words per frame (O14k) -- and the
-drain lays them out on the device: **main L/R → channels 1-2, cue L/R →
-3-4, ESAI words 0/1 → 5-6, words 6/7 → 7-8** (the last two pairs are
-zero on the stock firmware; a future mod that uses them is heard), as
+`audio start tracks` (O23, 13 Sep 2026) -- the EIGHT ESAI words per
+frame (O14k) followed by the EIGHT PER-TRACK STEMS, 24 words a frame --
+and the drain lays them out on the device: **main L/R → channels 1-2,
+cue L/R → 3-4, tracks 1-8 as stereo pairs → 5-20 (T1 on 5-6 … T8 on
+19-20), ESAI words 0/1 → 21-22, words 6/7 → 23-24** (the last two pairs
+are zero on the stock firmware; a future mod that uses them is heard), as
 many of those pairs as the device has channels for -- a 2-channel device
-(BlackHole 2ch, the speakers) gets main L/R -- and the stream is opened
-with exactly that many channels, so anything further on the device is
-silent. The ring, the takes and `/audio/pcm` get main L/R de-interleaved
-from the 8-word frames, byte for byte what the `main` capture gave (a
-take made with a device on fits the clean fixture at the same −33.0 dB);
-the switch itself restarts the child's ring, so up to one pacer slice
-(~10 ms) of an open take is lost at the moment a device is chosen or
-dropped. `/audio/status` `output` says how it is going: `device`,
-`channels` (opened) and `device_channels`, `running`, `latency_ms`
-(PortAudio's figure for the device), `buffered_ms` (queued, ahead of the
-callback), `underruns` (callbacks the queue could not fill: zeros went
-out, then the stream re-primes on 100 ms), `dropped` (frames discarded
-oldest-first beyond 250 ms queued while playing: an audible skip),
-`trimmed` (the same while re-priming after a gap -- the fresh child's
-boot burst after a reboot, nothing was due), `pa_underflows` (PortAudio's
-own flag), `pushed` / `played`, `map`, `note`. A device that goes away
+(BlackHole 2ch, the speakers) gets main L/R, an 8-channel one main, cue
+and tracks 1-2, **BlackHole 16ch main, cue and tracks 1-6**, the 64ch
+edition everything -- and the stream is opened with exactly that many
+channels, so anything further on the device is silent. The stems are
+**per-track outputs the hardware does not have**: on the unit only MAIN
+and CUE exist, but inside the DSP each track's audio is a block of
+samples after its FX1/FX2 chain (and the ColdFire's delay) that the
+mixdown multiplies by the track's level and sums into main; the emulator
+taps each track's own term there (`COLDFIRE_PORT.md` O23: the tap point,
+the buffer map, the numbers), so a stem is exactly what that track
+contributes to main -- muting a track (FUNC + track) silences its stem,
+the eight stems sum to the main pair to within the mixdown's own rounding
+(−52 dB: each stem's word is truncated where the mixdown truncates the
+sum once, a −7..0 LSB bias; the main pair's limiter and the two input
+words are the only things a stem does not carry), and a track that is
+silent gives zeros. An
+older child (`--port-bin`) without `tracks` gets `all` (main, cue and the
+ESAI words, 8 words) and `/audio/status` says so in `output.note`. The
+ring, the takes and `/audio/pcm` get main L/R de-interleaved from the
+24-word frames, byte for byte what the `main` capture gave (a take made
+with a device on fits the clean fixture at the same −33.0 dB); the switch
+itself restarts the child's ring, so up to one pacer slice (~10 ms) of an
+open take is lost at the moment a device is chosen or dropped.
+`/audio/status` `output` says how it is going: `device`, `channels`
+(opened) and `device_channels`, `running`, `latency_ms` (PortAudio's
+figure for the device), `buffered_ms` (queued, ahead of the callback),
+`underruns` (callbacks the queue could not fill: zeros went out, then the
+stream re-primes on 100 ms), `dropped` (frames discarded oldest-first
+beyond 250 ms queued while playing: an audible skip), `trimmed` (the
+same while re-priming after a gap -- the fresh child's boot burst after
+a reboot, nothing was due), `pa_underflows` (PortAudio's own flag),
+`pushed` / `played`, `words` (what the child streams: 24 with the stems,
+8, or 2), `map` (each device pair by name) and `layout` (the pair names
+in device order), `note`; beside it `capture` (`tracks` | `all` | `main`)
+and `words`. A device that goes away
 (unplugged, or taken by another app) stops the stream with a `note`
 after 3 s without a callback, nothing else; the server keeps the stream
 across its child's reboots (respawn, re-insert, sound switch: the fresh
-child picks the 8-word capture itself) and only forgets it when it
+child picks the 24-word capture itself) and only forgets it when it
 exits.
 
 **Drift.** Two clocks meet here: the child's pacer, which delivers

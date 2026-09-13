@@ -202,8 +202,12 @@ open "out/Virtual Panel.app"
   device=<name>` and is remembered (UserDefaults `outputDevice`; Off
   forgets it). The line under the submenu shows the channel map as the
   server reports it (`BlackHole 16ch: main L/R -> 1-2, cue L/R -> 3-4,
-  ESAI words 0/1 -> 5-6, ESAI words 6/7 -> 7-8`; a 2-channel device
-  `main L/R -> 1-2`; `Output off -- ...` with the full map otherwise).
+  track 1 L/R -> 5-6, ... track 6 L/R -> 15-16` -- since O23 (13 Sep
+  2026) the eight tracks follow main and cue as stereo stems on 5-20,
+  per-track outputs the hardware does not have, then ESAI words 0/1 on
+  21-22 and 6/7 on 23-24; a 2-channel device `main L/R -> 1-2`; `Output
+  off -- ...` with the full map otherwise), and each device's tooltip
+  says what its channel count gets.
   The remembered device is re-sent whenever `/status` returns to `ready`
   -- the first boot, every respawn, re-insert and sound switch, and a
   fresh server after Reload / Open Project, which knows nothing of it;
