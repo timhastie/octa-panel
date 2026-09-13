@@ -202,4 +202,6 @@ EMAC-fixed Unicorn (`scripts/build_unicorn.sh`), `vendor/dsp56300` pinned to
   page survive only while that server runs, or if they are also in an
   `--audio <dir>`).
 - The firmware's file browser lists files in card order, not name order.
-- RSS grows while the sequencer plays (pre-existing, ~+34 MB per 2 s slice).
+- Memory: the child's RSS is flat during play since O18 (13 Sep 2026: the
+  peripheral-write seed log was unbounded); the panel UART tx buffer still
+  grows ~0.7 MB per hour (needs a cursor change in main.cpp).

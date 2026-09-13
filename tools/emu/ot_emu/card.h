@@ -46,6 +46,11 @@ namespace ot
 		// answerable from a count.
 		struct Entry { std::string what; uint32_t lba = 0, count = 0, pc = 0, tcb = 0; };
 		const std::vector<Entry>& log() const { return m_log; }
+		// O18: the log stops at g_logCap entries (a project load issues
+		// ~12,400 commands; the panel's child streams from the card for
+		// hours) -- the ones past it are counted here, not kept.
+		static constexpr size_t g_logCap = 1u << 18;
+		uint64_t logDropped() const { return m_logDropped; }
 		void stampLastCommand(const uint32_t _pc, const uint32_t _tcb)
 		{
 			if(!m_log.empty() && !m_log.back().pc)
@@ -83,6 +88,14 @@ namespace ot
 		int64_t m_wremaining = 0;
 		uint8_t m_cmd = 0;
 		std::vector<Entry> m_log;
+		uint64_t m_logDropped = 0;
+		void note(Entry _e)
+		{
+			if(m_log.size() < g_logCap)
+				m_log.push_back(std::move(_e));
+			else
+				++m_logDropped;
+		}
 		uint64_t m_reads = 0, m_writes = 0;
 	};
 }

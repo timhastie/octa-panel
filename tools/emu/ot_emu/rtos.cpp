@@ -118,6 +118,8 @@ namespace ot
 	Rtos::~Rtos()
 	{
 		// stderr only, opt-in: stdout is diffed byte for byte by the oracles.
+		if(memStatOn())
+			std::fprintf(stderr, "memstat %.0f ms (end): %s\n", ms(), memStat().c_str());
 		if(const char* const e = std::getenv("OT_BURST_STATS"); e && std::atoi(e) != 0)
 		{
 			const auto& s = m_burstStats;
@@ -324,6 +326,7 @@ namespace ot
 			peripheralWrite(w.addr, w.size, val, true);
 		}
 		m_seeded = m_machine.peripheralWrites().size();
+		m_machine.endPeripheralWriteLog();		// O18: the record has no reader past this line
 		if(m_quirks.clearTransmitInterrupt)
 			for(auto* u : {&m_uart64, &m_uart68})
 				u->clearTransmitInterrupt();
@@ -776,7 +779,35 @@ namespace ot
 		s.untilGate = _untilGate;
 		s.whyGate = "the M6a gate passed";
 		s.whyTime = "time";
-		return runLoop(s);
+		const auto r = runLoop(s);
+		if(memStatOn())
+			std::fprintf(stderr, "memstat %.0f ms: %s\n", ms(), memStat().c_str());
+		return r;
+	}
+
+	bool Rtos::memStatOn()
+	{
+		static const bool s_on = [] { const char* const e = std::getenv("OT_MEMSTAT"); return e && std::atoi(e) != 0; }();
+		return s_on;
+	}
+
+	std::string Rtos::memStat() const
+	{
+		char b[640];
+		std::snprintf(b, sizeof b, "dispatches=%zu(kept %zu) created=%zu acks=%zu pcRing=%zu blockLog=%zu ataTrace=%zu memWrites=%zu"
+			" liveNibble=%zu trigWords=%zu uartA.tx=%zu uartA.rx=%zu uartB.tx=%zu cardLog=%zu(dropped %llu) edmaDue=%zu | ",
+			m_dispatches.size(), m_dispatches.kept(), m_created.size(), m_acks.size(), m_pcRing.size(), m_blockLog.size(),
+			m_ataTrace.size(), m_memWrites.size(), m_liveNibble.size(), m_trigWords.size(), m_uart64.tx().size(),
+			m_uart64.rxPending(), m_uart68.tx().size(), m_card ? m_card->log().size() : 0,
+			static_cast<unsigned long long>(m_card ? m_card->logDropped() : 0), m_edma.outstanding());
+		std::string out = b;
+		out += m_machine.memStat();
+		if(const auto* co = m_machine.coprocessor())
+		{
+			out += " | ";
+			out += co->memStat();
+		}
+		return out;
 	}
 
 	Rtos::Stop Rtos::runUntil(const double _ms, const std::function<bool()>& _stop, const Changes _changes)
@@ -1003,7 +1034,7 @@ namespace ot
 					if(atSchedRte)
 					{
 						const auto cur = curTcb();
-						m_dispatches.push_back({m_sample, cur, m_machine.pc()});
+						m_dispatches.push(Dispatch{m_sample, cur, m_machine.pc()});
 						m_gateDirty = true;
 						if(m_firstSwitch.first && !m_firstSwitch.second)
 							m_firstSwitch.second = cur;
@@ -1080,7 +1111,7 @@ namespace ot
 		if(atSchedRte)
 		{
 			const auto cur = curTcb();
-			m_dispatches.push_back({m_sample, cur, m_machine.pc()});
+			m_dispatches.push(Dispatch{m_sample, cur, m_machine.pc()});
 			m_gateDirty = true;
 			if(m_firstSwitch.first && !m_firstSwitch.second)
 				m_firstSwitch.second = cur;
@@ -1503,10 +1534,7 @@ namespace ot
 
 	std::unordered_set<uint32_t> Rtos::ran() const
 	{
-		std::unordered_set<uint32_t> out;
-		for(const auto& d : m_dispatches)
-			out.insert(d.tcb);
-		return out;
+		return m_dispatches.ran();
 	}
 
 	bool Rtos::gate(std::vector<std::string>* _problems) const

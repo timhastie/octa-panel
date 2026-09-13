@@ -5729,3 +5729,107 @@ diff` equals the patch byte for byte).
 - The waits are bounded (2 ms) for a dead core and counted (`take=`,
   `hcwait=`, `gatedrain=`, `waitto`); the diagnostics (`OT_DSP_FRAMETRACE`,
   `esaimism=`, `waitcu0/1=`) stay in.
+
+## Milestone O18 — the panel child's memory: the peripheral-write record ended at the seed, the dispatch record bounded ✅ (13 Sep 2026, branch `panel-ui`)
+
+The port's process grew while the sequencer played and never gave the
+memory back: **11-13 MB per emulated second of PLAY**, in bursts, with the
+DSP cores off as well as under `--dsp-rt` (CONTEXT.md's "+34 MB per 2 s
+slice"; the O15a verifier's +48 MB for 6 s, +175 MB for 13 s). The panel
+runs one child for hours, so an hour of play was 40 GB of address space.
+The growth was measured, not guessed: `MallocStackLogging=1` on a 20 s
+play and `malloc_history -allBySize` while the child was still playing,
+then a memory instrument inside the emulator (`OT_MEMSTAT=1`, below) for
+the rates of every record; the driver and every log are under
+`out/_agents/memfix/` (`memdrive.py`: boot on `otlive.img`, `frame on`,
+PLAY, `run 250` + `tx` per slice the way the server pumps, `ps -o rss`
+every few seconds, `vmmap`/`malloc_history` before STOP).
+
+### What grew, measured
+
+| record | rate during play | before | after |
+|---|---|---|---|
+| `Machine::m_periphWrites` — one 12-byte record per peripheral write the models take (the boot's seed for `Rtos::install`) | 0.4-0.8 M writes per emulated s (the vector's 2^24-entry block was live 20.5 s into play: 201,342,976 bytes, plus its 206 MB predecessor freed but still resident — the doubling that made the growth bursty); **the whole leak in both modes** | unbounded, never read after the seed | ended at the seed: `Machine::endPeripheralWriteLog()` after `Rtos::install` has replayed it (and captured `m_seeded`); the vector is freed |
+| `Rtos::m_dispatches` — one 24-byte record per scheduler `rte` | ~720 per emulated s (24,643 after the load, 164,531 at 200 s of play: 17 KB/s, 62 MB/h) | unbounded | `Rtos::DispatchLog`: the true count, the first 65,536 whole, a ring of the last 4,096, the TCB set for `ran()` (1.7 MB at most) |
+| `AtaCard::m_log` — one entry per ATA command | 10,339 after the load, +12 over 200 s of play (the fixture's flex slots live in RAM) | unbounded | capped at 262,144 entries, the rest counted (`logDropped()`) |
+| `Rtos::m_acks` | at its existing 100,000 cap 19 s into play (3.2 MB) | capped (O7) | unchanged |
+| the panel UART's `tx` (`Uart::m_tx`) | 187 B/s during play (45,707 bytes at 200 s; 0.7 MB/h) | unbounded | unchanged — `main.cpp`'s `tx` cursor indexes it absolutely and the batch's `serial_a` golden is the whole stream (see below) |
+| everything else (`m_periphLog` 4,096, `m_periphTrace` / `m_hostPortLog` / `m_memWrites` / the DSP's `m_log`, `m_trace`, maps, watch hits — all opt-in and capped; the audio ring 60 s fixed; the eDMA due list; `m_created` 10) | flat | bounded or opt-in | unchanged |
+
+The `--dsp-rt` mode adds nothing of its own: the JIT's block chains were
+21 MB in four allocations at 20 s and did not grow; the HDI08 rings held
+one word; the ESAI capture is off outside the render.
+
+### What changed (`machine.h/.cpp`, `rtos.h/.cpp`, `card.h/.cpp`, `dsp.h/.cpp`; no CLI change, `main.cpp` untouched)
+
+- `Machine::peripheralWrite` records into `m_periphWrites` only while
+  `m_periphWriteLogOn`; `Rtos::install` calls `endPeripheralWriteLog()`
+  right after `m_seeded = peripheralWrites().size()` — the record's one
+  reader is the seed replay above that line (`grep` finds no other), so
+  every printed count is taken before it is dropped.
+- `Rtos::DispatchLog` replaces `std::vector<Dispatch>`: `size()` is the
+  true count (the batch's "N dispatches", the load's delta), `operator[]`
+  answers the first 65,536 and the last 4,096 (`writeGoldenJson` reads the
+  first 200, the batch's "dispatch tail" the last 14; a batch run never
+  passes 65,536 — boot 51, load ~24,400, a 3,000-frame render ~10,000
+  more), `ran()` is kept incrementally. An index that fell out answers a
+  zero record; no reader asks for one. `kept()` says how many are held.
+- `AtaCard::note()` keeps the first `g_logCap` = 262,144 entries and
+  counts the rest (`logDropped()`); `stampLastCommand` stamps only an
+  unstamped last entry, so a dropped command never re-stamps a kept one.
+- **The instrument**: `OT_MEMSTAT=1` prints one `memstat <ms>: ...` line on
+  stderr at the end of every `Rtos::run()` and at destruction with the
+  size of every record above — `Rtos::memStat()`, `Machine::memStat()`,
+  `Coprocessor::memStat()` (a default, `DspPair` overrides it with its log,
+  trace, maps, stream, watch hits, capture and HDI08 rings). stderr only,
+  opt-in: stdout is diffed byte for byte by the oracles.
+
+### Measured (13 Sep 2026, the M5, macOS 26.5; Release, `-DOT_LTO=OFF`, `out/_agents/memfix/build` = before, `build-fix` = after; logs under `out/_agents/memfix/`)
+
+300 emulated seconds of PLAY on the OTLIVE fixture, `run 250` + `tx` per
+slice, RSS at PLAY and at its end (the peak is the last play sample; the
+drop at STOP in the "before" rows is the compressor, not a release):
+
+| mode | before: PLAY → 300 s | after: PLAY → 300 s | speed (emulated ms per wall s) |
+|---|---|---|---|
+| no `--dsp` | 422 → **3,856 MB** (+3,434 MB, 11.4 MB per emulated s; 2,323 MB after STOP) | 418.4 → **418.7 MB** (+0.3 MB; 362.7 after STOP) | 1,009 before, 1,008 after |
+| `--dsp-rt` | 1,056 → **4,890 MB** (+3,834 MB, 12.8 MB per emulated s; 2,589 after STOP) | 1,052.0 → **1,052.8 MB** (+0.8 MB, 0.6 of it in the first slice; flat after STOP) | 839 before, 792 after (the after run shared the machine with the oracle's ten jobs for its first minute — not a speed measurement) |
+
+The remaining growth is the UART stream (187 B/s), the dispatch ring's
+one-off 1.7 MB and the acks' 3.2 MB cap — a 5-minute play adds under 1 MB,
+an hour under 4 MB. `malloc_history` before the fix (20 s of play,
+`base-mh-nodsp/malloc_history.txt`): the one live block from
+`Machine::peripheralWrite` at 201,342,976 bytes, then only construction
+(the card region 133 MB + 67 MB, the image 67 MB, the SDRAM 33 MB × 2,
+the acks 3,162,112, the dispatches 1,064,960); the same picture under
+`--dsp-rt` with the DSP's memory and audio buffers on top
+(`base-mh-rt/malloc_history.txt`).
+
+**The gate: 28 PASS, 0 FAIL** (`out/_oracle/reports/20260913-080435-memfix2.txt`
+against `out/emu/ot_emu.ref-73c2815`: boot logs, `serial_a` 5,731 / 9,257
+bytes, goldens 12,757 / 26,367 bytes, `run3_core0.wav` identical, the
+`--interactive` UART 18,297 / 18,309 bytes step by step, 109 peeks, 47 run
+stamps at |dsample| = 0, `interdsp.pcm` 497,788 bytes identical, ctest
+7/7; the first pass, `20260913-080310-memfix.txt`, was 27/1 only because
+the candidate tree had not built the test executables yet). **The rt
+audio is unchanged**: `rtdrive.py --rt --seconds 4` on `otlive2.img` →
+`fit.py`: onset 82, lag 81, gain 0.7032, **residual −33.0 dB**
+(`out/_agents/memfix/fit-rt/`).
+
+### What it does not do
+
+- The panel UART's transmit record still keeps every byte the firmware
+  ever sent (187 B/s during play; 0.7 MB an hour). Trimming it needs
+  `main.cpp`'s `tx` cursor to become an offset into a ring (three lines
+  there, plus a `txBase()` on the `Uart`); the batch's `--serial-out` and
+  the goldens want the whole stream, so the trim would be the interactive
+  loop's alone. Left for the `main.cpp` owner.
+- The acks stop at 100,000 as before (O7); the "ack tail" of an
+  interactive session's end report is the tail of the first 100,000, as
+  it was.
+- Past 65,536 dispatches or 262,144 ATA commands the interactive
+  session's end report still prints the true dispatch count, but its ATA
+  command count and per-type histogram are the kept entries' (the batch
+  runs never get there; nothing compares an interactive end report).
+- The `--dsp` lockstep mode shares every record here; it was checked for
+  60 s of play (0.1x real time), not five minutes.

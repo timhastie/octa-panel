@@ -1993,6 +1993,26 @@ namespace ot
 		m_log.push_back(e);
 	}
 
+	// O18: the memory instrument's line -- every record this object can grow.
+	// Sizes only, read on the CPU's thread; the worker-owned ones (the poll
+	// histogram, the rt trace) are not touched.
+	std::string DspPair::memStat() const
+	{
+		size_t capture = 0, hdiTx = 0, hdiRx = 0;
+		for(const auto& c : m_cores)
+		{
+			capture += c->capture.size();
+			hdiTx += c->hdi().txData().size();
+			hdiRx += c->hdi().rxData().size();
+		}
+		char b[320];
+		std::snprintf(b, sizeof b, "dspLog=%zu trace=%zu map=%zu writeMap=%zu stream=%zu pcWatchHits=%zu watchHits=%zu"
+			" rtShort=%zu esaiMism=%zu capture=%zu hdiTx=%zu hdiRx=%zu input=%zu",
+			m_log.size(), m_trace.size(), m_map.size(), m_writeMap.size(), m_stream.size(), m_pcWatchHits.size(),
+			m_watchHits.size(), m_rtShortLog.size(), m_esaiMismatchLog.size(), capture, hdiTx, hdiRx, m_input.size());
+		return b;
+	}
+
 	// -- the register file ----------------------------------------------------
 
 	void DspPair::icrWrite(const uint32_t _v)

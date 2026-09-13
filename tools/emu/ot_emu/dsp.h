@@ -115,6 +115,7 @@ namespace ot
 		bool rt() const { return m_rt; }
 		bool rtOk() const { return m_rtOk; }				// the mode could be set up (MMU alias, JIT, threads)
 		const std::string& rtWhy() const { return m_rtWhy; }	// ... or why not
+		std::string memStat() const override;						// O18: the sizes of the records kept (OT_MEMSTAT=1)
 		std::string rtStatus();								// one line: MIPS per core, worker CPU, frames, waits, edges, faults (dsp.cpp)
 		bool realtime() const override { return m_rt; }
 		// O17b: an edge is pending for the CPU when the DSP has produced one AND

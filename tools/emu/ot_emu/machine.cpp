@@ -318,11 +318,30 @@ namespace ot
 		// writes; the models' seed stays the 8,235 route A counts).
 		if(m_coproc && m_coproc->write(_addr, _size, _val))
 			return;
-		m_periphWrites.push_back({_addr, _size, _val});
+		if(m_periphWriteLogOn)
+			m_periphWrites.push_back({_addr, _size, _val});
 		if(m_periphLog.size() < 4096)
 			m_periphLog.push_back({'W', pc(), _addr, _size, _val});
 		if(m_periphWriteFn)
 			m_periphWriteFn(_addr, _size, _val);
+	}
+
+	void Machine::endPeripheralWriteLog()
+	{
+		m_periphWriteLogOn = false;
+		m_periphWrites.clear();
+		m_periphWrites.shrink_to_fit();
+	}
+
+	std::string Machine::memStat() const
+	{
+		char b[512];
+		std::snprintf(b, sizeof b, "periphWrites=%zu(%s) periphLog=%zu periphTrace=%zu hostPortLog=%zu pcHits=%zu profile=%zu"
+			" unmapped=%zu unmappedPages=%zu unmappedPcs=%zu unmappedReadPcs=%zu autoPages=%zu writeWatches=%zu",
+			m_periphWrites.size(), m_periphWriteLogOn ? "on" : "off", m_periphLog.size(), m_periphTrace.size(),
+			m_hostPortLog.size(), m_pcHits.size(), m_profile.size(), m_unmapped.size(), m_unmappedPages.size(),
+			m_unmappedPcs.size(), m_unmappedReadPcs.size(), m_autoPages.size(), m_writeWatches.size());
+		return b;
 	}
 
 	uint32_t Machine::vbr() const

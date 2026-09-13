@@ -80,6 +80,9 @@ namespace ot
 	class Coprocessor
 	{
 	public:
+		// O18: the sizes of the records the co-processor keeps, one line, for
+		// the memory instrument (OT_MEMSTAT=1). Default: nothing to report.
+		virtual std::string memStat() const { return {}; }
 		virtual ~Coprocessor() = default;
 		virtual bool read(uint32_t _addr, uint8_t _size, uint32_t& _out) = 0;
 		virtual bool write(uint32_t _addr, uint8_t _size, uint32_t _val) = 0;
@@ -349,6 +352,14 @@ namespace ot
 		// stock image).
 		struct PeriphWriteRec { uint32_t addr; uint8_t size; uint32_t val; };
 		const std::vector<PeriphWriteRec>& peripheralWrites() const { return m_periphWrites; }
+		// O18: the record has ONE reader, `Rtos::install`'s seed replay, and
+		// nothing after it -- yet it kept growing at every peripheral write
+		// the models took (~1 M/s of play, 12 bytes each: THE memory leak of
+		// the panel's child, 8-13 MB per emulated second). The Rtos ends it
+		// once the seed is taken; the count it reports is captured before.
+		void endPeripheralWriteLog();
+		// O18: the sizes of every record this object keeps (OT_MEMSTAT=1).
+		std::string memStat() const;
 
 		// A stateful peripheral reply, for the handful the boot needs that are
 		// not constants (the DSP host port's ping index toggles 0/1).
@@ -561,6 +572,7 @@ namespace ot
 		PeriphRead m_periphReadFn;
 		PeriphWrite m_periphWriteFn;
 		std::vector<PeriphWriteRec> m_periphWrites;
+		bool m_periphWriteLogOn = true;		// O18: until the Rtos has seeded its models from the record
 		std::vector<Access> m_periphLog;
 		std::vector<Access> m_periphTrace;
 		bool m_periphTraceOn = false;

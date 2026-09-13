@@ -21,6 +21,7 @@
 // sample (`ips`) is a knob with a default, not a truth.
 #pragma once
 
+#include <algorithm>
 #include <array>
 
 #include <cstdint>
@@ -364,8 +365,56 @@ namespace ot
 		struct Created { double sample; uint32_t tcb, entry, prio, stack, size, creator; };
 		struct Dispatch { double sample; uint32_t tcb, pc; };
 
+		// O18: THE DISPATCH RECORD, BOUNDED. One record per scheduler `rte`
+		// (~1,000-2,500 per emulated second of play, 24 bytes each) used to be
+		// kept for the life of the process -- the panel's child runs for hours.
+		// Everything that is ever printed from it survives: the COUNT
+		// (`size()`, the batch's "N dispatches" and the load's delta), the
+		// FIRST 200 (the goldens' "dispatches" array, `writeGoldenJson`), the
+		// LAST 14 (the batch's "dispatch tail") and the set of TCBs that ran
+		// (`ran()`, the M6a gate). The first `g_head` records are kept whole
+		// (a batch run never gets past them: boot 51, load ~24,400, a 3,000
+		// frame render ~10,000 more), then a ring of the last `g_tail`; an
+		// index that fell between answers a zero record, which no reader asks
+		// for. `kept()` is the number actually held.
+		class DispatchLog
+		{
+		public:
+			static constexpr size_t g_head = 65536, g_tail = 4096;
+			void push(const Dispatch& _d)
+			{
+				++m_count;
+				m_ran.insert(_d.tcb);
+				if(m_head.size() < g_head)
+				{
+					m_head.push_back(_d);
+					return;
+				}
+				if(m_tail.empty())
+					m_tail.resize(g_tail);
+				m_tail[(m_count - 1 - g_head) % g_tail] = _d;
+			}
+			size_t size() const { return m_count; }
+			bool empty() const { return m_count == 0; }
+			size_t kept() const { return m_head.size() + std::min(m_count - m_head.size(), g_tail); }
+			const Dispatch& operator[](const size_t _i) const
+			{
+				if(_i < m_head.size())
+					return m_head[_i];
+				if(_i < m_count && m_count - _i <= g_tail && !m_tail.empty())
+					return m_tail[(_i - g_head) % g_tail];
+				static const Dispatch s_none{};
+				return s_none;
+			}
+			const std::unordered_set<uint32_t>& ran() const { return m_ran; }
+		private:
+			std::vector<Dispatch> m_head, m_tail;
+			size_t m_count = 0;
+			std::unordered_set<uint32_t> m_ran;
+		};
+
 		const std::vector<Created>& created() const { return m_created; }
-		const std::vector<Dispatch>& dispatches() const { return m_dispatches; }
+		const DispatchLog& dispatches() const { return m_dispatches; }
 		std::unordered_set<uint32_t> ran() const;
 		std::pair<uint32_t, uint32_t> firstSwitch() const { return m_firstSwitch; }
 		double sample() const { return m_sample; }
@@ -425,6 +474,12 @@ namespace ot
 			endPeriph = 0, endWake = 0, endHorizon = 0, endSpin = 0, endGate = 0, endPc = 0,
 			exactWake = 0, exactBySrc[8] = {}; };	// O17 diagnostic: exact steps by cause (a wake, or the horizon source: frame/ata/pit/dtim/edma)
 		const BurstStats& burstStats() const { return m_burstStats; }
+		// O18: the sizes of every record the Rtos, its machine, its card and
+		// its co-processor keep -- one line. OT_MEMSTAT=1 prints it on stderr
+		// at the end of every `run()` and when the Rtos is destroyed; the
+		// memory instrument that found the panel child's growth.
+		std::string memStat() const;
+		static bool memStatOn();
 		// The knobs, read once from the environment: OT_BURST = the quantum
 		// (default 4096; 0 = every instruction exact, the pre-O15a loop),
 		// OT_STEPFAST=0 = Machine::step inside bursts (diagnosis only).
@@ -571,7 +626,7 @@ namespace ot
 		uint64_t m_pcRingBudget = 0;
 
 		std::vector<Created> m_created;
-		std::vector<Dispatch> m_dispatches;
+		DispatchLog m_dispatches;
 		std::pair<uint32_t, uint32_t> m_firstSwitch{0, 0};
 		uint64_t m_idleSkips = 0, m_forces = 0;
 		BurstStats m_burstStats;

@@ -138,7 +138,7 @@ namespace ot
 			}
 			m_dpos = 0;
 			m_status |= ST_DRQ;
-			m_log.push_back({"IDENTIFY", 0, 0});
+			note({"IDENTIFY", 0, 0});
 			return;
 		}
 		case 0x20:					// READ SECTORS
@@ -151,7 +151,7 @@ namespace ot
 			m_dpos = 0;
 			m_status |= ST_DRQ;
 			m_reads += n;
-			m_log.push_back({"READ", l, n});
+			note({"READ", l, n});
 			return;
 		}
 		case 0x30:					// WRITE SECTORS
@@ -161,29 +161,29 @@ namespace ot
 			m_wlba = l;
 			m_wremaining = n;
 			m_status |= ST_DRQ;
-			m_log.push_back({"WRITE", l, n});
+			note({"WRITE", l, n});
 			return;
 		}
 		case 0x87:					// CFA TRANSLATE SECTOR
 			m_data.assign(g_sector, 0);
 			m_dpos = 0;
 			m_status |= ST_DRQ;
-			m_log.push_back({"CFA-TRANSLATE", lba(), 0});
+			note({"CFA-TRANSLATE", lba(), 0});
 			return;
 		case 0xe5:					// CHECK POWER MODE
 			m_count = 0xff;
-			m_log.push_back({"CHECK-POWER", 0, 0});
+			note({"CHECK-POWER", 0, 0});
 			return;
 		case 0xe0: case 0xe1: case 0xe2: case 0xe3: case 0xe6:
 		case 0xef: case 0xc0: case 0x03: case 0x91: case 0xc6:
 			std::snprintf(name, sizeof name, "CMD-%02x", _c);
-			m_log.push_back({name, 0, 0});
+			note({name, 0, 0});
 			return;
 		default:
 			m_error = 0x04;			// ABRT
 			m_status |= 0x01;
 			std::snprintf(name, sizeof name, "UNSUPPORTED-%02x", _c);
-			m_log.push_back({name, 0, 0});
+			note({name, 0, 0});
 			return;
 		}
 	}
