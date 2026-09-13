@@ -5969,3 +5969,233 @@ and **the rt audio fit −33.0 dB** (`rtdrive.py --rt --seconds 4` on
   inside the emulation's own `run`); it was not measured against the pacer
   beyond "the count stood still 3.3 s after YES". A `pwrite` that fails is
   counted (`errors=`), not retried.
+
+## Milestone O20 — the effects that use delay memory: an effects rig in both DSP modes, the Echo Freeze Delay's eDMA copies, and what the chorus/comb/delay still lack 🟡 (13 Sep 2026, branch `panel-ui`)
+
+The owner's report: "the reverbs and the delay, and the chorus, and I'm
+sure others like comb filter, don't sound good at all; the chorus sounds
+like a very small glitchy loop of the audio repeating" — heard through the
+panel with sound on (`--dsp-rt`), where plain sample playback is proven
+bit-identical to the lockstep interpreter (O17c, `fit.py` −33.0 dB). This
+milestone builds a rig that puts each effect on the playing track through
+the firmware's own UI, saves the card, and renders the same card under both
+DSP modes; measures every effect against the clean render of the same
+emulator; and separates the two hypotheses with instruments. **Findings:
+the DELAY is silent in BOTH modes (H1: two ColdFire-side causes, one fixed
+here, one located); the CHORUS and COMB add nothing to the dry in BOTH modes
+(H1: the module runs, writes its delay lines with audio, and multiplies its
+input by a per-instance word the emulated DSP drives to zero — located to
+the word, not fixed); the DARK REVERB works (a real, decaying wet in both
+modes); and `--dsp-rt` is no longer bit-identical to lockstep once an
+effect or the delay is on (H2: whole 16-sample blocks re-rendered
+differently about once a second, run to run — small, documented, not
+fixed).** Nothing in the rt scheduler was changed. Everything under
+`out/_agents/fx/` (scripts, cards, takes, renders, logs, `analyze_*.txt`).
+
+### The rig (`out/_agents/fx/rig.py`, `rig2.py`, `panctl.py`, `render.py`, `analyze.py`, `wet.py`, `anatomy.py`)
+
+- **Setup through the panel**, on an own server (`--port 8593`, own
+  binary `--port-bin out/_agents/fx/build/ot_emu`, LTO off), a fresh
+  `--card out/_agents/fx/cards/<name>.img` made from the clean tree2 project
+  (`out/_agents/audio/tree2/OTLIVE/PROJECT`, `third-0.wav` on the current
+  track). The playing track is **T5** (the UI's current track at boot,
+  `0x100b14cc` = 4, a FLEX machine); T1 is a STATIC machine. **The EFFECT
+  SETUP chooser opens with FUNC + [EFFECT 1/2]** (`/key` row 0x25 bit 5 held
+  around row 0x24 bit 5/6; the popup slot `0x460d175c` reads `0x46c7d34c`);
+  a second bare press of the page key did NOT open it through `/key` on the
+  paced child (the first rig run assigned nothing and YES on the main
+  screen opened ARM ALL — `chorus/01..17_*.png`). The list is NONE, FILTER,
+  EQ, DJ EQ, PHASER, FLANGER, CHORUS, SPATIALIZER, COMB, COMPRESSOR, LOFI
+  (+ DELAY, PLATE, SPRING, DARK on FX2), the current effect highlighted, so
+  CHORUS = 5 × DOWN from FILTER, COMB = 2 more, DARK = 3 × DOWN from DELAY;
+  YES assigns (the right pane shows the effect's SETUP boxes) and leaves the
+  window open; NO closes it; the page key once shows page 1 with the new
+  names. Page-1 knobs A–F are the six slots (`/knob?row=0x30..0x35`,
+  deltas applied exactly); the value is read back from the Part
+  (`0x400e21e0 + 0x8ee9a + 4·24 + 12/18`, ids at `+0x8ed80/+0x8ed88 + 4`),
+  which is how every state below was confirmed. PLAY 6 s (the pacer held
+  `rt` 0.93 on this LTO-off build for every effect, reverb included), STOP,
+  the take, then SAVE PROJECT (FUNC+MIXER, RIGHT, DOWN, YES, YES; 22,752 →
+  47,355 sectors flushed) and a copy of the card per effect.
+- **The cards** (`out/_agents/fx/cards/`): `clean` (untouched);
+  `chorus` (FX1 0x12: DEL 64 DEP 94 SPD 13 FB 0 WID 127 MIX 40); `chorusmax`
+  (DEL 127 DEP 127 SPD 13 FB 64 WID 127 MIX 64); `comb` (FX1 0x13: PTCH 26
+  TUNE 64 LP 127 FB 127 MIX 90); `delay` (FX1 NONE; FX2 0x08 DELAY: TIME 47
+  FB 70 VOL 127 BASE 0 WDTH 127 SEND 100 — at 120 BPM TIME 47 = 47/256 of a
+  whole note = 367 ms = 16,193 samples); `dark` (FX2 0x16: TIME 84 SHVG 0
+  SHVF 127 HP 0 LP 127 MIX 100, the delay's SEND back to 0).
+- **The renders**: `render.py --card X --out D [--rt] --seconds 6` boots
+  `ot_emu --interactive --mount --set OTLIVE --project PROJECT --dsp[-rt]`
+  on the saved card (rtdrive.py's shape), PLAYs 6 s in `run 250` slices and
+  writes `main.wav` (core 0 main L/R, 16-bit). The panel's own take is
+  bit-identical to `render.py --rt` on the same card before STOP (chorus:
+  0 mismatches of 261,132 frames), so the take is the rt render.
+- **The measures**: `analyze.py` (onset, RMS, autocorrelation lags,
+  spectrum, 100 ms envelope, lockstep-vs-rt alignment: max |diff|,
+  mismatching samples, correlation, per-second dB); `wet.py` (the WET =
+  effect render − clean render of the SAME emulator and mode, onset-aligned:
+  its level, envelope, autocorrelation, cross-correlation with the dry over
+  0–1000 ms, spectrum); `anatomy.py` (the wrong samples of rt against
+  lockstep by position mod 16, magnitude, the stale tests, run lengths).
+  A dry-fit against `third-0.wav` cannot separate a chorus from the dry on
+  this tonal sample (a 6,075 Hz tone; a copy delayed by a few ms is
+  absorbed into the fit gain) — the wet against the clean render is the
+  measure that works.
+
+### Measured (13 Sep 2026, the M5, macOS 26.5; `out/_agents/fx/rig2/analyze_*.txt`, `wet_ls.txt`, `anatomy_ls_vs_rt.txt`)
+
+| card | wet vs dry (lockstep) | what the wet is | lockstep vs rt | rt vs rt (2 runs) |
+|---|---|---|---|---|
+| clean | — | — | **bit-identical** (0 of 287,500) | bit-identical (O17c) |
+| chorus (MIX 40) | | | first hit identical, then −42 dB (0.37 % of samples, max 927) | |
+| chorusmax | **−61.5 dBFS** vs dry −23.6 (−38 dB: nothing) | the same residual as the no-FX1 delay card | −36 dB, 3.6 % of samples, max 9,225; 11 whole 16-sample blocks | 103 wrong samples: 7 whole blocks (2.03, 3.14, 3.19, 3.21, 4.09 s) |
+| comb | **−60.6 dBFS** (nothing; a feedback comb whose line reads zeros outputs exactly the dry) | as above | −37 dB, 3.6 %, max 5,901 | |
+| delay (FX1 NONE) | **−63.2 dBFS**: no energy between the hits (−83…−240 dBFS with SEND 100 / FB 70): **no repeats** | the second voice / LSB noise | −34 dB but only 0.03 %: **6 whole blocks** (1.06, 2.17, 3.18, 4.06, 4.16, 5.17 s), not stale copies, a different mix of the block | the same 6 blocks in one run, none in the other |
+| dark | **−24.1 dBFS**: a tail −47 → −56 dBFS over 0.75 s after each hit, decaying | a reverb | −28 dB, 84 % of samples (a modulated reverb's history: the O12 class) | |
+
+The panel takes measure the same (`analyze_takes.txt`): the delay take
+has silence between hits, the dark take a tail, the chorus/comb takes the
+dry-fit residual of the clean fixture (−18.5 dB, the DSP's fade-in).
+
+### H1 for the delay, cause 1 ✅ fixed: memory-to-memory eDMA channels moved no data (`rtos.cpp` `Rtos::copyMemToMem`, `installHostPortMover`; `rtos.h`; `main.cpp`)
+
+The Echo Freeze Delay is not on the DSP (EXTERNAL.md §1): the ColdFire's
+frame routine at `0x400031a0` points the eDMA at per-track rings in SDRAM
+at `0x4f502c10` (8 × 1,411,328 bytes, cleared at boot). Read off the image
+(`out/_agents/fx/delay_routine.lst`, the TCD init at `0x40002fd4`):
+channels 2/3 fetch this frame's and last frame's delay positions from the
+ring (SADDR = the 16-byte-aligned read position, DADDR = the block minus
+the misalignment: `0x80003ad8` / block+160−8, ATTR `0x0402` = 16-byte
+source bursts and 32-bit destination, SOFF 16, DOFF 4, NBYTES 144, CITER
+1, no modulo; CSR `0x321` = START + link to ch 3), the routine busy-waits
+ch 3's DONE at `0x400035a8`; channels 4/5 write the mixed block
+(`*(0x800000e8)` = `0x80003ae0`) into the ring at the write position (ATTR
+`0x0404`, NBYTES 128; a mirror at ring + 1,411,200 when the write lands at
+the base; CSR `0x521`), waited at `0x40003780`. Route A's model moves no
+data on any channel and the port's mover (O8) only ever carried the
+host-port blocks (`installHostPortMover` returns for a DADDR outside
+`0x20000000-0x20000fff`) — so the taps were never fetched and the ring
+never written: the delay mixed zeros, in both modes.
+
+The fix: at the kick, a channel with neither end in the host-port window
+is copied per its TCD (`copyMemToMem`: NBYTES per minor loop as SSIZE
+reads at SOFF and DSIZE writes at DOFF, SMOD/DMOD honoured, CITER minor
+loops; the TCD's words left as the firmware wrote them — it reprograms the
+addresses every frame and never reads them back). Counted:
+`memToMemBlocks/Bytes`, reported only under `--block-log` or
+`OT_M2M_REPORT=1` (the strict oracle compares the batch log line for line).
+Measured: **12,800 blocks / 1,740,800 bytes per 400 frames** (32 per
+frame: the routine runs for all eight tracks), the reference render
+byte-identical (below), the clean card's lockstep render bit-identical to
+the unfixed binary's, the rt fit gate unchanged.
+
+### H1 for the delay, cause 2 🟡 located, not fixed: the mix loop's gains for T5 are zero
+
+With the copies in, the delay is still silent: T5's ring is zero across
+the whole span of a hit (`fix/delay/peek3.out`: seven 64-byte peeks from
+ring + 0x94000 to + 0xac000, all zero), while T5's delay state record
+(`0x8000609c`: read `0x4fb0ba88`, write offset `0xc6f80`) says the
+geometry is right — **read = write − 16,545 frames = 375 ms** for TIME 47
+(the 367 ms expected plus a frame or two). The pipe's `watchmem` on the
+block the ring is written from (`0x80003ae0`, `watchblk.py`, 700 ms of
+play): the eDMA fetch lands there (my copies: 277 non-zero bytes of
+320,256), and the mix loop's two output stores (`movel %d1,%a0@+` at
+`0x4000376c` / `0x40003772` = dry×SEND + taps×FB per sample) wrote
+**15,440 zeros and nothing else**. Those gains come from the per-track
+coefficient records at `0x80006180` (68 bytes a track, `moveml
+%a4@(20),%d1-%d2/%a1-%a4`, ramped per sample): T1–T3's records carry
+gain words (`0x00800000`, `0x007fffff`, `0x08ff00ff`), **T5's
+(`0x80006290`) holds `8, 0x10, 0x10, 0x10, 0x800049d8, 0x80000690, 0,
+0xc, 0…` and T6–T8's are all zero** (`fix/delay/peek4.out`). So the
+firmware's parameter path that fills the delay's coefficient record for
+T5 (SEND 100 / FB 70 / VOL 127 in the Part, confirmed) never ran under
+the emulator, or the record walker reads a different table for tracks
+5–8 — the next step is to read `0x400031e4–0x400033c0` (the walker,
+`0x80005f8c`/`0x5f98`/`0x5fa0`/`0x5fa2` + 68·t) and `0x40003284` (the
+routine's own staged-time write, EXTERNAL.md) with a `watchmem` on
+`0x80006290`, and to check whether the record's writer is on a UI/menu
+task path (the O12 "slew/scene stage" family) that a saved-and-reloaded
+project should have run at the load. Not the eDMA, not the ring, not the
+DSP.
+
+### H1 for the chorus and the comb 🟡 located to the word, not fixed
+
+The chorus (payload A, init `P:0xeb7`, process `P:0xed7`) is dispatched
+every frame for T5 (`--dsp-pcwatch 0:ed7`: r7 = `0x6100` = position 0's
+FX1 block, x0 = 0x12, r6 cycling the three parameter copies 0x263/0x2e3/
+0x363, r0 = `x:$20e` = 0 = the 16-sample stereo block at X:0x0000), its
+parameter block is right (`X:0x263..`: 7f 7f 0d 40 7f 40 = DEL DEP SPD FB
+WID MIX), its instance base is `Y:0x1000` (`X:0x611{3,4}` = 0x1000 /
+0x1600), and it **writes its two 1,532-word delay lines with the block's
+audio** (`--dsp-writes`: non-zero writes in Y:0x1000–0x15ff and
+0x1600–0x1bff at the hits' duty cycle; the line-write loop `P:0xfe4–0xfed`
+forms `Y:base+idx` with the AGU's "N a multiple of 2^k is linear" rule,
+which interpreter and JIT both apply). What it does not do is hear its
+input: at `P:0xf43–0xf4b` the block is scaled by `y0 = x:(r7+$1d)` into
+the wet scratch (`Y:0xc0`/`0x110`), and **`x:0x611d` is 0** — the scratch
+gets zeros (`--dsp-watch 0:Y:c5`: pc 0xf49 ← 000000 every frame), the tap
+sums are 0/−1 LSB (pc 0xfa1), and the shared mixer `func_7b0` mixes a zero
+wet at MIX. The word is one of the module's own per-tap state words
+(`x:(r7+$1a)..` — the loops at `P:0xf24` (stride 4) and `P:0xf62` (stride
+3) smooth them toward payload tables at `X:0x8d79..0x8d8c` and
+`X:0x6c00/0x6d00`, all present and non-zero in the emulated memory): at
+frame 60 it reads `0x039b9a` and is growing, its siblings `0x6121/0x6125`
+are `0x493782/0x771123` at frame 400, and by frame 400 it is back to 0
+(`rig2/chorusmax/batch_state.log`, `batch_tbl.log`). The interpreter and
+the JIT agree to −36 dB on this card, so it is a DSP-model defect common to
+both (candidates, all in this module's path and none used by Sam's
+modules that `dsp_host` renders bit-exactly: the nested `do` loops over
+`(r3)+n3` with two strides, `tge`/`ifmi`/`ifgt` conditional transfers,
+`lsr #$10,a` on the accumulator, `mpyi`/`macri`, `l:(r4)+` long moves,
+`bset #$14,sr` scaling in `func_773`), not a memory-size or window defect
+(the pair allocates 2 M words per space; the FX1 slot is internal Y). The
+COMB (`P:0x1eca/0x1edc`) shows the identical wet (−60.6 dBFS) and was not
+traced separately. Falsifier for the next session: a `--dsp-watch
+0:X:611d` (the last 16 writers with PC and value) over the first 100
+frames, then the writing instruction's semantics against the DSP56300FM.
+
+### H2: `--dsp-rt` diverges from lockstep once the frame carries an effect (not fixed)
+
+The clean card stays bit-identical (0 of 287,500 samples, ls vs rt, fixed
+and unfixed binaries), but with an effect or the delay's SEND on, rt runs
+differ from lockstep and from each other by **whole 16-sample blocks
+re-rendered with a different mix** (`anatomy_ls_vs_rt.txt`: the delay
+card 6 blocks in 6.5 s, all runs of exactly 16, not stale copies
+(`cand==ref[i±16/32]` 0), |diff| up to 9,194; the chorus card 7–11 such
+blocks plus the wet's own LSB drift; a second rt run of the delay card
+had none of the six and the chorus card a different seven). That is the
+O17c fix-5 class — the ColdFire's own record for a voice rendered inside
+the frame ISR with a flipped 8-sample position bucket — reappearing when
+the ISR chain is longer (the delay's EMAC work, the effect's heavier DSP
+frame). `OT_FENCE_TRACE` / `OT_DSP_FRAMETRACE` and `blockdiff*.py` are the
+instruments; not pursued here because it is −30 dB and inaudible next to
+the H1 findings, and the fix belongs with the drain-time table (`rtos.cpp`
+THE DRAIN TIMES).
+
+### The gates
+
+- Strict oracle, the fixed binary against `out/emu/ot_emu.ref-73c2815`
+  (`out/_agents/fx/build-fix`, LTO off): **28 PASS, 0 FAIL**
+  (`out/_oracle/reports/20260913-111137-o20-m2m-2.txt`). The first run
+  failed only `render.log` on the new report line (`20260913-110823-o20-m2m`);
+  the reference `render.wav` (8 ch, 330,677 frames) and `interdsp.pcm` are
+  byte-identical with the copies on — the reference fixture's rings hold
+  silence, so moving them changes nothing it renders.
+- `fit.py` on the clean fixture in rt (`rtdrive.py --rt --extra "--card
+  out/_agents/audio/otlive2.img"`, the fixed binary): **gain 0.7032,
+  −33.0 dB** (`out/_agents/fx/fit-rt2/`); the tree2 clean card −33.0 dB in
+  both modes.
+- ctest 7/7 (inside the oracle).
+
+### What it does not do
+
+- The delay still has no repeats (cause 2 above); the chorus and comb
+  still add nothing (their word); the dark reverb was not compared to a
+  hardware reference (none exists here). Plate and spring were not run.
+- The reverb on a shared-window FX2 slot (T7/T8, `Y:0x30000/0x34000`) was
+  not exercised: the fixture has no audio on those tracks.
+- The panel's monitor was not the cause on this machine (`rt` 0.93 with
+  every effect, no starvation-specific symptom), but the owner's PGO
+  binary and machine were not measured under the reverb.
+- The rig's one-shot chooser navigation assumes the current effect
+  (FILTER / DELAY on a fresh part); `rig2.py` tracks it across steps.

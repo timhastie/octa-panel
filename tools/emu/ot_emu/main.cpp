@@ -1653,6 +1653,14 @@ int main(int _argc, char** _argv)
 				static_cast<unsigned long long>(rtos.hostBlocksIn()), static_cast<unsigned long long>(rtos.hostWordsIn()),
 				static_cast<unsigned long long>(rtos.hostNonZeroIn()),
 				static_cast<unsigned long long>(rtos.hostWordsShort()), static_cast<unsigned long long>(rtos.edma().gatedWaits()));
+		// O20: the memory-to-memory copies (the delay rings). Printed only on
+		// request: the strict oracle compares the batch log line for line
+		// against the frozen references (the reference `render.wav` itself is
+		// byte-identical with the copies on, 13 Sep 2026), and the block log
+		// is the diagnostic mode that already changes the report.
+		if(dspPair && (!blockLog.empty() || (std::getenv("OT_M2M_REPORT") && *std::getenv("OT_M2M_REPORT") == '1')))
+			std::printf("             eDMA memory-to-memory (O20): %llu blocks / %llu bytes copied (the delay rings' taps and writes)\n",
+				static_cast<unsigned long long>(rtos.memToMemBlocks()), static_cast<unsigned long long>(rtos.memToMemBytes()));
 		if(!blockLog.empty())
 		{
 			std::ofstream b(blockLog);

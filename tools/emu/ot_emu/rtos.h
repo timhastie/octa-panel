@@ -437,6 +437,10 @@ namespace ot
 		uint64_t hostWordsOut() const { return m_hostWordsOut; }
 		uint64_t hostWordsIn() const { return m_hostWordsIn; }
 		uint64_t hostWordsShort() const { return m_hostWordsShort; }
+		// O20: memory-to-memory eDMA copies made (channels with neither end in
+		// the host-port window: the Echo Freeze Delay's ring fetches and writes).
+		uint64_t memToMemBlocks() const { return m_m2mBlocks; }
+		uint64_t memToMemBytes() const { return m_m2mBytes; }
 		// ⚠️ THE COUNT THAT DECIDES WHETHER ANY OF IT MEANS ANYTHING. Blocks and
 		// words moved say the plumbing runs; only a non-zero count says the
 		// frames carry content. An end-of-run peek of the DSP's record buffer
@@ -599,6 +603,9 @@ namespace ot
 		void noteBlock(char _dir, uint32_t _ch, uint32_t _ramAddr, const std::vector<uint16_t>& _hw,
 			uint64_t _nonZero, const std::string& _note);
 		void installHostPortMover();
+		// O20: a memory-to-memory eDMA channel's copy (the delay's ring taps).
+		void copyMemToMem(uint32_t _ch, uint32_t _saddr, uint32_t _daddr);
+		uint64_t m_m2mBlocks = 0, m_m2mBytes = 0;
 		AtaCard* m_card = nullptr;
 		// ⚠️ INTRQ IS NOT INSTANTANEOUS, and the firmware depends on it. The
 		// driver writes the command and THEN calls the RTOS event wait; a

@@ -385,6 +385,57 @@ namespace ot
 		return static_cast<uint32_t>(m_edma.tcdField(_ch, 8, 4) * m_edma.minorLoops(_ch) / 4);	// bytes -> DSP words (one per 16-bit cycle pair... a 32-bit write is two halfwords on TXM:TXL = one word)
 	}
 
+	void Rtos::copyMemToMem(const uint32_t _ch, const uint32_t _saddr, const uint32_t _daddr)
+	{
+		// The MCF5445x eDMA TCD (RM ch. 18): ATTR = SMOD[15:11] SSIZE[10:8]
+		// DMOD[7:3] DSIZE[2:0], sizes 0..5 = 1/2/4/8/16/32 bytes; NBYTES per
+		// minor loop; CITER minor loops (bit 15 = a link, count in bits 8-0);
+		// SOFF/DOFF signed 16-bit strides per transfer. SLAST/DLAST_SGA (the
+		// pointer adjustments after the major loop) and the TCD's running
+		// SADDR/DADDR are not written back: the firmware reprograms both
+		// addresses before every kick and never reads them.
+		const auto attr = m_edma.tcdField(_ch, 6, 2);
+		const auto nbytes = m_edma.tcdField(_ch, 8, 4);
+		const auto loops = m_edma.minorLoops(_ch);
+		const auto soff = static_cast<int32_t>(static_cast<int16_t>(m_edma.tcdField(_ch, 4, 2)));
+		const auto doff = static_cast<int32_t>(static_cast<int16_t>(m_edma.tcdField(_ch, 0x16, 2)));
+		const uint32_t ssize = 1u << ((attr >> 8) & 7), dsize = 1u << (attr & 7);
+		const uint32_t smod = (attr >> 11) & 0x1f, dmod = (attr >> 3) & 0x1f;
+		if(!nbytes || !loops || nbytes > 0x100000)
+			return;
+		auto step = [](uint32_t& _a, const int32_t _off, const uint32_t _mod)
+		{
+			if(_mod)
+			{
+				const uint32_t mask = (1u << _mod) - 1;
+				_a = (_a & ~mask) | ((_a + static_cast<uint32_t>(_off)) & mask);
+			}
+			else
+				_a += static_cast<uint32_t>(_off);
+		};
+		std::vector<uint8_t> buf(nbytes);
+		uint32_t s = _saddr, d = _daddr;
+		for(uint32_t loop = 0; loop < loops; ++loop)
+		{
+			for(uint32_t i = 0; i < nbytes; i += ssize)
+			{
+				const auto n = std::min(ssize, nbytes - i);
+				for(uint32_t k = 0; k < n; ++k)
+					buf[i + k] = m_machine.read8(s + k);
+				step(s, soff, smod);
+			}
+			for(uint32_t i = 0; i < nbytes; i += dsize)
+			{
+				const auto n = std::min(dsize, nbytes - i);
+				for(uint32_t k = 0; k < n; ++k)
+					m_machine.write8(d + k, buf[i + k]);
+				step(d, doff, dmod);
+			}
+			m_m2mBytes += nbytes;
+		}
+		++m_m2mBlocks;
+	}
+
 	void Rtos::installHostPortMover()
 	{
 		auto* co = m_machine.coprocessor();
@@ -398,7 +449,34 @@ namespace ot
 				const auto saddr = m_edma.tcdField(_ch, 0, 4);
 				m_kickSel[_ch & 15] = co->selected();
 				if(daddr < Edma::g_hostPortLo || daddr >= Edma::g_hostPortHi)
+				{
+					// O20 (13 Sep 2026): A MEMORY-TO-MEMORY CHANNEL MOVES ITS BYTES.
+					// Route A's model moved no data on any channel, and the host-port
+					// mover only ever carried the DSP blocks -- so the ECHO FREEZE
+					// DELAY, which is not on the DSP at all (EXTERNAL.md §1: the
+					// ColdFire's frame routine at 0x400031a0 points the eDMA at its
+					// per-track rings in SDRAM at 0x4f502c10), never got its taps:
+					// channels 2/3 fetch this frame's and last frame's delay positions
+					// from the ring into the staging buffers 0x800039a0/0x80003a40
+					// (TCD: ATTR 0x0402 = 16-byte source bursts, 32-bit destination,
+					// SOFF 16, DOFF 4, NBYTES 144, CITER 1, no modulo), channels 4/5
+					// write the frame's block from 0x800000e8 into the ring (ATTR
+					// 0x0404, NBYTES 128) with a mirror at ring + 1,411,200 when the
+					// write lands at the base. The routine busy-waits DONE at
+					// 0x400035a8 / 0x40003780 and then mixes the staging buffers: with
+					// nothing moved the repeats were silence on every card (measured
+					// 13 Sep 2026: SEND 100 / FB 70 / TIME 47, no energy between the
+					// hits, lockstep and rt alike). The copy is the TCD's: every minor
+					// loop moves NBYTES as SSIZE reads at SOFF and DSIZE writes at
+					// DOFF (SMOD/DMOD honoured if ever set), CITER minor loops; the
+					// TCD's own words are left as the firmware wrote them (it
+					// reprograms the addresses every frame). The host-port lanes are
+					// untouched: a channel with either end in the window keeps the
+					// mover's rules below.
+					if(saddr < Edma::g_hostPortLo || saddr >= Edma::g_hostPortHi)
+						copyMemToMem(_ch, saddr, daddr);
 					return;
+				}
 				const auto bytes = m_edma.tcdField(_ch, 8, 4) * m_edma.minorLoops(_ch);
 				std::vector<uint16_t> hw;
 				hw.reserve(bytes / 2);
