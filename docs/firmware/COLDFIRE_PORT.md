@@ -6199,3 +6199,167 @@ THE DRAIN TIMES).
   binary and machine were not measured under the reverb.
 - The rig's one-shot chooser navigation assumes the current effect
   (FILTER / DELAY on a fresh part); `rig2.py` tracks it across steps.
+
+## Milestone O21 — the Echo Freeze Delay repeats: the eDMA copy read the TCD's ATTR/SOFF words swapped; the chorus and comb were never on a track that sounds; the JIT renders the DSP effects differently 🟡 (13 Sep 2026, branch `panel-ui`)
+
+O20 left two "open causes": (A) the delay's coefficient record for T5
+"holds no gain words", and (B) the chorus scales its input by a word the
+DSP "drives to zero". Both were measurement errors, and under them sat one
+real ColdFire-side defect (fixed here), one real EMAC corner (fixed, one
+shift), and one real DSP-side divergence that is the owner's symptom and
+is NOT fixed (the JIT). Everything under `out/_agents/fx2/` (scripts,
+cards, renders, `O21_measurements.txt`, `wet_final.txt`,
+`ls_vs_rt_final.txt`, the watch logs under `delay/` and `chorus/`).
+
+### ❌ What O20 measured, retracted
+
+- **"T5's coefficient record `0x80006180 + 4·68` holds `8, 0x10, …`"**:
+  `0x80006180` is the frame routine's POINTER CELL — set to `0x80005f60`
+  at `0x400033be` and advanced 68 bytes per track at `0x400036fe` — so the
+  records are at `0x80005f60 + 68·t`, and O20 read past the eighth one.
+  T5's (`0x80006070`), peeked on the delay card during play: `7e020000
+  7e020000 b972a200 4e200000` = dry level `(0x7f00)²·2`, VOL `(0x7f00)²·2`,
+  FB `sats(−66053·0x4600)`, SEND `(0x6400)²·2` — exactly the CFPRM's
+  fractional squares and the saturating subtract (`macw %d7l,%d7l,%acc0`
+  under MACSR `0xa0`, `mulsl`/`subl`/`satsl`; `out/_agents/fx2/watchrec-delay-1.out`,
+  `hitsmix-delay-hit.out`). The writer was right all along; the four
+  instruction variants it uses are now cases in `test_emac.cpp` (41 checks).
+- **"T5 plays third-0.wav"**: the tree2 fixture's tracks are T1–T4 STATIC on
+  sample slots 1–4 and T5–T8 FLEX on flex slots 1–4 (`first, second, third,
+  fourth-0.wav`; third = fourth = fifth by md5), every track trigging at
+  steps 1 and 9. In emulation **the slot-1/2 tracks (T1, T2, T5, T6) never
+  sound**: DSP core 0 position 0 — the position whose FX record `X:0x25d`
+  carries the rig's effect ids for T5 — receives nothing from the voice
+  stage `P:0x41a` in any frame of a hit (`dsp watch 0:X:0` / `dsp pcwatch
+  0:f49`: x0 = 0 through 1.00–1.08 s), while positions 2/3 (T7/T8, and
+  T3/T4 on core 1) carry third/fourth-0.wav; the clean fit against
+  third-0.wav alone is −33 dB, so first-0.wav is not in the main out. So
+  every O20 effect card put its effect on a silent track, and the "silent
+  wet" of the chorus/comb and the "no repeats" of the delay followed. The
+  cause of that silence is not determined (a fixture/part state, or an
+  emulation defect of the slot-1/2 path): 🟡 the falsifier is first-0.wav
+  on T7's slot.
+- **The O20 "comb" card is a chorus card**: its Part bytes hold T5 FX1 =
+  `0x12` with the chorusmax page (the rig's second DOWN did not take).
+- **The chorus word `X:0x611d`** is tap 0's gain (`r7+0x1a+3`), smoothed at
+  `P:0xf24–0xf30` toward `X:(0x8d80+a)` = `0x400000` (a = 2, 1/√4) with
+  y1 = `0x20c5`/2²³ = 0.001 per frame: `0x00d3b4` at 30 frames, `0x150545`
+  at 400 (= 0.5·(1−e^−0.4)), `0x3ffc19` at 6000 — the DSP56300 semantics
+  exactly; never 0 (`out/_agents/fx2/chorus/watch_611d_f*.log`).
+- **The DSP has no DELAY module**: id 8's init entry `X:0x215+8` = `P:0x7c8`
+  (`rts`), its process entry `X:0x235+8` = `P:0x7c9` (a copy in place). The
+  delay is the ColdFire's alone: its dry is the per-position read-back
+  (DSP DMA1 from `X:0x2600/0x4600 + 64·position`, 64 words = 16 stereo
+  samples as hi/lo halves, → `0x80003190 + 0x400·ping + 128·slot`; core 1 =
+  slots 0–3, core 0 = slots 4–7), its result returns as the forward
+  (`0x6400` → `X:0x2400/0x4400`), one frame later.
+
+### The rig, corrected (`out/_agents/fx2/`)
+
+Cards are built directly from the project — no panel session: a copy of
+`out/_agents/audio/tree2`, `tools/hw/ot_project.py set_fx(pdir, slot,
+track, id, page, page2)` on **T7** (a track that sounds) with the O20
+settings read back from the O20 cards' Part bytes, `emu_card.build_image`
+→ `cards/{clean7,chorus7,comb7,delay7,dark7}.img` (comb7 = `0x13` with page
+`26 64 127 127 0 90`, the PTCH TUNE LP FB — MIX order of DSP.md). Renders
+with O20's `render.py`, wet with `wet.py` (a numpy venv at
+`out/_agents/fx2/venv`). New instruments: **`dsp watch | dsp pcwatch | dsp
+peek <core> <X|Y|P> <0xaddr> <len>`** on the pipe (`main.cpp`; the batch's
+`--dsp-watch/--dsp-pcwatch` records and a DSP memory peek, readable in the
+interactive run — the batch's `--sequencer` start leaves the playing
+tracks silent on these cards, so the traces could only be taken here;
+lockstep only), `dspq.py` (PLAY, run, issue pipe commands at chosen
+times), `hitsmix.py` (the delay mix loop's registers per slot, 0x40003738 /
+0x4000375e / 0x4000376c), `watchrec.py`. ⚠️ A `watchmem` on SDRAM must be
+given as `0x8xxxxxxx`: the watch compares the cached alias, and a range
+given as `0x4fxxxxxx` reports 0 writes while the ring fills (measured).
+
+### Cause A ✅ fixed: `copyMemToMem` read the TCD's ATTR at +6 and SOFF at +4 (`rtos.cpp`; the eDMA log's labels in `main.cpp`; the comment in `periph.h`)
+
+On the MCF5445x the 32-bit word at TCD+4 is `ATTR` (high half) and `SOFF`
+(low half): TCDn_ATTR 0x04, TCDn_SOFF 0x06 (RM ch. 18), and the firmware's
+values say so — the delay routine writes `0x0402`/`0x0404` there (SSIZE 4 =
+16-byte bursts; DSIZE 2 = 32-bit or 4 = 16 bytes) and `0x0010` at +6 (the
+16-byte stride). O20's copy had them swapped: SSIZE = DSIZE = 1 byte, DMOD
+= 2 (a 4-byte destination modulo), and a source stride of 1026/1028. So
+the 144-byte tap fetch folded 144 single bytes, from every 1026th address,
+into the staging block's first longword (`watchmem 0x800039a0`: 1872
+one-byte writes per 8 ms, all 0, pc `0x4000337c`), and the 128-byte ring
+write folded into four bytes at the write pointer — the ring stayed zero
+(`peek` of T7's ring `0x4fd16210 + 0x2000…0x5c000` at 1.07 s: all 0) while
+the mix loop's ring-input stores were non-zero (inside the hit: T7 1650 of
+1761 stores, gains `a2 4e200000 a3 b972a200 a4 7e020000`). Nothing else
+reads those two words (the host-port mover uses NBYTES/CITER/SADDR/DADDR),
+which is how the swap hid.
+
+**Measured after the fix, delay7 (TIME 47 FB 70 VOL 127 SEND 100 on T7),
+lockstep:** wet −38.6 dBFS with the echo at **lag 16,529 samples = 374.8 ms**
+(wet×dry cross-correlation r = 0.297) and the second repeat at 33,058 (r =
+0.164); the wet envelope −32…−39 dB at 350–600 ms and −38…−44 at 700–950
+ms. Before: −44.5 dBFS, top lag 16 (the one-frame ColdFire latency), no
+energy between the hits. 16,529 is the firmware's own staged time
+(state record +0x38 = `0x81221 >> 5`); O20's 16,193 was 47/256 of a whole
+note at 120 BPM, not the firmware's formula (`0x40003284–0x400032ea`,
+unverified against hardware).
+
+### Cause A′ ✅ fixed: fractional −1.0 × −1.0 (`v4e.cpp`)
+
+The new gate caught it: the fractional product was formed as `(product <<
+1) >> 24` in an int64, and the one product that reaches 2⁶² (0x80000000
+squared, or the 0x8000 halves) overflowed into −2³⁹, where the 48-bit EMAC
+holds +1.0 as +2³⁹ in its extension bits (CFPRM, fractional mode: only the
+read-out saturates — `0x7fffffff` with OMC set, wrapped `0x80000000` with
+OMC clear). Now `product >> 23`, one shift; no other input changes; both
+read-outs are gate cases.
+
+### Measured (13 Sep 2026, the M5, macOS 26.5; the LTO binary `out/_agents/fx2/build-lto/ot_emu`; `wet_final.txt`, `ls_vs_rt_final.txt`)
+
+| card (effect on T7) | lockstep wet | what the wet is | rt wet | lockstep vs rt |
+|---|---|---|---|---|
+| clean7 | — | — | — | **bit-identical** |
+| chorus7 (DEL 127 DEP 127 SPD 13 FB 64 WID 127 MIX 64) | **−43.6 dBFS** | a detuned copy (wet peak 6063 Hz vs the dry's 6075), no short-loop autocorrelation (top lag r = 0.18) | −49.0 | 27 % of samples, −21 dB; **the rt wet is not detuned** (6075 Hz) |
+| comb7 (PTCH 26 TUNE 64 LP 127 FB 127 MIX 90) | **−28.3 dBFS** | a comb ringing at 337 samples = 130.9 Hz (C3 = PTCH 26), decaying over 1 s | −36.4 | 99 %, −5 dB; **the rt comb does not ring** (autocorrelation peaks at 24–39 samples, r = 0.5: the owner's "very small glitchy loop") |
+| delay7 | **−38.6 dBFS** | the echo at 16,529 samples and its repeat | −38.6 | **bit-identical** |
+| dark7 (TIME 84 … MIX 100) | −24.1 dBFS | a reverb, tail −35 → −44 dB over 1 s | −24.1 | 98 %, −9 dB (the tail is there, the samples differ) |
+
+So **(B) as O20 stated it does not exist in lockstep**: the chorus and the
+comb work once they are on a track that sounds. What does exist is a
+**JIT-vs-interpreter semantic difference inside the DSP-side effect
+modules** — `--dsp-rt` is the panel's mode, the owner listens to it — from
+the first sample of a hit, not a scheduling class (the clean card and the
+ColdFire-side delay are bit-identical between the modes; O20's H2 "whole
+16-sample blocks" were this on the silent-T5 cards). Not fixed here.
+
+### The gates
+
+- Strict oracle, `out/_agents/fx2/build-lto/ot_emu` vs `out/emu/ot_emu.ref-73c2815`:
+  **28 PASS, 0 FAIL** (`out/_oracle/reports/20260913-122719-o21-delay-fix.txt`);
+  the reference `render.wav` / `interdsp.pcm` byte-identical — the
+  reference fixture's rings hold silence (SEND 0 everywhere), and no other
+  memory-to-memory channel changes bytes the oracle reads.
+- ctest **7/7**, the EMAC gate **41 checks** (the delay-coefficient square
+  law in three accumulators including an address-register operand, the
+  mix loop's fractional `macl` with an `(An)` load, the `mulsl/subl/satsl`
+  chain with and without overflow, and the −1×−1 read-outs).
+- `fit.py` on the clean fixture in rt (`rtdrive.py --rt --extra "--card
+  out/_agents/audio/otlive2.img"`): **gain 0.7032, −33.0 dB** (`out/_agents/fx2/fit-rt/fit.txt`).
+
+### What it does not do
+
+- **The JIT's effect rendering** (chorus not detuned, comb not ringing,
+  reverb samples different under `--dsp-rt`) is diagnosed to the class,
+  not to the instruction. The exact next step: a differential run of the
+  comb module (`P:0x1eca` init, `P:0x1edc` process, and `func_773`'s
+  `bset #$14,sr` … `bclr #$14,sr` window) — the same DSP state under the
+  vendored interpreter and under the JIT (`out/_agents/jit-spike/jittest/`),
+  the first register or memory write that differs names the instruction;
+  the candidates are the ones O20 listed (`do` over `(r3)+n3`, `tge`/`ifmi`/
+  `ifgt`, `lsr #$10,a`, `mpyi`/`macri`, `l:(r4)+`, the SR bit-20 window,
+  `asr #$a,b,b`), and the fix belongs in `vendor/dsp56300` +
+  `tools/patches/dsp56300.patch`.
+- Why the slot-1/2 tracks are silent in emulation (T1, T2, T5, T6 with
+  first/second-0.wav) is not determined.
+- The delay's time formula (16,529 samples for TIME 47 at 120 BPM) is the
+  firmware's; no hardware reference exists here to check it against.
+- Plate and spring were not run; the O20 cards (effects on T5) were not
+  re-rendered — they measure a silent track.

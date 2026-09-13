@@ -297,8 +297,9 @@ namespace ot
 	// The MCF5445x eDMA, as far as the DSP frame exchange and the ColdFire's
 	// per-frame EMAC work use it. Route A's `class Edma`, rule for rule.
 	//
-	// Registers: TCDs at 0xfc045000, 32 bytes per channel (SADDR +0, SOFF +4,
-	// ATTR +6, NBYTES +8, SLAST +0xc, DADDR +0x10, CITER +0x14, DOFF +0x16,
+	// Registers: TCDs at 0xfc045000, 32 bytes per channel (SADDR +0, ATTR +4,
+	// SOFF +6 -- ⚠️ in that order, the RM's TCDn_ATTR 0x04 / TCDn_SOFF 0x06;
+	// O20's copy had them swapped, O21 -- NBYTES +8, SLAST +0xc, DADDR +0x10, CITER +0x14, DOFF +0x16,
 	// DLAST_SGA +0x18, BITER +0x1c, CSR +0x1e); control bytes at 0xfc04401c
 	// CINT (clear a channel's request; 0x40 = all), +0x1e SSRT (software-start
 	// a channel), +0x1f CDNE (clear DONE). A channel starts by SSRT or by

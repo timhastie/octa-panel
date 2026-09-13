@@ -631,10 +631,17 @@ namespace ot::v4e
 		int64_t addend;
 		if(fi)
 		{
-			int64_t product = static_cast<int64_t>(static_cast<int32_t>(opX))
+			const int64_t product = static_cast<int64_t>(static_cast<int32_t>(opX))
 							* static_cast<int64_t>(static_cast<int32_t>(opY));
-			product <<= 1;
-			addend = product >> 24;			// MACSR's RT (round) bit is clear here
+				// (product << 1) >> 24, written as ONE shift: O21 (13 Sep 2026). The
+				// two-step form overflowed the int64 for the one product that reaches
+				// 2^62, -1.0 x -1.0 (0x80000000 squared, or the 0x8000 halves), and
+				// accumulated -2^39 where the 48-bit EMAC holds +1.0 as +2^39 in its
+				// extension bits (CFPRM, the MAC unit's fractional mode: the product
+				// is representable in the accumulator; only the READ-OUT saturates,
+				// to 0x7fffffff when OMC is set, and wraps to 0x80000000 when it is
+				// clear). The EMAC gate carries both cases; no other input changes.
+				addend = product >> 23;			// MACSR's RT (round) bit is clear here
 		}
 		else if(su)
 		{

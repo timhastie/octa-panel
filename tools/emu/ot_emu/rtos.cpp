@@ -394,10 +394,26 @@ namespace ot
 		// pointer adjustments after the major loop) and the TCD's running
 		// SADDR/DADDR are not written back: the firmware reprograms both
 		// addresses before every kick and never reads them.
-		const auto attr = m_edma.tcdField(_ch, 6, 2);
+		// ⚠️ O21 (13 Sep 2026): THE WORD AT +4 IS ATTR AND THE WORD AT +6 IS
+		// SOFF (MCF5445x RM ch. 18, the TCD memory map: TCDn_ATTR 0x04,
+		// TCDn_SOFF 0x06 -- the big-endian halves of the 32-bit word at +4),
+		// and the firmware's own values say so: the delay routine writes
+		// 0x0402 / 0x0404 there (SSIZE 4 = 16-byte bursts with a 32-bit or
+		// 16-byte destination -- attribute words) and 0x0010 at +6 (the
+		// 16-byte stride). O20 read them the other way round, so every
+		// delay copy ran with SSIZE = DSIZE = 1 byte, DMOD = 2 (a 4-byte
+		// destination window) and a source stride of 1026/1028: the taps
+		// were 144 single bytes from every 1026th address folded into the
+		// staging block's first longword, and the ring received four bytes
+		// per frame -- measured 13 Sep 2026 on a track that sounds (T7): the
+		// ring all zero at the write pointer, no repeat at 367 ms, while
+		// the mix loop's ring-input stores were non-zero. The label swap
+		// hid in plain sight because nothing else reads +4/+6 (the
+		// host-port mover uses NBYTES/CITER/SADDR/DADDR only).
+		const auto attr = m_edma.tcdField(_ch, 4, 2);
 		const auto nbytes = m_edma.tcdField(_ch, 8, 4);
 		const auto loops = m_edma.minorLoops(_ch);
-		const auto soff = static_cast<int32_t>(static_cast<int16_t>(m_edma.tcdField(_ch, 4, 2)));
+		const auto soff = static_cast<int32_t>(static_cast<int16_t>(m_edma.tcdField(_ch, 6, 2)));
 		const auto doff = static_cast<int32_t>(static_cast<int16_t>(m_edma.tcdField(_ch, 0x16, 2)));
 		const uint32_t ssize = 1u << ((attr >> 8) & 7), dsize = 1u << (attr & 7);
 		const uint32_t smod = (attr >> 11) & 0x1f, dmod = (attr >> 3) & 0x1f;

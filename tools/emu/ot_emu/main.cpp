@@ -87,6 +87,13 @@ namespace
 	//   watchmem <addr> <len> -> ok      Rtos::watchMem (adds a range; nothing removes one)
 	//   writes            -> writes n=<count> <rec> ... one per watched write since the last `writes`:
 	//                        <sample>:<pc>:<addr>:<val>:<size>:<tcb>
+	//   dsp watch         -> dsp n=<k> <pc>:<val>:<executed>:<r0>:<r4>:<r6>:<area> ...   (O21) the last 16 writers of
+	//                        the --dsp-watch word; `dsp pcwatch` -> dsp n=<k> <executed>:<a1>:<a0>:<b1>:<b0>:<x0>:<x1>:
+	//                        <y0>:<y1>:<r0>:<r4>:<r6>:<n4>:<sp>:<r2>:<m2>:<r1>:<n1>:<r7> ... the last 24 arrivals at
+	//                        the --dsp-pcwatch PC; `dsp peek <core> <X|Y|P> <addr> <len>` -> dsp <word> ... (hex,
+	//                        addr with 0x, len <= 4096). Lockstep only (`err` under --dsp-rt: the JIT is not observed).
+	//                        ⚠️ A watched address is folded to its cached alias (0x8xxxxxxx) before the compare, so a
+	//                        `watchmem` on an SDRAM range must be given as 0x8xxxxxxx, not 0x4xxxxxxx (O21).
 	//
 	// The hit log is the machine's (capped at 2M records, as the batch); a
 	// watched PC costs one compare per instruction, `watch off` when done.
@@ -870,6 +877,80 @@ namespace
 				reply(out);
 				continue;
 			}
+			if(cmd == "dsp")
+			{
+				// O21 (13 Sep 2026): the lockstep interpreter's per-instruction
+				// instruments (--dsp-watch, --dsp-pcwatch) and a DSP memory peek,
+				// readable over the pipe. The batch prints them at the end of the
+				// run; the interactive loop returns before that report, and the
+				// effects rig plays through the panel's path (PLAY), where the
+				// batch's --sequencer start leaves the playing track silent -- so the
+				// chorus/delay word traces of O21 could only be taken here. One line
+				// each, the records ':'-separated like `hits`/`writes`:
+				//   dsp watch    -> dsp n=<k> <pc>:<val>:<executed>:<r0>:<r4>:<r6>:<area> ...
+				//   dsp pcwatch  -> dsp n=<k> <executed>:<a1>:<a0>:<b1>:<b0>:<x0>:<x1>:<y0>:<y1>:<r0>:<r4>:<r6>:<n4>:<sp>:<r2>:<m2>:<r1>:<n1>:<r7> ...
+				//   dsp peek <core> <X|Y|P> <addr> <len>  -> dsp <word> ... (hex, at most 4096)
+				// Lockstep only: under --dsp-rt the cores run on their own threads
+				// and the instruments do not observe the JIT (O17).
+				if(!_dsp)
+				{
+					reply("err dsp needs --dsp");
+					continue;
+				}
+				if(_dsp->realtime())
+				{
+					reply("err dsp instruments are the lockstep interpreter's (not under --dsp-rt)");
+					continue;
+				}
+				const auto sub = w.size() > 1 ? w[1] : std::string();
+				char rec[256];
+				if(sub == "watch" && w.size() == 2)
+				{
+					const auto& hs = _dsp->writeWatchHits();
+					std::string out = "dsp n=" + std::to_string(hs.size());
+					for(const auto& h : hs)
+					{
+						std::snprintf(rec, sizeof rec, " %x:%x:%llu:%x:%x:%x:%u", h.pc, h.val,
+							static_cast<unsigned long long>(h.executed), h.r0, h.r4, h.r6, h.area);
+						out += rec;
+					}
+					reply(out);
+					continue;
+				}
+				if(sub == "pcwatch" && w.size() == 2)
+				{
+					const auto& hs = _dsp->pcWatchHits();
+					std::string out = "dsp n=" + std::to_string(hs.size());
+					for(const auto& h : hs)
+					{
+						std::snprintf(rec, sizeof rec, " %llu:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x",
+							static_cast<unsigned long long>(h.executed), h.a1, h.a0, h.b1, h.b0, h.x0, h.x1, h.y0, h.y1,
+							h.r0, h.r4, h.r6, h.n4, h.sp, h.r2, h.m2, h.r1, h.n1, h.r7);
+						out += rec;
+					}
+					reply(out);
+					continue;
+				}
+				uint64_t core = 0, addr = 0, len = 0;
+				if(sub == "peek" && w.size() == 6 && parseNumber(w[2], core) && core <= 1 && w[4 - 1].size() == 1
+					&& (w[3] == "X" || w[3] == "Y" || w[3] == "P") && parseNumber(w[4], addr) && addr <= 0xffffff
+					&& parseNumber(w[5], len) && len >= 1 && len <= 4096)
+				{
+					std::string out = "dsp";
+					for(uint64_t k = 0; k < len; ++k)
+					{
+						const auto a = static_cast<uint32_t>(addr + k);
+						const auto v = w[3] == "P" ? _dsp->peekP(static_cast<int>(core), a)
+							: w[3] == "Y" ? _dsp->peekY(static_cast<int>(core), a) : _dsp->peekX(static_cast<int>(core), a);
+						std::snprintf(rec, sizeof rec, " %06x", v);
+						out += rec;
+					}
+					reply(out);
+					continue;
+				}
+				reply("err usage: dsp watch | dsp pcwatch | dsp peek <core> <X|Y|P> <addr> <len>");
+				continue;
+			}
 			if(cmd == "audio")
 			{
 				const auto sub = w.size() > 1 ? w[1] : std::string();
@@ -1342,9 +1423,9 @@ int main(int _argc, char** _argv)
 				const auto& e = rtos.edma();
 				char line[256];
 				std::snprintf(line, sizeof line,
-					"kick ch %2u %s sample %.1f saddr %08x soff %d attr %04x nbytes %08x slast %d daddr %08x doff %d citer %04x dlast %d biter %04x csr %04x\n",
+					"kick ch %2u %s sample %.1f saddr %08x attr %04x soff %d nbytes %08x slast %d daddr %08x doff %d citer %04x dlast %d biter %04x csr %04x\n",
 					_ch, _paced ? "paced" : "burst", rtos.sample(),
-					e.tcdField(_ch, 0, 4), static_cast<int16_t>(e.tcdField(_ch, 4, 2)), e.tcdField(_ch, 6, 2),
+					e.tcdField(_ch, 0, 4), e.tcdField(_ch, 4, 2), static_cast<int16_t>(e.tcdField(_ch, 6, 2)),	// O21: +4 is ATTR, +6 SOFF (the RM's order; the label was swapped)
 					e.tcdField(_ch, 8, 4), static_cast<int32_t>(e.tcdField(_ch, 0xc, 4)), e.tcdField(_ch, 0x10, 4),
 					static_cast<int16_t>(e.tcdField(_ch, 0x16, 2)), e.tcdField(_ch, 0x14, 2),
 					static_cast<int32_t>(e.tcdField(_ch, 0x18, 4)), e.tcdField(_ch, 0x1c, 2), e.tcdField(_ch, 0x1e, 2));
