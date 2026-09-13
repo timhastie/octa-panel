@@ -106,6 +106,14 @@ func findRepoRoot() -> URL? {
 /// out/panel_app.log: the server's stdout/stderr and the app's own lines in
 /// one file. O_APPEND on both descriptors so the two writers interleave
 /// whole lines instead of overwriting each other.
+/// The firmware image the server boots: VIRTUAL_PANEL_IMAGE for scripts, else the remembered
+/// File > Open Firmware Image... choice ("imagePath") when the file still exists, else nil = stock.
+func firmwareImagePath() -> String? {
+    if let e = ProcessInfo.processInfo.environment["VIRTUAL_PANEL_IMAGE"], !e.isEmpty { return e }
+    if let p = UserDefaults.standard.string(forKey: "imagePath"), FileManager.default.fileExists(atPath: p) { return p }
+    return nil
+}
+
 enum Log {
     static var fd: Int32 = -1
     static var path = ""
@@ -178,6 +186,9 @@ final class PanelServer {
         var a = [repo.appendingPathComponent("tools/panel/panel_server.py").path, "--port", String(port)]
         if let b = ProcessInfo.processInfo.environment["VIRTUAL_PANEL_PORT_BIN"], !b.isEmpty {
             a += ["--port-bin", b]
+        }
+        if let img = firmwareImagePath() {
+            a += ["--image", img]
         }
         if let c = card {
             a += ["--card", c.path]
@@ -379,6 +390,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     static let saveDirKey = "saveDir"      // UserDefaults: where the last recording was saved
     static let cardKey = "cardPath"        // UserDefaults: the card image (O19) booted at launch
     static let outputKey = "outputDevice"  // UserDefaults: the output device's name ("" / absent = off)
+    static let imageKey = "imagePath"      // UserDefaults: a firmware image (a remix .bin) instead of the stock one (14 Sep 2026)
+    static var imagePath: String? { firmwareImagePath() }
 
     let repo: URL
     let server: PanelServer
@@ -632,6 +645,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         // the card (O19): a persistent image the unit saves into
         file.addItem(withTitle: "New Card from Project...", action: #selector(newCardFromProject(_:)), keyEquivalent: "n").target = self
         let openCard = file.addItem(withTitle: "Open Card...", action: #selector(openCard(_:)), keyEquivalent: "O")
+        file.addItem(withTitle: "Open Firmware Image...", action: #selector(openImage(_:)), keyEquivalent: "i").target = self
+        file.addItem(withTitle: "Use Stock Firmware", action: #selector(useStockImage(_:)), keyEquivalent: "").target = self
         openCard.keyEquivalentModifierMask = [.command, .shift]
         openCard.target = self
         showCardItem = file.addItem(withTitle: "Show Card in Finder", action: #selector(showCardInFinder(_:)), keyEquivalent: "")
@@ -932,6 +947,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         panel.beginSheetModal(for: window) { [weak self] resp in
             guard let self = self, resp == .OK, let img = panel.url else { return }
             self.useCard(img, project: nil, source: "Open Card")
+        }
+    }
+
+    /// Open Firmware Image...: a remix .bin (REMIX=<name> make bus -> out/mainos_bus.bin)
+    /// instead of the stock OS; remembered, the unit reboots on it (14 Sep 2026).
+    @objc func openImage(_ sender: Any?) {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Boot"
+        panel.message = "A main-OS image to boot instead of the stock one: a remix built by octabam (out/mainos_bus.bin, or a copy of it)"
+        if #available(macOS 11.0, *) {
+            panel.allowedContentTypes = [UTType(filenameExtension: "bin") ?? .data, .data]
+        }
+        let out = repo.appendingPathComponent("out")
+        if FileManager.default.fileExists(atPath: out.path) { panel.directoryURL = out }
+        panel.beginSheetModal(for: window) { [weak self] resp in
+            guard let self = self, resp == .OK, let img = panel.url else { return }
+            UserDefaults.standard.set(img.path, forKey: Self.imageKey)
+            Log.write("firmware image chosen (remembered): \(img.path)")
+            self.rebootOnCurrentCard()
+        }
+    }
+
+    @objc func useStockImage(_ sender: Any?) {
+        UserDefaults.standard.removeObject(forKey: Self.imageKey)
+        Log.write("firmware image: back to the stock image")
+        rebootOnCurrentCard()
+    }
+
+    /// Restart the server on whatever card/project it runs on now (the image comes from imagePath).
+    func rebootOnCurrentCard() {
+        if let c = UserDefaults.standard.string(forKey: Self.cardKey), FileManager.default.fileExists(atPath: c) {
+            restartServer(project: nil, card: URL(fileURLWithPath: c))
+        } else {
+            restartServer(project: projectDir(), card: nil)
         }
     }
 

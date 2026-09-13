@@ -351,3 +351,13 @@ VirtualPanelWindow"` forgets it).
 | `Info.plist` | bundle id `io.octabam.virtual-panel`, min macOS 13, the audio document types for Dock drops |
 | `build.sh` | swiftc -O (explicit arm64 target + SDK: a Rosetta shell otherwise loses both), bundle assembly, `repo_root`, icon, `codesign -s -` |
 | `make_icon.py` | draws the icon PNG (stdlib); `build.sh` runs sips + iconutil on it |
+
+## Running a remix (your own firmware) in the app
+
+`File > Open Firmware Image...` (cmd-I) boots a main-OS image instead of the
+stock one and remembers it; `File > Use Stock Firmware` goes back. Build a
+remix first, e.g. `REMIX=direct-jump make bus` or `REMIX=quantizer make bus`
+(both modules together: see modules/README.md on composing remixes) -> the
+image lands at `out/mainos_bus.bin` (Elektron bytes: keep it under out/,
+never in git). The unit reboots on the chosen image on the same card, so
+your projects and samples stay. Scripts: `VIRTUAL_PANEL_IMAGE=<path>`.
