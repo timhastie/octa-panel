@@ -189,6 +189,26 @@ EMAC-fixed Unicorn (`scripts/build_unicorn.sh`), `vendor/dsp56300` pinned to
   toggle). Rear edge shows only HEAD-PHONES, MAIN/CUE OUT, INPUT A B/C D
   and the card slot.
 
+- **Effects fidelity + firmware modules (13-14 Sep 2026, O20-O23):** the
+  time-based effects were silent/wrong in BOTH DSP modes until three
+  emulator defects were fixed: memory-to-memory eDMA moved no data (the
+  Echo Freeze delay's ring), the TCD ATTR/SOFF fields were read swapped,
+  and the EMAC -1x-1 product overflowed; then two JIT defects (MPYI/MACI
+  immediate sign; bset/bclr on an M register corrupting its modulo mask)
+  made --dsp-rt match the interpreter (clean/chorus/comb bit-identical).
+  Known: MACRI is a no-op in both engines (chorus/phaser/flanger at
+  P:0x779) -- implementing it will change those modules' output; the
+  flex-slot-1/2 tracks (T5/T6 of OTLIVE) are silent in emulation. The
+  effects rig: out/_agents/fx2 (cards per effect on T7, render.py in both
+  modes, wet.py). Per-track outputs (O23): stems tapped at P:0x2d5 from
+  X:$204+32k, `audio start tracks`, output map main 1-2 / cue 3-4 /
+  tracks 5-20. FIRMWARE MODULES (source only, never flashed):
+  modules/direct-jump (CHAIN AFTER = DIRECT), modules/quantizer (SCALE
+  row, #SEQUENCER_SCALE=n), remixes/tim.py = both; build with
+  `PATH=.venv/bin:$PATH REMIX=tim make bus` -> out/mainos_bus.bin (the
+  build script needs Python >= 3.12); boot it in the app with File > Open
+  Firmware Image....
+
 ## Repo / process rules that matter
 
 - **No Elektron bytes in git**: `out/`, `downloads/`, `vendor/`, `.venv/` are
