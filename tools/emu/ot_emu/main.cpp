@@ -640,14 +640,19 @@ namespace
 				}
 				const auto& hs = _m.pcHits();
 				std::string out = "hits n=" + std::to_string(hs.size() - hitCursor);
+				// The record is 23 fields: at most 1 + 16 + 22 * 9 = 215 bytes
+				// when every register is 8 hex digits (a 64-bit instruction
+				// count 16), which the shared 160-byte `buf` cut short --
+				// silently, snprintf truncates -- so the record gets its own.
+				char rec[256];
 				for(size_t i = hitCursor; i < hs.size(); ++i)
 				{
 					const auto& h = hs[i];
-					std::snprintf(buf, sizeof buf, " %llx:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x",
+					std::snprintf(rec, sizeof rec, " %llx:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x:%x",
 						static_cast<unsigned long long>(h.instruction), h.pc, h.d0, h.d1, h.a0, h.a1, h.sp,
 						h.stack[0], h.stack[1], h.stack[2], h.stack[3], h.stack[4],
 						h.d[2], h.d[3], h.d[4], h.d[5], h.d[6], h.d[7], h.a[2], h.a[3], h.a[4], h.a[5], h.a[6]);
-					out += buf;
+					out += rec;
 				}
 				hitCursor = hs.size();
 				reply(out);

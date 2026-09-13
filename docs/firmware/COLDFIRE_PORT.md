@@ -4325,7 +4325,8 @@ on the idle machine: 1475.
 - The `hits` record line is formatted into a 160-byte buffer and can be
   cut short when every register is 8 hex digits (up to 215 bytes); a
   pre-existing limit, left as it is because changing it would change an
-  existing command's output.
+  existing command's output. (Fixed in O15g, below: the record has its
+  own buffer; the reply's grammar did not change.)
 
 ## Milestone O16a — the oracle in the repo, a second frozen reference, and the Phase B audio contract ✅ (12 Sep 2026, branch `panel-ui`)
 
@@ -4441,6 +4442,86 @@ tolerance (a first version fired on every shift inside digital silence).
   the Phase B steps that add threads must prove those separately (a
   `-fsanitize=thread` Debug build through `drive.py`, a measured quit/EOF/
   SIGTERM).
+
+## Milestone O15g — the `hits` record, uncut: its own buffer ✅ (12 Sep 2026, branch `panel-ui`)
+
+`main.cpp` (`serveInteractive`, the `hits` command only); no other reply,
+no run-loop, batch or vendored change. O15f's last "does not do" item,
+closed. Every `serveInteractive` reply was formatted through one shared
+`char buf[160]`, and the `hits` record is the one reply that can exceed
+it: 23 fields, ` %llx` for the instruction count (up to 16 hex digits)
+and `:%x` for the 22 registers (up to 8 each), 1 + 16 + 22 × 9 = **215**
+bytes when every value is wide. `snprintf` truncates silently, so the
+client got a 158-character record with the trailing registers missing,
+the last one shortened (a wrong value, not a missing one) or, when the
+cut fell just after a `:`, an empty last field -- which the
+`int(x, 16)` parse every instrument script does
+(`out/_agents/seqled/probe.py`, `ledtimer.py`, `verifier/gate.py`)
+raises on. The frame handler `0x4000ab1a` reaches it routinely: with
+`a1`, `sp` and the five stack words all 8 digits, the record is over
+160 before `d2..d7` start.
+
+### What changed (`main.cpp`)
+
+- **The record has its own `char rec[256]`** in the `hits` handler; the
+  format string and the 23 arguments are as they were. The shared
+  `buf[160]` still serves every other reply (`ready`, `status`, `ok`,
+  `pacestatus`, `audio status`, the `err unmapped` lines and the
+  six-field `writes` record), so no other command's output can change.
+- **The protocol is unchanged**: `hits n=<count> <rec> ...` on one line,
+  `<rec>` =
+  `<instr>:<pc>:<d0>:<d1>:<a0>:<a1>:<sp>:<stack0..4>:<d2..d7>:<a2..a6>`,
+  hex without `0x`. What changed is that a record is now always the 23
+  fields the comment above the command promises. The parsers in
+  `tools/panel` (none read `hits`; `KEYMAP.md` documents the format) and
+  `out/_agents` (`seqled/probe.py`, `seqled/ledtimer.py`,
+  `seqled/seqcheck.py`, `verifier/gate.py`, `verifier/seqcheck.py`,
+  `samples/scan.py`, `impl-1-bursts-verify0/adv.py`,
+  `impl-3-memory-verify0/instr_cmp.py`) all split the reply on spaces
+  and each record on `:`; a longer record is what they were written for.
+
+### Measured (12 Sep 2026, the same M5 Mac, macOS 26.5; logs under `out/_agents/fix-hits-buf/`)
+
+`hits_len.py` boots the OTLIVE fixture (`--card out/_agents/port/otlive.img
+--mount --set OTLIVE --project PROJECT --internal-clock --rtc 1000000000`),
+watches `0x400622da,0x4009bc76,0x4000ab1a`, taps YES / MIXER / NO / PLAY,
+runs 600 ms and reads `hits` once -- on this tree's build (`build/ot_emu`,
+`cmake --fresh -B out/_agents/fix-hits-buf/build -S tools/emu/ot_emu`,
+Release + LTO as the default configure) and, run only, on the pre-fix
+`out/emu/ot_emu`:
+
+| | `out/emu/ot_emu` (before) | `build/ot_emu` (after) |
+|---|---|---|
+| records | 3982 | 3982 |
+| longest record (chars) | 158 | 181 |
+| records cut at 158 | 36 | 0 |
+| records with fewer than 23 fields | 34 (15 × 20, 11 × 21, 8 × 22) | 0 |
+| records the scripts' `int(x, 16)` parse rejects | 8 | 0 |
+
+(`hits_len_ref.txt`, `hits_len_fix.txt`; the record dumps beside them.)
+The two sets are the same hits in the same order: record by record,
+3946 are byte-identical and the other 36 -- every one a 158-character
+before-record -- are proper prefixes of their after-record, which runs
+159 to 181 characters (`prefix_check.txt`). The first cut one is the
+frame handler with `a6 = 1`: before, `...:ffffff00:` (an empty 23rd
+field); after, `...:ffffff00:1`.
+The earlier instrument logs show the same defect in the wild:
+`out/_agents/impl-3-memory-verify0/instr_ref.txt` has 85 of its 6363
+`hits` records with fewer than 23 fields, and its candidate log the same
+85 -- both binaries of that comparison were cut identically, which is why
+the O15c gate could not see it. `ctest` in `build/`: 7/7 (`ctest.txt`).
+
+### What it does not do
+
+- It does not touch `out/emu/ot_emu` or `out/emu/ot_emu.ref-1e76ac5`:
+  the build is under `out/_agents/fix-hits-buf/build/`; the operator's
+  binary is rebuilt as before
+  (`cmake -B out/emu -S tools/emu/ot_emu && cmake --build out/emu -j8`).
+- A `hits` reply is still one line of unbounded length (the log is capped
+  at 2M records, each now up to 215 bytes); a client needs a line reader,
+  as every script above has.
+- The other replies keep the shared 160-byte `buf`; none was measured
+  against it here. The change is the `hits` record only.
 
 ## Milestone O16b — the DSP step, exact: the pair's per-instruction wrapper trimmed without moving a single interpreted instruction ✅ (12 Sep 2026, branch `panel-ui`)
 
