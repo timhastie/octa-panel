@@ -176,6 +176,19 @@ EMAC-fixed Unicorn (`scripts/build_unicorn.sh`), `vendor/dsp56300` pinned to
   Device sends MAIN L/R to channels 1-2 and CUE L/R to 3-4 of any CoreAudio
   device (BlackHole etc.) via sounddevice; `/audio/devices`, `/audio/output`.
 
+- **Panel UI (13 Sep 2026 late):** the top bar is collapsible (chevron tab;
+  hidden = the stage moves to the top) and holds only the status pills, the
+  phase text and SOUND (the drawer = SOUND ON/OFF); MAP KEYS/EXPORT MAP/RUN
+  buttons and map mode are gone (key_map.json + BUILTIN are the map); the
+  AUDIO POOL drawer opens from the COMPACT FLASH slot; the headphones jack
+  + VOLUME pot are the in-app monitor, takes are saved from the app's Audio
+  menu. Encoder PUSH = key-matrix row 0x27, bit = encoder (A-F 0-5, LEVEL
+  6): `/knob/press?row=` — a double-click on an encoder while a trig is
+  held (Shift-latched) sends it, which removes that step's parameter lock
+  (manual 12.5); a push on an unlocked parameter sets a lock (firmware
+  toggle). Rear edge shows only HEAD-PHONES, MAIN/CUE OUT, INPUT A B/C D
+  and the card slot.
+
 ## Repo / process rules that matter
 
 - **No Elektron bytes in git**: `out/`, `downloads/`, `vendor/`, `.venv/` are

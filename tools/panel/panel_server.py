@@ -2777,6 +2777,43 @@ class Panel:
             return False, {"note": str(res)}
         return bool(res.get("ok")), res
 
+    KNOB_PUSH_ROW = 0x27    # the encoders' push switches: key-matrix row 0x27, bit = encoder index
+
+    def knob_press(self, row, hold=60.0):
+        """The encoder's PUSH switch. The panel scanner reports it as a key
+        in matrix row 0x27, bit = the encoder's index (A-F = bits 0-5, LEVEL
+        = bit 6; the descriptor table at [0x46c901dc] carries key codes
+        0x38-0x3f for that row): found 13 Sep 2026, KEYMAP.md "The encoder
+        push". Down, `hold` ms of firmware, up -- through _key_act, so a
+        TRIG key held on rows 0x20/0x21 (a page chord or /key) stays held
+        around it. With a trig held in GRID RECORDING the push TOGGLES that
+        step's lock on the parameter this encoder edits: removes it, or
+        sets one at the current value when there is none (measured on the
+        OTLIVE fixture: PTCH lock 0x45 -> 0xff on the push, 0xff -> 0x40 on
+        the next), as the unit's [TRIG] + knob press does (manual 12.5); with
+        a SCENE key held it removes that parameter's scene lock (manual
+        10.3.1). Bare, it only nudges a redraw."""
+        if not (0x30 <= row < 0x37):
+            return False, {"note": "encoder rows are 0x30-0x36"}
+        bit = row - 0x30
+        hold = max(10.0, min(float(hold), 2000.0))
+        def act(rt):
+            st = self.row_state or {}
+            held = [f"{r:#04x}={m:#04x}" for r, m in sorted(st.items()) if m and r != self.KNOB_PUSH_ROW]
+            trig = any(st.get(r, 0) for r in (0x20, 0x21))
+            scene = bool(st.get(0x23, 0) & 0x06)
+            a = self._key_act(rt, self.KNOB_PUSH_ROW, bit, True, run_ms=hold)
+            b = self._key_act(rt, self.KNOB_PUSH_ROW, bit, False, run_ms=50.0)
+            note = ("with a TRIG key held: the step's lock on this parameter is toggled (removed; set at the current value if there was none)" if trig
+                    else "with a SCENE key held: the parameter's scene lock is removed" if scene
+                    else "no TRIG or SCENE key held: nothing is locked or unlocked (the firmware only redraws)")
+            return {"row": f"{row:#04x}", "bit": bit, "cell": f"{self.KNOB_PUSH_ROW:#04x}.{bit}", "hold_ms": hold,
+                    "sent": [a, b], "held": held, "trig_held": trig, "scene_held": scene, "note": note}
+        ok, res = self.do(act, timeout=120)
+        if not ok:
+            return False, {"note": str(res)}
+        return True, res
+
     def xfader(self, pos=None):
         """The crossfader. `pos` 0..127 (0 = leftmost = scene A, 127 =
         rightmost = scene B, the same scale as MIDI CC 48) is sent the way
@@ -3813,6 +3850,13 @@ class Handler(BaseHTTPRequestHandler):
             # init value, through the firmware (detent reports): the page's
             # double-click. ok:false + note where the page is not mapped.
             ok, res = p.knob_reset(int(args.get("row", "-1"), 0))
+            self._json({"ok": ok, **res})
+        elif path == "/knob/press":
+            # the encoder's push switch (matrix row 0x27, bit = encoder index):
+            # down, ?hold= ms (60), up. With a TRIG key held (/key or the page's
+            # latched chord) in GRID RECORDING it toggles that step's lock on
+            # the parameter the encoder edits -- the unit's [TRIG] + knob press.
+            ok, res = p.knob_press(int(args.get("row", "-1"), 0), hold=float(args.get("hold", "60")))
             self._json({"ok": ok, **res})
         elif path == "/xfader":
             # the crossfader: ?pos=0..127 (0 = scene A / left, 127 = scene B /

@@ -16,7 +16,7 @@
 
   /* ---- toolbar (outside the unit) ---- */
   #top { flex:none; background:#121214; border-bottom:1px solid #232326; }
-  #bar { display:flex; flex-wrap:wrap; align-items:center; gap:6px 8px; padding:5px 10px; min-height:22px; font-size:11px; }
+  #bar { display:flex; flex-wrap:wrap; align-items:center; gap:6px 8px; padding:5px 56px 5px 10px; min-height:22px; font-size:11px; }   /* right: room for #topbtn */
   #bar .brand { color:#6f6d68; letter-spacing:.25em; font-size:10px; font-weight:600; }
   #bar .img { color:#bdbab2; font-family:ui-monospace, Menlo, monospace; font-size:10px; }
   #phase { padding:1px 8px; border-radius:9px; font-size:10px; background:#2a2a2c; color:#bdbab2; }
@@ -34,23 +34,14 @@
   #bar button.on { background:#7a5a18; border-color:#e8b23a; }
   #hint { flex:1 1 260px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
           color:var(--dim); font-size:11px; line-height:22px; margin-left:4px; }   /* wraps to its own line when squeezed */
-
-  /* ---- MAP KEYS drawer: matrix rows 0x20-0x2f as columns, bits as rows,
-          plus the seven encoder rows 0x30-0x36 for knob binding ---- */
-  #drawer { display:none; padding:6px 10px 8px; border-top:1px solid #232326; overflow-x:auto; }
-  #drawer.open { display:block; }
-  #drawer .note { font-size:10px; color:var(--dim); margin-bottom:5px; max-width:1100px; }
-  #matrix { display:grid; grid-template-columns:auto repeat(16, 1fr); gap:3px; min-width:860px; }
-  #encoders { display:grid; grid-template-columns:auto repeat(7, 1fr); gap:3px; width:460px; margin-top:6px; }
-  .tk { background:#2a2a2d; border:1px solid #3e3e42; border-radius:3px; padding:2px 3px; font-size:9px;
-        text-align:center; cursor:pointer; color:#bdbab2; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
-  .tk:hover { background:#3c3c42; }
-  .tk.named { border-color:#6f8f52; color:#d5dfc8; }
-  .tk.enc { border-color:#4d5a78; }
-  .tk.enc.named { border-color:#7f8fc0; }
-  .hdr { font-size:9px; color:var(--dim); align-self:center; text-align:center; white-space:nowrap; }
-  #export { display:none; width:100%; height:80px; margin-top:6px; background:#0d0d0e; color:#bdbab2;
-            border:1px solid #3e3e42; font:10px ui-monospace, Menlo, monospace; box-sizing:border-box; }
+  /* the bar's toggle (13 Sep 2026): a thin chevron tab at the top edge, there in both
+     states; body.nobar hides #top (bar + drawers) and #view takes the whole window */
+  #topbtn { position:absolute; top:0; right:14px; z-index:20; width:34px; height:11px; border-radius:0 0 6px 6px;
+            background:#2c2c2e; border:1px solid #47474a; border-top:0; color:#9a978e; font-size:7px; line-height:10px;
+            text-align:center; cursor:pointer; user-select:none; -webkit-user-select:none; }
+  #topbtn:hover { background:#38383a; color:#e8e6df; }
+  #topbtn::after { content:""; position:absolute; inset:-2px -8px -8px; }   /* an easier target than the 11 px tab itself */
+  body.nobar #top { display:none; }
 
   /* ---- AUDIO POOL drawer: the card's AUDIO folder (GET /samples), opened by
           clicking the COMPACT FLASH slot on the rear edge (or its toolbar button) ---- */
@@ -115,12 +106,12 @@
      slot and label -- click opens the AUDIO POOL drawer, files dropped on it
      go to the pool. .ejected pulls the card out while the unit reboots. */
   #card { cursor:pointer; border-radius:4px; }
-  #card .slot { position:absolute; left:27px; top:9px; width:46px; height:7px; border-radius:2px;
+  #card .slot { position:absolute; left:27px; top:5px; width:46px; height:7px; border-radius:2px;
                 background:linear-gradient(#3a3a3d, #202022); border:1px solid #4a4a4d; box-sizing:border-box; }
-  #card .cf { position:absolute; left:31px; top:5px; width:38px; height:5px; border-radius:1px 1px 0 0;
+  #card .cf { position:absolute; left:31px; top:1px; width:38px; height:5px; border-radius:1px 1px 0 0;
               background:linear-gradient(#2f6396, #1d4269); border:1px solid #0e2338; border-bottom:0;
               box-sizing:border-box; transition:top .3s; }
-  #card.ejected .cf { top:-3px; }
+  #card.ejected .cf { top:-7px; }
   #card:hover .slot, #card.open .slot { border-color:#e8b23a; box-shadow:0 0 6px rgba(232,178,58,.45); }
   #card.drop { background:rgba(98,224,106,.1); }
   #card.drop .slot { border-color:#8fe39a; box-shadow:0 0 8px rgba(98,224,106,.6); }
@@ -152,40 +143,22 @@
   .knob.pot { cursor:ns-resize; }
   .knob.pot:hover { box-shadow:0 0 0 1px #1a1a1b, 0 3px 6px rgba(0,0,0,.75), inset 0 1px 0 rgba(255,255,255,.12), 0 0 0 2px rgba(232,178,58,.35); }
 
-  /* ---- MONITOR drawer: the HEAD-PHONES monitor, the takes (GET /audio/status),
-          SOUND ON/OFF (GET /audio/enable) -- opened by the toolbar button or the jack ---- */
+  /* ---- SOUND drawer: SOUND ON/OFF (GET /audio/enable) with its state line -- opened by
+          the toolbar button. The HEAD-PHONES jack, VOLUME and the meter beside the jack are
+          the listening controls (below); the takes are the server's, saved from the app's
+          Audio menu (13 Sep 2026: the drawer's plug button, readouts and takes list went). ---- */
   #mon { display:none; padding:6px 10px 8px; border-top:1px solid #232326; }
   #mon.open { display:block; }
-  #mon .note { font-size:10px; color:var(--dim); margin-bottom:6px; max-width:1100px; }
-  #mon .note b { color:#bdbab2; }
   #monrow { display:flex; gap:14px; align-items:flex-start; flex-wrap:wrap; font-size:10px; }
   #monside { flex:0 1 440px; min-width:280px; display:flex; flex-direction:column; gap:6px; }
-  #monside button, #takes button { background:#2c2c2e; color:#d8d5cc; border:1px solid #47474a; border-radius:4px;
-                                   padding:3px 10px; font-size:10px; cursor:pointer; letter-spacing:.04em; }
-  #monside button:hover, #takes button:hover { background:#38383a; }
-  #monside button:disabled, #takes button:disabled { opacity:.45; cursor:default; }
-  #plugbtn.on { background:#7a5a18; border-color:#e8b23a; }
+  #monside button { background:#2c2c2e; color:#d8d5cc; border:1px solid #47474a; border-radius:4px;
+                    padding:3px 10px; font-size:10px; cursor:pointer; letter-spacing:.04em; }
+  #monside button:hover { background:#38383a; }
+  #monside button:disabled { opacity:.45; cursor:default; }
   #soundbtn.armed { background:#b8261f !important; border-color:#d02b26 !important; color:#fff; }
   #monstate { color:var(--dim); line-height:13px; min-height:26px; }   /* two lines reserved: the sound-off message
-                                                                          wraps, and the buttons below must not move */
+                                                                          wraps, and the button below must not move */
   #monstate.off { color:#f0c85a; }
-  #monread { color:#bdbab2; font-family:ui-monospace, Menlo, monospace; }
-  #recdot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#2b2b2b;
-            box-shadow:inset 0 0 0 1px #3a3a3a; vertical-align:-1px; margin-right:5px; }
-  #recdot.on { background:#ff4d3c; box-shadow:0 0 6px 1px rgba(255,77,60,.65); animation:recblink 1s steps(2) infinite; }
-  @keyframes recblink { to { opacity:.35; } }
-  #takes { flex:1 1 400px; min-width:0; max-height:190px; overflow:auto; background:#0d0d0e; border:1px solid #2a2a2d; border-radius:3px; }
-  .take { display:grid; grid-template-columns:70px 56px 1fr auto auto; gap:0 12px; align-items:center; padding:2px 8px;
-          border-bottom:1px solid #1a1a1c; font-size:10px; }
-  .take:last-child { border-bottom:0; }
-  .take.h { color:var(--dim); position:sticky; top:0; background:#131315; }
-  .take .n { font-family:ui-monospace, Menlo, monospace; color:#d8d5cc; white-space:nowrap; }
-  .take .s { text-align:right; color:#bdbab2; font-family:ui-monospace, Menlo, monospace; }
-  .take .st { color:#bdbab2; }
-  .take.rec .n, .take.rec .st { color:#f0c85a; }
-  .take a { color:#8fe39a; text-decoration:none; letter-spacing:.04em; }
-  .take a:hover { text-decoration:underline; }
-  .take button { padding:0 6px !important; font-size:9px !important; }
 
   /* labels: white 10px caps, function (shifted) labels red 9px */
   .lb { color:var(--txt); font-size:10px; letter-spacing:.02em; white-space:nowrap; text-transform:uppercase;
@@ -197,8 +170,12 @@
   .lb.title { font-size:9px; color:#5c5c5e; letter-spacing:.32em; }
   .lb.left { transform:translate(0,-50%); }
   .lb.right { transform:translate(-100%,-50%); }
+  /* the FUNCTION legend: the red square (red labels are FUNC + key) and the word as ONE group,
+     centred under the key like every other label (13 Sep 2026; the square used to sit beside
+     a label centred 24 px right of the key) */
+  .lb.grp { display:flex; align-items:center; gap:4px; }
   .rule { height:1px; background:var(--red); }
-  .sw { width:8px; height:8px; background:var(--red); border-radius:1px; }
+  .sw { width:8px; height:8px; background:var(--red); border-radius:1px; flex:none; }
   .pillb { height:13px; border:1px solid #c9c7c0; border-radius:7px; color:var(--txt); font-size:7.5px;
            display:flex; align-items:center; justify-content:center; text-transform:uppercase;
            letter-spacing:.03em; line-height:1; white-space:nowrap; }
@@ -223,8 +200,6 @@
      pressed look plus a faded green tint until Shift is released */
   .k.held::after { content:""; position:absolute; inset:0; border-radius:inherit;
                    background:rgba(98,224,106,.45); pointer-events:none; }
-  body.mapping .k.unmapped { outline:1px dashed rgba(232,178,58,.55); outline-offset:-3px; }
-  .k.selecting, .knob.selecting { outline:2px solid #e8b23a !important; outline-offset:2px; }
 
   /* knobs: dark cap, lighter skirt ring, white indicator at 12 o'clock.
      The cap is rotated in JS: a live encoder is ENDLESS like the unit's (15 deg per
@@ -270,12 +245,10 @@
              border:1px solid #1a1a1a; box-shadow:0 2px 4px rgba(0,0,0,.8), inset 0 1px 0 rgba(255,255,255,.4); }
   #fhandle::after { content:""; position:absolute; left:3px; right:3px; top:22px; height:3px; background:#3a3a38; border-radius:1px; }
   #fhandle:hover, #fbed:hover ~ #fhandle, #fhandle.focus { box-shadow:0 2px 4px rgba(0,0,0,.8), inset 0 1px 0 rgba(255,255,255,.4), 0 0 0 2px rgba(232,178,58,.35); }
-  #fpos { left:1032px; top:527px; width:208px; text-align:center; color:#d8d5cc; font-size:9px; letter-spacing:.06em;
-          text-transform:uppercase; pointer-events:none; }
-  #fpos b { color:#e8b23a; }
 </style>
 </head>
 <body>
+<div id="topbtn" onclick="toggleBar()">&#9650;</div>
 <div id="top">
   <div id="bar">
     <span class="brand">VIRTUAL PANEL</span>
@@ -283,23 +256,8 @@
     <span id="phase">…</span>
     <span id="rt" title="x real time: emulated ms per wall s over the last second / 1000 (the unit's own clock = 1.00x)"></span>
     <span id="fault"></span>
-    <button id="mapbtn" onclick="toggleMap()">MAP KEYS</button>
-    <button id="poolbtn" onclick="togglePool()" title="the card's AUDIO folder (also: click the COMPACT FLASH slot)">AUDIO POOL</button>
-    <button id="monbtn" onclick="toggleMon()" title="the HEAD-PHONES monitor: listen to the unit's main out, replay or save takes, sound on/off (also: click the HEAD-PHONES jack)">MONITOR</button>
-    <button onclick="doRun(1000)">RUN 1s</button>
-    <button onclick="doRun(5000)">RUN 5s</button>
-    <button onclick="exportMap()">EXPORT MAP</button>
+    <button id="monbtn" onclick="toggleMon()" title="sound on/off: reboot the unit with or without the DSP cores (listening: click the HEAD-PHONES jack, VOLUME is its gain)">SOUND</button>
     <span id="hint"></span>
-  </div>
-  <div id="drawer">
-    <div class="note">
-      The key matrix: events to the firmware are &lt;row&gt;&lt;column-bits&gt; on the panel UART.
-      Click a cell to tap that key (an encoder cell turns it +1) and watch the screen; to bind,
-      click a panel key or knob first (it highlights), then the cell that drives it. Bindings persist in this browser.
-    </div>
-    <div id="matrix"></div>
-    <div id="encoders"></div>
-    <textarea id="export" readonly spellcheck="false"></textarea>
   </div>
   <div id="pool">
     <div class="note">
@@ -327,22 +285,11 @@
     </div>
   </div>
   <div id="mon">
-    <div class="note">
-      <b>HEAD-PHONES &middot; MONITOR</b> &mdash; the unit's main out (DSP core 0, L/R, 16-bit 44.1 kHz), drained by the
-      server from the emulator into a ring of frames. Click the jack to plug the headphones in and listen; <b>VOLUME</b> is
-      the monitor's gain (nothing of it reaches the firmware &mdash; the unit's pot is analogue, after the DAC). The emulator
-      renders ~9x slower than real time while the sequencer plays, so listening is <i>behind</i> and comes in bursts (each
-      burst waits for 300 ms of sound); a <b>take</b> &mdash; PLAY to STOP, what the unit played &mdash; replays at real time.
-    </div>
     <div id="monrow">
       <div id="monside">
         <div id="monstate">&hellip;</div>
-        <div><button id="plugbtn" onclick="monToggle()">PLUG IN</button> <span id="monread">unplugged</span></div>
-        <div>gain <b id="mongain">75 %</b> <span style="color:var(--dim)">(the VOLUME pot: wheel or drag turns it, double-click returns to 75 %)</span></div>
-        <div><span id="recdot"></span><span id="rectext">no take open</span></div>
         <div><button id="soundbtn" onclick="soundToggle()">SOUND OFF</button> <span id="soundphase"></span></div>
       </div>
-      <div id="takes"></div>
     </div>
   </div>
 </div>
@@ -404,30 +351,36 @@ const KNOBS = [
   ["d", 1109, 322, 26, true], ["e", 1207, 322, 26, true], ["f", 1305, 322, 26, true],
 ];
 // labels: text, x, y, class ("" white 10px, r red 9px, s 8px, t 7px, j jack, title)
+// Label spacing (13 Sep 2026): a label's line box starts 14 px below the
+// control's OUTER edge (a knob's ring, a key's rim) -- centre = edge + 19 for
+// the 10 px caps, +18.5 red 9 px, +18 small 8 px; a red second line sits 12 px
+// under the first. The soft keys (FUNCTION/CUE, PATTERN/BANK) get 16 px. The
+// two exceptions: ENTER/YES and EXIT/NO are 8 px at 8 px from their key
+// (there are 21 px between the YES and NO keys, the hardware's pitch), and
+// the page-key names stay ABOVE their keys as on the unit.
 const LABELS = [
   ...[["Head-phones", 120], ["Main Out", 190], ["Cue Out", 262], ["Input A B", 335], ["Input C D", 405],
-      ["MIDI In", 490], ["MIDI Out", 568], ["MIDI Thru", 650], ["Compact Flash", 840], ["USB", 1005],
-      ["DC In", 1165], ["Power", 1280]].map(([t, x]) => [t, x, 55, "j"]),
-  ["Card Status", 900, 108, "s"], ["Volume", 143, 205],
+      ["Compact Flash", 840]].map(([t, x]) => [t, x, 55, "j"]),
+  ["Card Status", 900, 110, "s"], ["Volume", 143, 226],
   ["A --- B", 250, 166, "s"], ["C --- D", 318, 166, "s"],
-  ["Record", 253, 262], ["Setup", 253, 276, "r"], ["Record", 318, 262], ["Setup", 318, 276, "r"],
-  ["Mixer", 213, 372], ["Project", 213, 384, "r"], ["MIDI", 315, 372], ["Part", 315, 384, "r"],
-  ["Function", 154, 462], ["Cue", 211, 462], ["Reload", 211, 474, "r"],
-  ["Enter/Yes", 314, 500],
-  ["Pattern", 130, 552], ["Arranger", 130, 566, "r"], ["Bank", 211, 552], ["Edit", 211, 566, "r"],
-  ["Exit/No", 314, 557],
+  ["Record", 253, 271], ["Setup", 253, 283, "r"], ["Record", 318, 271], ["Setup", 318, 283, "r"],
+  ["Mixer", 213, 373], ["Project", 213, 385, "r"], ["MIDI", 315, 373], ["Part", 315, 385, "r"],
+  ["Cue", 211, 464], ["Reload", 211, 476, "r"],          // FUNCTION is the group built below (the red square + the word)
+  ["Enter/Yes", 314, 496, "s"],
+  ["Pattern", 130, 555], ["Arranger", 130, 567, "r"], ["Bank", 211, 555], ["Edit", 211, 567, "r"],
+  ["Exit/No", 314, 553, "s"],
   ...[166, 232, 296, 356].flatMap((y, i) => [["T" + (i + 1), 500, y - 6], ["Mute", 500, y + 7, "r"]]),
   ...[166, 232, 296, 356].flatMap((y, i) => [["T" + (i + 5), 858, y - 6], ["Mute", 858, y + 7, "r"]]),
   ["Virtual Panel", 681, 150, "title"],
   ["Playback", 571, 388], ["Note", 571, 402, "r"], ["Amp", 626, 388], ["Arp", 626, 402, "r"],
   ["LFO", 681, 388], ["LFO", 681, 402, "r"], ["Effect 1", 736, 388], ["Ctrl 1", 736, 402, "r"],
   ["Effect 2", 791, 388], ["Ctrl 2", 791, 402, "r"],
-  ["Copy", 651, 556, "r"], ["Clear", 725, 556, "r"], ["Paste", 798, 556, "r"],
-  ["Level", 1013, 250], ["A", 1109, 250], ["B", 1207, 250], ["C", 1305, 250],
-  ["Tempo", 1013, 350], ["Tap Tempo", 1013, 362, "r"], ["D", 1109, 350], ["E", 1207, 350], ["F", 1305, 350],
-  ["Scene A", 943, 540], ["Mute", 943, 552, "r"], ["Scene B", 1318, 540], ["Mute", 1318, 552, "r"],
+  ["Copy", 651, 558, "r"], ["Clear", 725, 558, "r"], ["Paste", 798, 558, "r"],
+  ["Level", 1013, 264], ["A", 1109, 264], ["B", 1207, 264], ["C", 1305, 264],
+  ["Tempo", 1013, 358], ["Tap Tempo", 1013, 370, "r"], ["D", 1109, 368], ["E", 1207, 368], ["F", 1305, 368],
+  ["Scene A", 943, 547], ["Mute", 943, 559, "r"], ["Scene B", 1318, 547], ["Mute", 1318, 559, "r"],
   ...[...Array(16)].map((_, i) => [String(i + 1), 133 + i * 74.1, 604, "s"]),
-  ["Scale Setup", 1315, 676, "r"],
+  ["Scale Setup", 1315, 678, "r"],
   ["1:4", 1290, 585, "t"], ["2:4", 1310, 585, "t"], ["3:4", 1330, 585, "t"], ["4:4", 1348, 585, "t"],
 ];
 // red rules with a caption break: x1, x2, y, text, text x
@@ -436,9 +389,11 @@ const RULES = [
   [106, 678, 712, "Track Trigs", 390],
   [772, 1272, 712, "Sample/MIDI Trigs", 1000],
 ];
-// rear-edge jacks (decorative, except HEAD-PHONES = the monitor and COMPACT FLASH = the pool), at y 15: x, kind, id
-const JACKS = [[120, 1, "hp"], [190, 2], [262, 2], [335, 2], [405, 2], [490, "din"], [568, "din"], [650, "din"],
-               [840, "cf"], [1005, "usb"], [1165, 1], [1280, "sw"]];
+// rear-edge jacks, centred on the rear-edge bar (the 20 px above the strip, y 10): x, kind, id.
+// HEAD-PHONES is the monitor and COMPACT FLASH the pool; the audio pairs are decorative. MIDI
+// IN/OUT/THRU, USB, DC IN and POWER (no path into the emulator) were removed 13 Sep 2026.
+const JACK_Y = 10;
+const JACKS = [[120, 1, "hp"], [190, 2], [262, 2], [335, 2], [405, 2], [840, "cf"]];
 
 // ---------------- build ----------------
 function el(cls, x, y, w, h) {
@@ -455,12 +410,9 @@ function label(text, x, y, cls = "") {
   S.append(d); return d;
 }
 for (const [x, kind, id] of JACKS) {
-  if (kind === 1) { const j = el("jack", x, 15, 12, 12); if (id) j.id = "jack-" + id; }
-  else if (kind === 2) { el("jack", x - 9, 15, 12, 12); el("jack", x + 9, 15, 12, 12); }
-  else if (kind === "din") el("jack", x, 15, 16, 16);
-  else if (kind === "cf") continue;                       // drawn as #card below the labels (it is a control)
-  else if (kind === "usb") el("jack rect", x, 15, 12, 7);
-  else el("jack rect", x, 15, 16, 9);
+  if (kind === 1) { const j = el("jack", x, JACK_Y, 12, 12); if (id) j.id = "jack-" + id; }
+  else if (kind === 2) { el("jack", x - 9, JACK_Y, 12, 12); el("jack", x + 9, JACK_Y, 12, 12); }
+  // "cf" is drawn as #card below the labels (it is a control)
 }
 for (const [x, y] of [[32, 55], [1385, 55], [32, 700], [1385, 700]]) el("screw", x, y, 14, 14);
 for (const [id, x, y, w, h, shape, col, glyph] of KEYS) {
@@ -488,14 +440,19 @@ for (const [t, x, y, cls] of LABELS) label(t, x, y, cls);
   h.addEventListener("click", () => monToggle());
   h.after($("#jack-hp"));                                   // the jack right after #hp: the CSS sibling rule lights it
                                                             // (it paints over #hp, so CSS gives it pointer-events:none)
-  const vu = el("", 161, 15, 15, 22); vu.id = "vu";
+  const vu = el("", 161, 12, 15, 22); vu.id = "vu";
   for (const ch of ["L", "R"]) {
     const bar = document.createElement("div"); bar.className = "bar"; bar.title = ch;
     for (const cls of ["fill", "pk"]) { const d = document.createElement("div"); d.className = cls; bar.append(d); }
     vu.append(bar);
   }
 }
-el("sw", 122, 462, 8, 8);   // "FUNCTION" legend: red labels are FUNC + key
+{ // the FUNCTION legend as one group (the red square = "red labels are FUNC + key", then the word), centred under the key
+  const g = label("", 130, 464, "grp");
+  const sq = document.createElement("span"); sq.className = "sw";
+  const t = document.createElement("span"); t.textContent = "Function";
+  g.append(sq, t);
+}
 for (const [x1, x2, y, text, tx] of RULES) {
   const l = label(text, tx, y, "r");
   const half = l.offsetWidth / 2 + 5;
@@ -503,16 +460,15 @@ for (const [x1, x2, y, text, tx] of RULES) {
   const b = el("rule"); b.style.left = (tx + half) + "px"; b.style.top = y + "px"; b.style.width = (x2 - tx - half) + "px";
 }
 for (let i = 0; i < 16; i++) { // bank / track pills under the trig keys
-  const p = el("pillb", 133 + i * 74.1, 690, 36, 13);
+  const p = el("pillb", 133 + i * 74.1, 693, 36, 13);
   p.innerHTML = `<b>${"ABCDEFGHIJKLMNOP"[i]}</b>T${(i % 8) + 1}`;
 }
-{ // crossfader tick marks, and the position readout under the bed
+{ // crossfader tick marks (the position is in the fader's tooltip; the readout under the bed went 13 Sep 2026)
   const bed = $("#fbed");
   for (let i = 0; i <= 10; i++) for (const top of [3, 32]) {
     const t = document.createElement("div"); t.className = "tick";
     t.style.left = (8 + i * 19.1) + "px"; t.style.top = top + "px"; bed.append(t);
   }
-  const r = document.createElement("div"); r.id = "fpos"; r.textContent = "crossfader"; S.append(r);
 }
 
 // ---------------- fit the stage to the window ----------------
@@ -524,16 +480,36 @@ function fit() {
 window.addEventListener("resize", fit);
 if (window.ResizeObserver) new ResizeObserver(fit).observe($("#view"));   // the toolbar re-wrapping changes the view too
 
+// ---------------- the top bar: collapsible (13 Sep 2026) ----------------
+// #topbtn is a thin chevron tab at the top edge, there in both states; hidden
+// = body.nobar (the bar and its drawers go, #view takes the window and fit()
+// rescales the stage). Remembered in localStorage ("otpanel.bar"), default
+// shown; a drawer opening while the bar is hidden shows it again.
+let barShown = true;
+try { barShown = localStorage.getItem("otpanel.bar") !== "hidden"; } catch (e) {}
+function drawBar() {
+  document.body.classList.toggle("nobar", !barShown);
+  const b = $("#topbtn");
+  b.textContent = barShown ? "\u25b2" : "\u25bc";
+  b.title = barShown ? "hide the top bar (the panel takes the whole window)" : "show the top bar (status, SOUND, the drawers)";
+  fit();
+}
+function toggleBar(show) {
+  barShown = show === undefined ? !barShown : !!show;
+  try { localStorage.setItem("otpanel.bar", barShown ? "shown" : "hidden"); } catch (e) {}
+  drawBar();
+}
+
 // ---------------- the map ----------------
-// data-driven key map: id -> [row, bit]; discovered entries ship here,
-// /map (tools/panel/key_map.json) layers over it, and the MAP drawer's
-// bindings (localStorage) over both.
+// data-driven key map: id -> [row, bit]; the first discovered entries ship
+// here and /map (tools/panel/key_map.json, the source of the whole map:
+// keys, knobs, LEDs) layers over them. The MAP KEYS drawer (click-to-bind
+// cells, localStorage overrides, EXPORT MAP) went 13 Sep 2026: edit
+// key_map.json instead.
 const BUILTIN = {
   // Confirmed 10 Sep 2026 by driving the emulated firmware and reading the
   // screen it drew. These are top-level screen keys; in-field editing uses
   // held-modifier chords (e.g. a FUNC row held while a value key taps).
-  // The rest are still unidentified -- use MAP KEYS to bind them, then
-  // EXPORT MAP and send the JSON as a PR to seed key_map.json.
   mixer:   [0x26, 0],   // opens MIXER
   yes:     [0x26, 1],   // ENTER/YES: confirms SET DATE/TIME (writes the RTC)
   right:   [0x24, 1],   // cursor right (moves the date field)
@@ -544,27 +520,23 @@ const BUILTIN = {
   ...Object.fromEntries([...Array(8)].map((_, i) => ["t" + (i + 1), [0x22, i]])),
 };
 let mapKeys = {}, mapKnobs = {}, mapLeds = {};   // from /map
-let overrides = {}, knobOverrides = {};          // from the drawer (localStorage)
-try { overrides = JSON.parse(localStorage.getItem("otpanel.matrix") || "{}"); } catch (e) {}
-try { knobOverrides = JSON.parse(localStorage.getItem("otpanel.knobs") || "{}"); } catch (e) {}
-let mapMode = false, selecting = null;
 
 const hint = m => { $("#hint").textContent = m; };
 const hex = n => "0x" + n.toString(16);
-function keyOf(el) { const id = el.dataset.id; return overrides[id] || mapKeys[id] || BUILTIN[id] || null; }
-function rowOfKnob(el) { const id = el.dataset.id; const r = knobOverrides[id] ?? mapKnobs[id]; return r == null ? null : +r; }
+function keyOf(el) { const id = el.dataset.id; return mapKeys[id] || BUILTIN[id] || null; }
+function rowOfKnob(el) { const id = el.dataset.id; const r = mapKnobs[id]; return r == null ? null : +r; }
 
 function refreshMapped() {
   document.querySelectorAll(".k[data-id]").forEach(el => {
     const k = keyOf(el);
     el.classList.toggle("unmapped", !k);
-    el.title = k ? `${el.dataset.id}: row ${hex(k[0])} bit ${k[1]}` : `${el.dataset.id}: unmapped — use MAP KEYS`;
+    el.title = k ? `${el.dataset.id}: row ${hex(k[0])} bit ${k[1]}` : `${el.dataset.id}: not in key_map.json`;
   });
   document.querySelectorAll(".knob").forEach(el => {
     const r = rowOfKnob(el);
     el.title = !el.classList.contains("live") ? potTitle()
-             : r != null ? `${el.dataset.id}: encoder row ${hex(r)} — endless: wheel/drag turns it (every detent goes to the firmware); double-click sets the parameter it controls on the current page back to its init value (through the firmware)`
-             : `${el.dataset.id}: unmapped — use MAP KEYS`;
+             : r != null ? `${el.dataset.id}: encoder row ${hex(r)} — endless: wheel/drag turns it (every detent goes to the firmware); double-click sets the parameter it controls on the current page back to its init value (through the firmware); with a TRIG key held (Shift-click latches it) a double-click is the encoder's PUSH (matrix 0x27.${r - 0x30}): it removes that step's lock on this parameter, as [TRIG] + knob press does on the unit (toggle: with no lock it sets one at the current value)`
+             : `${el.dataset.id}: not in key_map.json`;
   });
 }
 
@@ -594,7 +566,6 @@ document.addEventListener("mousedown", e => {
   const el = e.target.closest(".k[data-id]");
   if (!el) return;
   e.preventDefault();
-  if (mapMode) { select(el); return; }
   const k = keyOf(el);
   if (!k) {
     // transport has a proven fallback: the firmware's own key handlers
@@ -604,7 +575,7 @@ document.addEventListener("mousedown", e => {
       fetch(`/transport?k=${t}`).then(x => x.json()).then(r => hint(`${t.toUpperCase()} via key handler: ${r.result}`));
       return;
     }
-    hint(`"${el.dataset.id}" is unmapped — use MAP KEYS`); return;
+    hint(`"${el.dataset.id}" is not in key_map.json`); return;
   }
   if (el.classList.contains("held")) {         // already down at the firmware: this click lets go
     el.classList.remove("held"); sendKey(k[0], k[1], false); return;
@@ -620,7 +591,7 @@ document.addEventListener("mouseup", () => {
   document.querySelectorAll(".k.down").forEach(el => {
     el.classList.remove("down");
     const k = keyOf(el);
-    if (k && !mapMode) sendKey(k[0], k[1], false);
+    if (k) sendKey(k[0], k[1], false);
   });
 });
 function releaseHeld() {
@@ -640,12 +611,6 @@ document.addEventListener("keyup", e => {
   if (e.key === "Shift") { shiftHeld = false; releaseHeld(); }
 });
 window.addEventListener("blur", () => { shiftHeld = false; releaseHeld(); });   // the keyup would never reach us
-function select(el) {
-  document.querySelectorAll(".selecting").forEach(x => x.classList.remove("selecting"));
-  selecting = el; el.classList.add("selecting");
-  const knob = el.classList.contains("knob");
-  hint(`selected "${el.dataset.id}" — click ${knob ? "an encoder cell (0x30-0x36)" : "a matrix cell"} to bind`);
-}
 
 // encoders: wheel or vertical drag over a knob = detents on its matrix row.
 // Turns are coalesced (80 ms) since every /knob costs a 30 ms emulator run.
@@ -664,6 +629,14 @@ function select(el) {
 // "Encoders" section of 13 Sep 2026, tools/panel/param_map.json); on a
 // SETUP page, a menu or the MIXER the server answers ok:false and sends
 // nothing. The indicator returns to 12 o'clock as the cue.
+// DOUBLE-CLICK WITH A TRIG KEY HELD (Shift-click latches it, or the key is
+// down) = the encoder's PUSH SWITCH instead: /knob/press sends the panel's
+// own report for it -- key-matrix row 0x27, bit = the encoder (A-F = 0-5,
+// LEVEL = 6; found 13 Sep 2026, KEYMAP.md "The encoder push") -- and the
+// firmware toggles that step's lock on the parameter: [TRIG] + knob press
+// on the unit (manual 12.5, "remove a single parameter lock"). Measured:
+// the lock byte 0x45 -> 0xff, the inverted box back to normal, the trig
+// kept; a push with no lock there sets one at the current value.
 const DEG_PER_DETENT = 15, REPORT_MAX = 64;
 const signed = n => (n > 0 ? "+" : "") + n;
 function drawKnob(el) {
@@ -674,7 +647,7 @@ const pending = new Map();
 function turn(el, detents) {
   if (!detents) return;
   const row = rowOfKnob(el);
-  if (row == null) { hint(`"${el.dataset.id}" knob is unmapped — use MAP KEYS`); return; }
+  if (row == null) { hint(`"${el.dataset.id}" knob is not in key_map.json`); return; }
   el.dataset.pos = +el.dataset.pos + detents;
   drawKnob(el);
   const p = pending.get(el) || {n: 0, timer: 0};
@@ -685,17 +658,32 @@ function turn(el, detents) {
   }, 80);
   pending.set(el, p);
 }
+async function flushTurn(el, row) {                        // what the wheel left in the 80 ms coalescer goes out first
+  const p = pending.get(el);
+  if (p) { clearTimeout(p.timer); pending.delete(el); if (p.n) await sendKnob(row, p.n); }
+}
 async function resetKnob(el) {
   const row = rowOfKnob(el);
-  if (row == null) { hint(`"${el.dataset.id}" knob is unmapped — use MAP KEYS`); return; }
-  const p = pending.get(el);
-  if (p) { clearTimeout(p.timer); pending.delete(el); if (p.n) await sendKnob(row, p.n); }   // flush what the wheel left
+  if (row == null) { hint(`"${el.dataset.id}" knob is not in key_map.json`); return; }
+  await flushTurn(el, row);
   hint(`${el.dataset.id}: back to init…`);
   const r = await fetch(`/knob/reset?row=${hex(row)}`).then(x => x.json());
   if (r.ok) {
     el.dataset.pos = 0; drawKnob(el);
     hint(`${el.dataset.id}: ${r.name} on ${r.page} (T${r.track}) ${r.before === r.after ? "already at init" : `${r.before} → ${r.after}`} (init ${r.init}, ${r.sent.length} report${r.sent.length === 1 ? "" : "s"} sent)`);
   } else hint(`${el.dataset.id}: not reset — ${r.note}`);
+}
+// a TRIG key (rows 0x20/0x21) latched with Shift-click (.held) or down right now
+function trigHeld() {
+  return [...document.querySelectorAll(".k.held, .k.down")].some(el => { const k = keyOf(el); return !!k && (k[0] === 0x20 || k[0] === 0x21); });
+}
+async function pressKnob(el) {
+  const row = rowOfKnob(el);
+  if (row == null) { hint(`"${el.dataset.id}" knob is not in key_map.json`); return; }
+  await flushTurn(el, row);
+  const r = await fetch(`/knob/press?row=${hex(row)}`).then(x => x.json());
+  if (r.ok) hint(`${el.dataset.id} pressed (matrix ${r.cell}, ${r.hold_ms} ms${r.held && r.held.length ? "; held: " + r.held.join(" ") : ""}) — ${r.note}`);
+  else hint(`${el.dataset.id}: push not sent — ${r.note}`);
 }
 // Track keys: a quick double tap (two clicks) opens the track's sample slot
 // list, as on the unit. The two clicks are two ordinary presses; the server
@@ -706,15 +694,13 @@ document.addEventListener("dblclick", e => {
   const el = e.target.closest(".knob.live");
   if (!el) return;
   e.preventDefault();
-  if (mapMode) return;
-  resetKnob(el);
+  if (trigHeld()) pressKnob(el); else resetKnob(el);      // TRIG held: the push (the lock goes); alone: back to init
 });
 const wheelAcc = new Map();
 document.addEventListener("wheel", e => {
   const el = e.target.closest(".knob.live");
   if (!el) return;
   e.preventDefault();
-  if (mapMode) return;
   // with Shift down (a latched chord: FUNC + encoder) browsers report the
   // vertical wheel as deltaX (Chrome, WebKit); take it when deltaY is 0
   const raw = e.deltaY || (e.shiftKey ? e.deltaX : 0);
@@ -729,7 +715,6 @@ document.addEventListener("mousedown", e => {
   const el = e.target.closest(".knob.live");
   if (!el) return;
   e.preventDefault();
-  if (mapMode) { select(el); return; }
   drag = {el, y: e.clientY};
 });
 document.addEventListener("mousemove", e => {
@@ -747,14 +732,15 @@ document.addEventListener("mouseup", () => { drag = null; });
 // redraws its fader icon. Nothing is remembered here across reloads: the
 // page asks the firmware where the fader is (on load and every few seconds
 // while idle). Drag the handle or click in the bed, wheel over either
-// (Shift = 8 steps), or Left/Right arrows after a click on it.
+// (Shift = 8 steps), or Left/Right arrows after a click on it. The value
+// and the two scenes are in the fader's tooltip (the text readout under the
+// bed went 13 Sep 2026).
 const FADER = {pos: null, want: null, timer: 0, drag: false, focus: false, scenes: ""};
-const FBED = $("#fbed"), FHANDLE = $("#fhandle"), FPOS = $("#fpos");
+const FBED = $("#fbed"), FHANDLE = $("#fhandle");
 const F_LEFT = 1040, F_TRAVEL = 170;      // handle left edge: pos 0 at the slit's left end .. pos 127 at its right end
 function drawFader() {
-  if (FADER.pos == null) { FPOS.textContent = "crossfader"; return; }
+  if (FADER.pos == null) { FHANDLE.title = FBED.title = "CROSSFADER"; return; }
   FHANDLE.style.left = (F_LEFT + FADER.pos / 127 * F_TRAVEL) + "px";
-  FPOS.innerHTML = `A <b>${FADER.pos}</b> B${FADER.scenes}`;
   FHANDLE.title = FBED.title = `CROSSFADER at ${FADER.pos} (0 = scene A, 127 = scene B; = MIDI CC 48)${FADER.scenes} — drag, wheel (Shift ×8) or ←/→ after a click; the firmware morphs the scene locks`;
 }
 async function faderRefresh() {
@@ -788,7 +774,6 @@ function faderPosFromX(clientX) {
 }
 for (const el of [FBED, FHANDLE]) el.addEventListener("mousedown", e => {
   e.preventDefault();
-  if (mapMode) { hint("the crossfader is a pot on the panel board, not a matrix cell — nothing to bind"); return; }
   FADER.drag = true; FADER.focus = true; FHANDLE.classList.add("focus");
   if (el === FBED) setFader(faderPosFromX(e.clientX));
 });
@@ -799,7 +784,7 @@ document.addEventListener("mousedown", e => {
 }, true);
 for (const el of [FBED, FHANDLE]) el.addEventListener("wheel", e => {
   e.preventDefault();
-  if (mapMode || FADER.pos == null) return;
+  if (FADER.pos == null) return;
   const raw = e.deltaY || e.deltaX;
   if (!raw) return;
   setFader(FADER.pos + (raw < 0 ? 1 : -1) * (e.shiftKey ? 8 : 1));   // wheel up = towards B (right)
@@ -811,86 +796,6 @@ document.addEventListener("keydown", e => {
     setFader(FADER.pos + (e.key === "ArrowRight" ? 1 : -1) * (e.shiftKey ? 8 : 1));
   }
 });
-
-// ---------------- MAP KEYS drawer ----------------
-function toggleMap() {
-  mapMode = !mapMode;
-  $("#mapbtn").classList.toggle("on", mapMode);
-  $("#drawer").classList.toggle("open", mapMode);
-  document.body.classList.toggle("mapping", mapMode);
-  if (!mapMode) { selecting = null; $("#export").style.display = "none";
-    document.querySelectorAll(".selecting").forEach(x => x.classList.remove("selecting")); }
-  fit();
-}
-
-function buildMatrix() {
-  const m = $("#matrix"), en = $("#encoders"); m.innerHTML = ""; en.innerHTML = "";
-  const names = {}, knobNames = {};
-  for (const [id, k] of Object.entries({...BUILTIN, ...mapKeys, ...overrides})) names[k[0] + ":" + k[1]] = id;
-  for (const [id, r] of Object.entries({...mapKnobs, ...knobOverrides})) knobNames[+r] = id;
-  const cell = (into, cls, text) => { const d = document.createElement("div"); d.className = cls; d.textContent = text; into.append(d); return d; };
-  const done = () => { selecting.classList.remove("selecting"); selecting = null; buildMatrix(); refreshMapped(); };
-  // matrix rows 0x20-0x2f as columns, bits as rows
-  cell(m, "hdr", "");
-  for (let row = 0x20; row < 0x30; row++) cell(m, "hdr", hex(row));
-  for (let b = 0; b < 8; b++) {
-    cell(m, "hdr", "bit " + b);
-    for (let row = 0x20; row < 0x30; row++) {
-      const name = names[row + ":" + b];
-      const d = cell(m, "tk" + (name ? " named" : ""), name || "·");
-      d.title = `row ${hex(row)} bit ${b}` + (name ? ` = ${name}` : "");
-      d.onclick = async () => {
-        if (selecting && selecting.classList.contains("knob")) { hint("a knob binds to an encoder cell (0x30-0x36)"); return; }
-        if (selecting) {
-          overrides[selecting.dataset.id] = [row, b];
-          localStorage.setItem("otpanel.matrix", JSON.stringify(overrides));
-          hint(`bound "${selecting.dataset.id}" → row ${hex(row)} bit ${b}`);
-          done();
-        } else {
-          await sendKey(row, b, true);
-          await sendKey(row, b, false);
-        }
-      };
-    }
-  }
-  // the seven encoder rows 0x30-0x36 (a turn is an event, not a state)
-  cell(en, "hdr", "encoders");
-  for (let row = 0x30; row < 0x37; row++) {
-    const name = knobNames[row];
-    const d = cell(en, "tk enc" + (name ? " named" : ""), (name ? name + " " : "") + hex(row));
-    d.title = `encoder ${hex(row)}` + (name ? ` = ${name}` : "") + " — click: +1 detent";
-    d.onclick = () => {
-      if (selecting && !selecting.classList.contains("knob")) { hint("a key binds to a matrix cell (0x20-0x2f)"); return; }
-      if (selecting) {
-        knobOverrides[selecting.dataset.id] = row;
-        localStorage.setItem("otpanel.knobs", JSON.stringify(knobOverrides));
-        hint(`bound "${selecting.dataset.id}" → encoder ${hex(row)}`);
-        done();
-      } else sendKnob(row, 1);
-    };
-  }
-}
-
-function exportMap() {
-  // key_map.json shape: {"keys": {id: [row, bit]}, "knobs": {id: row}, "leds": {...}}
-  const out = {keys: {}, knobs: {}};
-  document.querySelectorAll(".k[data-id]").forEach(el => { const k = keyOf(el); if (k) out.keys[el.dataset.id] = k; });
-  document.querySelectorAll(".knob.live").forEach(el => { const r = rowOfKnob(el); if (r != null) out.knobs[el.dataset.id] = r; });
-  if (Object.keys(mapLeds).length) out.leds = mapLeds;
-  const json = JSON.stringify(out, null, 1);
-  const ta = $("#export");
-  if (mapMode) { ta.style.display = "block"; ta.value = json; ta.select(); fit(); }
-  const clip = navigator.clipboard ? navigator.clipboard.writeText(json) : Promise.reject();
-  clip.then(() => hint("panel map JSON copied to clipboard" + (mapMode ? " (and shown below the matrix)" : "")),
-            () => { if (!mapMode) toggleMap(); ta.style.display = "block"; ta.value = json; ta.select(); fit();
-                    hint("clipboard unavailable — the map JSON is selected below the matrix"); });
-}
-
-async function doRun(ms) {
-  hint(`running ${ms} ms of emulated time…`);
-  const r = await fetch(`/run?ms=${ms}`).then(x => x.json());
-  hint(r.ok ? `ran ${ms} ms` : `run failed: ${r.result}`);
-}
 
 // ---------------- AUDIO POOL drawer (the card) ----------------
 // The unit's samples live in the set's AUDIO folder on the card; here the
@@ -914,9 +819,8 @@ const fmtBytes = n => n >= 1e6 ? (n / 1e6).toFixed(1) + " MB" : n >= 1e3 ? Math.
 function togglePool(open) {
   poolOpen = open === undefined ? !poolOpen : !!open;
   $("#pool").classList.toggle("open", poolOpen);
-  $("#poolbtn").classList.toggle("on", poolOpen);
   $("#card").classList.toggle("open", poolOpen);
-  if (poolOpen) loadPool();
+  if (poolOpen) { loadPool(); if (!barShown) toggleBar(true); }   // the drawer lives in the bar
   fit();
 }
 function poolLog(msg, cls = "") {
@@ -1083,11 +987,11 @@ $("#howto").innerHTML = HOWTO;
 // ahead to end - 20 s and says so. VOLUME is the GainNode (0..100 %,
 // remembered in localStorage); nothing of it reaches the firmware -- the
 // unit's pot is analogue, after the DAC. The meter beside the jack reads two
-// AnalyserNodes after the gain. A take (PLAY to STOP, the server's
-// out/_panel_takes_<port>/take-NNN.wav) replays at real time through the
-// same GainNode (decodeAudioData of /audio.wav?take=N) or is saved by its
-// SAVE link (target=_blank: the app intercepts the audio/wav response with
-// a save panel, Chrome downloads it).
+// AnalyserNodes after the gain. Takes (PLAY to STOP, the server's
+// out/_panel_takes_<port>/take-NNN.wav) are recorded server-side and saved
+// from the app's Audio menu; the drawer's takes list (REPLAY / SAVE), plug
+// button and readouts went 13 Sep 2026 -- the drawer is SOUND ON/OFF only,
+// and the jack's tooltip carries the readout.
 const MON_RATE = 44100, MON_POLL_MS = 150, MON_MAX = 88200, MON_STARVE = Math.round(0.3 * MON_RATE),
       MON_SKIP = 20 * MON_RATE, MON_LEAD = 0.05, VOL_DEFAULT = 75;
 const SOUND_OFF_MSG = "sound is off (DSP cores not running): turn it on in the drawer";
@@ -1111,7 +1015,6 @@ function drawPot() {
   POT.querySelector(".cap").style.transform = `rotate(${-SWEEP / 2 + vol * SWEEP / 100}deg)`;
   POT.title = potTitle();
   if (MON.gain) MON.gain.gain.value = vol / 100;
-  $("#mongain").textContent = vol + " %";
 }
 function setVol(v, note = "") {
   const nv = Math.max(0, Math.min(100, Math.round(v)));
@@ -1126,7 +1029,6 @@ document.addEventListener("mousedown", e => {
   const el = e.target.closest(".knob.pot");
   if (!el) return;
   e.preventDefault();
-  if (mapMode) { hint("VOLUME is a pot, not an encoder — nothing to bind"); return; }
   potDrag = {y: e.clientY};
 });
 document.addEventListener("mousemove", e => {
@@ -1140,7 +1042,6 @@ document.addEventListener("wheel", e => {
   const el = e.target.closest(".knob.pot");
   if (!el) return;
   e.preventDefault();
-  if (mapMode) return;
   const raw = e.deltaY || (e.shiftKey ? e.deltaX : 0);
   potAcc += e.deltaMode === 1 ? raw * 20 : raw;
   const d = Math.trunc(potAcc / 20);                    // 1 % per 20 px (a mouse notch = 5 %)
@@ -1151,7 +1052,6 @@ document.addEventListener("dblclick", e => {
   const el = e.target.closest(".knob.pot");
   if (!el) return;
   e.preventDefault();
-  if (mapMode) return;
   if (vol === VOL_DEFAULT) hint(`VOLUME already at ${VOL_DEFAULT} %`); else setVol(VOL_DEFAULT, " (back to the default)");
 });
 
@@ -1266,7 +1166,7 @@ function monToggle() {
   MON.on = true; MON.gen++; MON.from = -1; MON.err = null; MON.skippedAt = 0;
   monDrop();
   monLoop(MON.gen); meterLoop(); refreshAudioStatus();
-  hint("headphones plugged in — the unit's main out, behind and in bursts (the emulator is slower than real time); MONITOR shows how far");
+  hint("headphones plugged in — the unit's main out, behind and in bursts when the emulator is slower than real time (the jack's tooltip says how far)");
   monRender();
 }
 function monStop(why) {
@@ -1301,12 +1201,12 @@ function meterLoop() {
   VU.raf = requestAnimationFrame(tick);
 }
 
-// -- the drawer --
+// -- the SOUND drawer --
 function toggleMon(open) {
   MON.open = open === undefined ? !MON.open : !!open;
   $("#mon").classList.toggle("open", MON.open);
   $("#monbtn").classList.toggle("on", MON.open);
-  if (MON.open) refreshAudioStatus();
+  if (MON.open) { refreshAudioStatus(); if (!barShown) toggleBar(true); }   // the drawer lives in the bar
   monRender(); fit();
 }
 async function refreshAudioStatus() {                      // every second while the drawer is open or the headphones are in
@@ -1314,58 +1214,8 @@ async function refreshAudioStatus() {                      // every second while
   MON.statusBusy = true; clearTimeout(MON.statusTimer);
   try { await audioStatus(); MON.statusErr = null; } catch (e) { MON.statusErr = e.message; }
   MON.statusBusy = false;
-  renderTakes(); monRender();
+  monRender();
   if (MON.open || MON.on) MON.statusTimer = setTimeout(refreshAudioStatus, 1000);
-}
-const pad3 = n => String(n).padStart(3, "0");
-function renderTakes() {
-  const st = MON.status, list = $("#takes"), busy = !!MON.phase && MON.phase !== "ready";
-  const takes = st ? [...(st.takes || [])] : [], cur = st && st.take;
-  list.innerHTML = "";
-  const row = (cls, cells) => {
-    const r = document.createElement("div"); r.className = "take " + cls;
-    for (const [c, v] of cells) { const s = document.createElement("span"); s.className = c; if (v instanceof Node) s.append(v); else s.textContent = v; r.append(s); }
-    list.append(r); return r;
-  };
-  row("h", [["n", "take"], ["s", "length"], ["st", "PLAY opens one, STOP closes it"], ["", ""], ["", ""]]);
-  for (const t of takes) {
-    const active = MON.replay && MON.replay.n === t.n;
-    const rp = document.createElement("button");
-    rp.textContent = active ? (MON.replay.loading ? "LOADING…" : "STOP") : "REPLAY";
-    rp.title = active ? "stop the replay" : `play take ${pad3(t.n)} at real time through the headphones (VOLUME applies)`;
-    rp.disabled = busy; rp.onclick = () => replayTake(t.n);
-    const a = document.createElement("a");
-    a.href = `/audio.wav?take=${t.n}`; a.target = "_blank"; a.textContent = "SAVE";
-    a.title = `octatrack-take-${pad3(t.n)}.wav — the app asks where to save it; a browser downloads it`;
-    row("", [["n", `take ${pad3(t.n)}`], ["s", `${(+t.seconds).toFixed(1)} s`],
-             ["st", active ? (MON.replay.loading ? "loading…" : "replaying at real time") : ""], ["", rp], ["", a]]);
-  }
-  if (cur) row("rec", [["n", `take ${pad3(cur.n)}`], ["s", `${(cur.frames / MON_RATE).toFixed(1)} s`], ["st", "recording (STOP closes it)"], ["", ""], ["", ""]]);
-  if (!takes.length && !cur) row("", [["n", st ? "(no takes yet)" : MON.statusErr ? `takes unavailable: ${MON.statusErr}` : "…"], ["s", ""], ["st", ""], ["", ""], ["", ""]]);
-}
-async function replayTake(n) {
-  if (MON.replay) { const was = MON.replay.n; stopReplay(); if (was === n) return; }
-  let ctx;
-  try { ctx = monCtx(); } catch (e) { hint("replay: " + e.message); return; }
-  MON.replay = {n, src: null, loading: true}; renderTakes();
-  try {
-    const r = await fetch(`/audio.wav?take=${n}`);
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const data = await r.arrayBuffer();
-    const ab = await new Promise((res, rej) => { const p = ctx.decodeAudioData(data, res, rej); if (p && p.then) p.then(res, rej); });
-    if (!MON.replay || MON.replay.n !== n || !MON.replay.loading) return;   // stopped while loading
-    const src = ctx.createBufferSource(); src.buffer = ab; src.connect(MON.gain);
-    src.onended = () => { if (MON.replay && MON.replay.src === src) { MON.replay = null; renderTakes(); monRender(); } };
-    src.start();
-    MON.replay = {n, src, loading: false, seconds: ab.duration};
-    meterLoop(); renderTakes();
-    hint(`replaying take ${pad3(n)} (${ab.duration.toFixed(1)} s) at real time through the headphones`);
-  } catch (e) { MON.replay = null; renderTakes(); hint(`replay of take ${pad3(n)} failed: ${e.message}`); }
-}
-function stopReplay() {
-  const r = MON.replay; MON.replay = null;
-  if (r && r.src) { try { r.src.stop(); } catch (e) {} }
-  renderTakes();
 }
 // SOUND ON/OFF: two clicks like RE-INSERT CARD (the first arms for 5 s); the
 // server reboots the port child with/without --dsp (~1 min / ~40 s), /status
@@ -1400,29 +1250,22 @@ function monPhase(s, phase) {
   // the server says sound:false while a child boots (a re-insert, a sound reboot): only a
   // ready unit without sound pulls the plug, a rebooting one keeps it (the stream resumes)
   if (sound === false && MON.on && !monBusy()) monStop(SOUND_OFF_MSG);
-  if (changed) { monRender(); if (MON.open) renderTakes(); }
+  if (changed) monRender();
 }
 function monRender() {
   const busy = monBusy();
   const hp = $("#hp");
   hp.classList.toggle("plugged", MON.on);
-  hp.title = "HEAD-PHONES — click: " + (MON.on ? `unplug (${monReadout()})` : "plug in and listen to the unit's main out (VOLUME is the gain; MONITOR has the takes)");
+  hp.title = "HEAD-PHONES — click: " + (MON.on ? `unplug (${monReadout()})` : "plug in and listen to the unit's main out (VOLUME is the gain; takes are recorded by the server, PLAY to STOP, and saved from the app's Audio menu)");
   const st = $("#monstate");
   st.classList.toggle("off", !busy && MON.sound === false);
   st.textContent = busy ? `the unit is busy — ${MON.phase}`
                  : MON.sound === false ? SOUND_OFF_MSG + (MON.soundNote ? ` — ${MON.soundNote}` : "")
                  : MON.sound === null ? "sound: unknown (this panel_server.py reports no sound flag)"
-                 : "sound on — while it plays the unit runs ~9x slower than real time (~3x slower than without the DSP cores)";
-  $("#monread").textContent = monReadout();
-  const pb = $("#plugbtn");
-  pb.textContent = MON.on ? "UNPLUG" : "PLUG IN"; pb.classList.toggle("on", MON.on); pb.disabled = !MON.on && (busy || MON.sound === false);
-  const t = MON.status && MON.status.take;
-  $("#recdot").classList.toggle("on", !!(t && t.recording));
-  $("#rectext").textContent = t ? `recording take ${pad3(t.n)} — ${(t.frames / MON_RATE).toFixed(1)} s` : "no take open (PLAY opens one, STOP closes it)";
+                 : "sound on — the DSP cores run; click the HEAD-PHONES jack to listen (VOLUME is the gain)";
   soundLabel();
   $("#soundbtn").disabled = busy || MON.sound === null;
   $("#soundphase").textContent = busy ? MON.phase : MON.statusErr ? `(${MON.statusErr})` : "";
-  $("#mongain").textContent = vol + " %";
 }
 // verification hook, not used by the page itself: window.__monitor.state()
 // (the agents' scripts read it; keep the field names)
@@ -1539,10 +1382,10 @@ async function loadMap() {
     const m = await fetch("/map").then(x => x.json());
     mapKeys = m.keys || {}; mapKnobs = m.knobs || {}; mapLeds = m.leds || {};
   } catch (e) {}
-  buildMatrix(); refreshMapped();
+  refreshMapped();
 }
 
-fit(); loadMap(); poll();
+drawBar(); loadMap(); poll();
 </script>
 </body>
 </html>

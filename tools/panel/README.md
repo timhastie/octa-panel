@@ -34,9 +34,22 @@ Almost every control is wired (`tools/panel/key_map.json`, 47 keys, 7
 encoders and 40 LEDs measured — `KEYMAP.md` has the evidence): keys press,
 encoders turn with the mouse wheel or a vertical drag (endless, as on the
 unit; a double-click puts the parameter the encoder controls back to its
-init value, through the firmware), the crossfader drags (left = scene A,
-right = scene B), LEDs follow the firmware. Unwired: REC AB/CD and SCALE
-SETUP are inferred from their FUNC layers.
+init value, through the firmware, and with a TRIG key held a double-click
+is the encoder's PUSH: it removes that step's lock on the parameter --
+"Parameter locks" below), the crossfader drags (left = scene A, right =
+scene B; its value is in its tooltip), LEDs follow the firmware. Unwired:
+REC AB/CD and SCALE SETUP are inferred from their FUNC layers.
+
+The top bar (13 Sep 2026): the status pills (image, phase, x real time),
+**SOUND** (a drawer with SOUND ON/OFF: reboot the unit with or without the
+DSP cores) and the hint line; the small chevron tab at the top right
+hides the bar so the panel takes the whole window (remembered per
+browser; a drawer opening shows it again). The AUDIO POOL drawer opens
+from the COMPACT FLASH slot on the rear edge; listening is the
+HEAD-PHONES jack (VOLUME is its gain, the meter beside it the level).
+The MAP KEYS / EXPORT MAP / RUN buttons and the drawer's plug button,
+readouts and takes list are gone -- scripts have `/key`, `/knob`, `/run`,
+`/audio.wav?take=N`, and the app's Audio menu saves the takes.
 
 ## What is real, and what it took to find
 
@@ -118,12 +131,15 @@ shared tree).
 
 ## Mapping the rest of the panel
 
-Only a handful of the matrix cells are identified. **MAP KEYS** opens the
-matrix: click a cell to tap that key and watch the screen; to bind a panel
-control, click it (it highlights), then click the cell that drives it. Your
-bindings persist in the browser and **EXPORT MAP** copies them as JSON.
-A completed map, dropped into `BUILTIN` in `panel.html` (or a `key_map.json`
-beside it), is a good PR — it is pure discovery, no firmware bytes.
+`tools/panel/key_map.json` is the map (`keys`: id -> [row, bit] of the
+matrix report; `knobs`: id -> encoder row; `knob_push`: id -> [0x27, bit];
+`leds`: id -> [bitmap row, bit]); the page reads it through `/map` when it
+loads, so an edit needs a reload, not a restart. To probe an unknown cell,
+tap it from a script (`/key?row=0x23&bit=4&down=1`, then `down=0`; an
+encoder `/knob?row=0x36&delta=1`) and read `/screen.txt`, `/leds` and
+`/peek` -- `KEYMAP.md` is the evidence per entry and the method. (The
+click-to-bind MAP KEYS drawer and EXPORT MAP went 13 Sep 2026.) A
+completed entry is a good PR — pure discovery, no firmware bytes.
 
 ## Endpoints (for scripting)
 
@@ -136,6 +152,7 @@ beside it), is a good PR — it is pure discovery, no firmware bytes.
 | `GET /tap?row=0x22&bit=0&n=2&hold=50&gap=150` | `n` presses of one key inside one action (the double-tap chords, see "Loading samples") |
 | `GET /knob?row=0x30&delta=2` | one encoder report (rows 0x30–0x36, signed delta) |
 | `GET /knob/reset?row=0x33` | the parameter this encoder edits on the CURRENT page back to its init value, done by the firmware (detent reports until the page descriptor's default is reached): `{ok, note, knob, name, page, track, addr, before, after, init, range, sent}`; `ok: false` + `note` and nothing sent on a SETUP window, the MIXER, a menu, MIDI mode, or a dead slot (AMP F/XVOL). "Scenes and the crossfader" below, `param_map.json` |
+| `GET /knob/press?row=0x30&hold=60` | the encoder's PUSH switch (key-matrix row 0x27, bit = row - 0x30): down, `hold` ms, up, through the same per-row state as `/key`, so a TRIG key held by `/key` stays held around it -- with a trig held in GRID RECORDING the firmware toggles that step's lock on the parameter the encoder edits (removes it; with none there, sets one at the current value), the unit's [TRIG] + knob press; with a SCENE key held it removes the scene lock. `{ok, row, bit, cell, hold_ms, sent, held, trig_held, scene_held, note}`. "Parameter locks" below |
 | `GET /xfader?pos=64` | the crossfader: `pos` 0..127 (0 = leftmost = scene A, 127 = rightmost = scene B, the MIDI CC 48 scale) goes out as the panel board's own fader report `0x40 <byte>`; without `pos` it only reads. Answers the firmware's value `{ok, pos, xf, cc48, byte, scene_a, scene_b}` (`xf` = the firmware's 0x460d16c8, 127 at A; `scene_a/b` = the Part's assigned scenes, 1-based) |
 | `GET /samples` | the sample pool: `{pool, staged, files: [{name, bytes, format, on_card, removing}], pending, removed, busy, phase, card, card_mode, card_rw, card_ejected}` -- on a persistent card `files` is the image's `<SET>/AUDIO` (read directly, `on_card: true`) plus the pool's pending files |
 | `GET /samples/add?path=<abs>` | copy a Mac file into the pool (converted when needed): `{ok, name, converted, note, format, bytes, pending}` (+ `cmd`, afconvert's argv, when converted) or `{ok: false, error}` |
@@ -396,8 +413,8 @@ took 25.8 s of wall.
 only when the core keeps up; with the DSP cores it plays at ~0.15x real
 time (the toolbar badge beside the phase shows the live figure, green at
 >= 0.97x, yellow below), so anyone *listening* live is behind, and in
-bursts — the page's MONITOR plays what has arrived and waits when it
-runs dry; a replayed take plays at real time. Two more things the fixture taught: `/audio/status peak` at
+bursts — the page's headphones (the HEAD-PHONES jack) play what has
+arrived and wait when it runs dry; a replayed take plays at real time. Two more things the fixture taught: `/audio/status peak` at
 32767 means the DSP itself is clipping (the fixture's slots 1 and 2 loop
 `first-0`/`second-0` at GAIN 75/72 from step 1 — the spike's `tree2`
 copy, `out/_agents/audio/tree2`, has them at 48 with looping off, which
@@ -525,9 +542,9 @@ firmware scales the byte by a calibration record in its boot flash
 rebuilds the morph weights and redraws the fader icon in the LCD's bottom
 right. `/xfader?pos=` sends exactly that byte; the page's fader is a drag
 (the handle, or a click in the bed), a wheel (Shift = 8 steps) or, after a
-click on it, the Left/Right arrows, with the position under it (0 = A at
-the left, 127 = B at the right, the CC 48 value) and the two assigned
-scenes. Nothing is remembered across reloads: the page asks the firmware
+click on it, the Left/Right arrows, with the position (0 = A at the left,
+127 = B at the right, the CC 48 value) and the two assigned scenes in its
+tooltip (the readout under the bed went 13 Sep 2026). Nothing is remembered across reloads: the page asks the firmware
 where the fader is on load and every few seconds while idle.
 
 **The flow, as on the unit** (manual 10.3; every step through the matrix,
@@ -535,7 +552,7 @@ the Shift-click latches a key so one mouse can hold a chord):
 
 1. Shift-click **SCENE A**, click **TRIG 2**, click SCENE A again to let go:
    scene 2 is in slot A (the Part byte `blob+0x8ed90` 0 -> 1, the page's
-   readout under the fader says `scenes 2 / 9`). While SCENE A is held the
+   fader's tooltip says `scenes 2 / 9`). While SCENE A is held the
    trig LEDs show the slots: red = the scene in this slot, green = the
    other slot's (1 and 9 after a load: rows `01 00 02`).
 2. The same with **SCENE B** + **TRIG 3**: `blob+0x8ed91` -> 2.
@@ -578,6 +595,35 @@ The encoders themselves are endless now: no end stops, every detent goes
 out (a wheel burst is capped at +-64 per report), the indicator turns 15
 degrees per detent and returns to 12 o'clock on a reset; VOLUME is a pot
 and unchanged (the monitor's gain, double-click = 75 %).
+
+## Parameter locks
+
+Measured 13 Sep 2026 on the port with the OTLIVE fixture (`out/_agents/plock/`:
+`verify_plock.py` the scripted run, `probe2.py`, `flash_stream.log`; the
+evidence is the last section of `KEYMAP.md`).
+
+**As on the unit** (manual 12.5): REC for GRID RECORDING, hold a [TRIG]
+key of a placed trig and turn a DATA ENTRY knob -- the box inverts with
+the locked value and the trig LED flashes (here: a green blink on the red
+LED twice a second, on the LED stream). **Remove a single lock by holding
+[TRIG] and pressing that knob.** In the page: Shift-click the trig key
+(it latches, green), turn the encoder, then **double-click the encoder
+while the trig is latched** -- that is the encoder's push, sent as
+`/knob/press` (the panel's own report for the push switch: key-matrix row
+`0x27`, bit = the encoder, found this day; the parser has no other push
+message), and the lock goes: the box is drawn normal, the LED stops
+blinking, the trig itself stays. Click the latched trig to let go. A
+double-click with no trig held is still the init-value reset.
+
+The firmware's push is a toggle: a push on a parameter with NO lock on
+that step sets one at the current value (the box inverts), the next push
+removes it -- the page passes that through unchanged. With a SCENE key
+held instead, the push removes the scene lock (manual 10.3.1); LEVEL's
+push is bit 6. Measured: PTCH lock byte `0xff -> 0x45` on the turn,
+`-> 0xff` on the push, the step's trig mask unchanged; the lock bytes are
+`track record + 0x59 + slot` on the PLAYBACK page. TRIG LOCK CLEAR (trig
+held + PLAY, manual 12.9.10) clears all of a trig's locks and is a plain
+chord here (Shift-click the trig, click PLAY).
 
 ## Limits
 

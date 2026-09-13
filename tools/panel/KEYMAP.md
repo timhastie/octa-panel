@@ -58,7 +58,8 @@ Boot ~15 s wall; the project load ~90 s.
   (`E4_main.png`, reached by YES then NO on the dialog) are that popup. It
   sits over the parameter boxes only; no key/LED/RAM measurement depends on
   it.
-- **The panel's key rows are 0x20-0x26 only.** Rows 0x27-0x2f were tapped
+- **The panel's key rows are 0x20-0x26 only** (13 Sep 2026: plus row 0x27 =
+  the encoders' PUSH switches, the last section of this file). Rows 0x27-0x2f were tapped
   on the dialog, the main screen and inside the PROJECT menu (E1 `sw_*`,
   E3 `menu_c27_*`, E4 `27_*`): no RAM, LED or menu-cursor change ever; the
   only effect of 0x27.x is a 2-4 block redraw of the tempo readout (and,
@@ -278,7 +279,9 @@ their `.log`s, `profile_frame_on.txt`, PNGs `S_*` (server), `P_*` `Q_*`
   coalesced deltas beyond +-9 go the wrong way. No modifier is involved:
   FUNC held, the spare cells 0x23.4-7 / 0x26.6-7 / 0x25.3-4 / 0x23.3 held,
   rows 0x27-0x2f, arrows, YES change nothing about it (`lab_pages.log`);
-  no encoder-push cell exists in rows 0x23-0x2f.
+  no encoder-push cell exists in rows 0x23-0x2f (13 Sep 2026: row 0x27 IS the
+  push -- found with a TRIG key held in GRID RECORDING, last section; tapped
+  alone on a SETUP page it changed nothing, as measured here).
 - The display: the edit IS drawn (the RAM buffer `0x460d1f80` changes,
   e.g. `0x460d2136..0x460d21a7` for the AMP box) but **no LCD block is
   sent** -- not within 3 s idle, not after a tap of the non-key cell
@@ -840,3 +843,66 @@ edges, the same as the page sends):
   what changes (midi_re_scene.md). Nothing in the panel needed fixing for
   the flow: the scene keys latch, the chords land, the fader was the
   missing piece.
+
+## 13 Sep 2026: the encoder push -- key-matrix row 0x27, bit = the encoder
+
+The one panel input that was not in the map. On the port with the OTLIVE
+fixture, own server on 8593 (`out/_agents/plock/`: `verify_plock.py` the
+scripted run -- with `--scan` it taps the candidate cells until the lock
+goes, without it uses `/knob/press`; `probe2.py` the toggle / F / LEVEL
+probes; `flash_stream.log` the LED stream; `verify.log`, `verify.json`,
+`S_*.txt` / `P2_*.txt` the screens before and after every step):
+
+- **The parser has no push class.** `0x4009228c` (PANEL_LINK.md) accepts
+  exactly four first bytes: `0x2r` keys (1 payload byte), `0x3r` encoders
+  (1), `0x40` the fader (1), `0x7r` (9); anything else leaves it in its
+  header state (`0x40092350`). An encoder report's byte is ADDED to the
+  pending delta (`0x4009250c`) or posted as the delta (`0x4009254a`), so
+  no value of it can mean "push". The key descriptor table at
+  `[0x46c901dc]` (`0x4610048c` here) starts `ff 80` -- modifier row 0xff,
+  so the ISR's shifted layer (+770) is never used -- then holds one
+  12-byte entry per row 0x20-0x27 x bit 0-7, EVERY one live: `01 <code>
+  01 00 460d17ae 00000000` = type 1, key code = row*8+bit (0x00-0x3f),
+  down 1 / up 0, the UI queue. Rows 0x28+ index the all-zero shifted
+  layer and are dropped. So the only key codes without a panel key are
+  row 0x27's `0x38`-`0x3f` -- which is why a tap there always redrew the
+  tempo readout (the 11 Sep note above): the UI does handle them.
+- **Measured.** GRID RECORDING (REC), TRIG 1 held (the fixture's step 1
+  has a sample trig on T5, mask `.. 01 01`), encoder A +5: the PTCH box
+  inverts (dark pixels 2634 -> 2842) and ONE byte of the 36,568-byte
+  pattern record changes, `0x400e46a1` = the track record (`blob +
+  pattern*0x8ed8 + track*0x91a`, T5 = `0x400e4648`) + 0x59: `0xff` (no
+  lock) -> `0x45` (69 = 64+5, the locked value). Still holding TRIG 1,
+  `27 01` then `27 00` (60 ms apart): the byte is `0xff` again, the box
+  is drawn normal (2634), nothing else in the record moved, and after the
+  release the trig is still there (mask unchanged, LED red). Knob B +5 ->
+  `+0x5a` = `0x05`; `0x27.0` does NOT clear it, `0x27.1` does. Knob F +5
+  -> `+0x5e` = `0x54` (RTIM 79+5); `0x27.4` leaves it, `0x27.5` clears
+  it. The lock bytes: `track record + 0x59 + slot` for the PLAYBACK page
+  (A..F = +0x59..+0x5e), `0xff` = unlocked.
+- **It is a toggle.** A push with NO lock on that parameter sets one at
+  the current value: `0x27.0` on an unlocked PTCH -> `0x40` (64) and the
+  box inverts; the next push -> `0xff`. (`0x27.4` in the F run put an E
+  lock `0x00` = RTRG 0 on the step the same way; pushed again, gone.)
+  The unit's [TRIG] + knob press does this too; the page's gesture
+  inherits it.
+- **LEVEL is bit 6**, measured through a scene lock (TRIG + LEVEL turn
+  changed no pattern byte here): SCENE A held, LEVEL -5 -> the LEV box
+  inverts (dark 2632 -> 2804); `0x27.6` with SCENE A still held -> normal
+  again (2632): manual 10.3.1, "pressing the LEVEL knob while holding the
+  SCENE key removes the lock". C and D (bits 2, 3) follow from the order
+  A B . . E F; bit 7 is spare.
+- **The lock LED.** With the lock on and the trig released, `/leds/stream`
+  (`flash_stream.log`) shows row 0 go `0x01` -> `0x03` for ~24 ms every
+  ~490 ms: the red trig LED gets a green blink (yellow for a frame) twice
+  a second -- manual 12.5's "flash rapidly" as the emulated firmware
+  emits it (a `/leds` snapshot reads `0x01` 23 times in 24). Without the
+  lock there is no row-0 traffic; while the trig key is held the blink
+  does not run.
+
+`key_map.json` carries it as `knob_push` (a = [0x27, 0] .. f = [0x27, 5],
+level = [0x27, 6]). The server's `/knob/press?row=0x30..0x36` sends the
+down / up pair through the same per-row state as `/key`, so a trig held by
+`/key` or by the page's Shift-latched chord stays held around it; the page
+sends it for a double-click on an encoder while a TRIG key is held (alone,
+a double-click is still `/knob/reset`).

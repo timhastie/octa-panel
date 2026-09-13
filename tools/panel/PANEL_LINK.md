@@ -152,7 +152,7 @@ length; the low nibble is the row:
 
 | first byte | payload | class |
 |---|---|---|
-| `0x2r` | 1 byte | **key matrix row r**, bitmask (set = held); changed bits against the last mask (`0x46100b18[r]`) become key events from the descriptor table at `[0x46c901dc] + (r*8+bit)*12` (+770 with the modifier row's key held), posted to the UI/sys queues |
+| `0x2r` | 1 byte | **key matrix row r**, bitmask (set = held); changed bits against the last mask (`0x46100b18[r]`) become key events from the descriptor table at `[0x46c901dc] + (r*8+bit)*12` (+770 with the modifier row's key held -- never: the table's modifier row is 0xff), posted to the UI/sys queues. Rows 0-7 are all live entries (key codes 0x00-0x3f); **row 7 (`0x27`) is the encoders' push switches**, bit = the encoder (A-F = 0-5, LEVEL = 6): with a TRIG key held it toggles the step's parameter lock (KEYMAP.md, 13 Sep 2026) |
 | `0x3r` | 1 byte | **encoder r**, signed detent delta; if the previous report is still unread it is ADDED into the pending message (`0x4009250c`), else a 6-byte message `{type, sub, delta, stamp}` is posted (`0x40092526`) |
 | `0x40` | 1 byte | **the crossfader**: the ADC byte 0..255. Scaled by the calibration record at `0x1ffffe` (magic `0x1234`: min `[0x1ffffc]+1`, span from `[0x1ffffa]`, `0x400925ac`), none under emulation so `pos = (byte >> 1) & 127`; `0x40092fac` drops a repeat of the last value (`0x400d16cc`) and `0x40092f2c` writes it into a 2-byte ping-pong message `04 <pos>` at `0x400d16c8/ca` (coalesced while one is pending) and posts it to the sys queue registered in `0x46104ca4`. Sys kind 4 -> `0x40061e0a`: gated on AUDIO CC OUT having INT (`0x8000004a` bit 0), stores `0x460d16c8`, rebuilds the 10 weight longs `0x80003c60`, echoes CC 48 = 127-pos if EXT, runs the STRT/LEN/RATE morph `0x4003f1b4` and redraws the fader icon (`0x4003577c`, five glyphs from `0x400bcd7c`, LCD x 104-108 / y 59-61). Rows `0x41`-`0x4f` are ignored (`0x4009256a` wants row 0) |
 | `0x7r` | 9 bytes | a report copied to `0x46100b48` with its pointer in `0x46100b52` (the panel's handshake/version reply; not seen under emulation) |
@@ -165,7 +165,8 @@ redraws the icon and rebuilds the weights (`0x80003c60` = `0x8000_0000` at
 127 = scene A fully, `0x0000_8000` at 0 = scene B). Rows `0x27`-`0x2f`,
 `0x37`-`0x3f`, `0x41`, `0x42`, `0x4f` with a value byte change nothing
 (`0x27`/`0x37` nudge the tempo readout's redraw, as KEYMAP.md found for
-`0x27`). The panel's own scaling of the pot to `0x40 <byte>` on the
+`0x27`) -- alone: `0x27` with a TRIG key held is the encoder push, the
+lock toggle (KEYMAP.md, 13 Sep 2026). The panel's own scaling of the pot to `0x40 <byte>` on the
 hardware is not measured here (no unit); the message and the firmware's
 side are.
 
