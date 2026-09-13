@@ -729,3 +729,24 @@ What else the block is, measured, and running now:
   byte), `smoke.py --card` PASS on the final binary. `COLDFIRE_PORT.md` is
   not this task's file: the O-milestone note for the DMA timers, the logo
   quirk and the mount order is owed there.
+
+## LED colours (measured 13 Sep 2026 on the emulated firmware)
+
+The trig LEDs (rows 0-3) and the track LEDs (rows 5-6) are bi-colour, two
+bitmap bits each: the map's bit is RED, the next bit up is GREEN, both lit is
+YELLOW. The level nibble of the lit bit's id (`row*8 + bit`) is the
+brightness: 15 full, 5 half. Measured against manual 11.5 / 12.4:
+
+| state | bits | level |
+|---|---|---|
+| sample trig (`[TRIG]` in GRID RECORDING) | red | 15 |
+| trigless lock (`[FUNC]+[TRIG]`) | green | 5 (half-bright) |
+| trigless trig (`[TRIG]+[NO]` on a sample trig) | green | 15 |
+| one-shot trig (`[FUNC]+[TRIG]` on a sample trig) | red+green = yellow | 15 |
+| active track | red | 15 |
+| other tracks | green | 15 |
+| muted active track (`[FUNC]+[TRACK]`) | red+green = yellow | 15 |
+| muted unselected track | off | – |
+
+The page (`applyLeds`) renders the pair and the brightness; the other LEDs
+stay single-bit with their fixed colour.

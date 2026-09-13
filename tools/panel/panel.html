@@ -574,13 +574,14 @@ async function sendKnob(row, delta, note = "") {
 
 // keys: mousedown = held, mouseup anywhere = released (chords across keys work).
 // Shift-held chords (emulator-only, one mouse has no second finger): with the
-// Shift key down, a click on a key while nothing is latched LATCHES it -- down
-// goes out, up does not, and the key shows a green tint (.held, never .down,
-// so the global mouseup below leaves it alone). Further clicks, Shift or not,
-// press other keys normally on top (down, then up on mouseup); the server
-// keeps per-row state so FUNC+MIXER etc. reach the firmware as a real chord,
-// and FUNC+arrow x N is one click per press. Clicking the latched key again
-// releases it; Shift keyup, window blur or Escape release everything.
+// Shift key down, EVERY click LATCHES its key -- down goes out, up does not,
+// and the key shows a green tint (.held, never .down, so the global mouseup
+// below leaves it alone) -- so FUNC, then BANK, then a trig can all be held
+// at once (13 Sep 2026: any number of latched keys, for the three-key
+// combinations). Clicks without Shift press other keys normally on top (down,
+// then up on mouseup); the server keeps per-row state so the firmware sees a
+// real chord. Clicking a latched key again releases just that key; Shift
+// keyup, window blur or Escape release everything.
 let shiftHeld = false;
 document.addEventListener("mousedown", e => {
   const el = e.target.closest(".k[data-id]");
@@ -602,8 +603,8 @@ document.addEventListener("mousedown", e => {
     el.classList.remove("held"); sendKey(k[0], k[1], false); return;
   }
   const shift = shiftHeld || e.shiftKey;     // e.shiftKey: Shift went down before the page had focus
-  if (shift && !document.querySelector(".k.held")) {
-    el.classList.add("held"); sendKey(k[0], k[1], true); return;
+  if (shift) {                               // every Shift-click latches (FUNC, then BANK, then ...); a
+    el.classList.add("held"); sendKey(k[0], k[1], true); return;   // click on a latched key lets it go
   }
   el.classList.add("down");
   sendKey(k[0], k[1], true);
@@ -1343,12 +1344,37 @@ function ledOn(spec, bits, ids) {
   const key = typeof spec === "number" ? "0x" + spec.toString(16).padStart(2, "0") : String(spec).toLowerCase();
   return (ids[key] || 0) > 0x20;
 }
+// The trig and track LEDs are BI-COLOUR: two bitmap bits each (measured 13
+// Sep 2026 on the emulated firmware, KEYMAP.md) -- the map's bit is the RED
+// bit, the next bit up is GREEN, both lit is YELLOW -- and the level nibble
+// of the lit bit's id (row*8 + bit) is the brightness: 15 full, 5 half. So a
+// sample trig is red, a trigless lock half-bright green, a trigless trig
+// full green, a one-shot yellow; a muted active track is yellow, a muted
+// unselected track unlit (manual 11.5 and 12.4).
+const BI_LED = /^led_(trig\d+|t\d)$/;
+function ledState(id, spec, bits, ids) {
+  if (!Array.isArray(spec) || !BI_LED.test(id)) return { on: ledOn(spec, bits, ids), colour: null, level: 15 };
+  const byte = parseInt(bits.substr(spec[0] * 2, 2) || "0", 16);
+  const red = !!((byte >> spec[1]) & 1), green = !!((byte >> (spec[1] + 1)) & 1);
+  const lvl = b => ids["0x" + (spec[0] * 8 + b).toString(16).padStart(2, "0")];
+  let level = 15;
+  const lv = [red ? lvl(spec[1]) : null, green ? lvl(spec[1] + 1) : null].filter(v => v != null);
+  if (lv.length) level = Math.max(...lv);
+  return { on: red || green, colour: red && green ? "yellow" : red ? "red" : green ? "green" : null, level };
+}
 function applyLeds(l) {
   for (const [id, spec] of Object.entries(mapLeds)) {
     // key_map.json names LEDs "led_trig1"; the elements are "led-trig1"
     // (the first version looked up "led-led_trig1" and lit nothing, 12 Sep 2026)
     const el = document.getElementById("led-" + id.replace(/^led_/, ""));
-    if (el) el.classList.toggle("on", ledOn(spec, l.bits || "", l.ids || {}));
+    if (!el) continue;
+    const st = ledState(id, spec, l.bits || "", l.ids || {});
+    el.classList.toggle("on", st.on);
+    if (st.colour) {
+      el.classList.remove("red", "green", "yellow");
+      el.classList.add(st.colour);
+      el.style.opacity = st.on ? String(0.45 + 0.55 * Math.max(0, Math.min(1, st.level / 15))) : "";   // half-bright (5) reads ~0.63
+    }
   }
 }
 
