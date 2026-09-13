@@ -6364,6 +6364,149 @@ ColdFire-side delay are bit-identical between the modes; O20's H2 "whole
 - Plate and spring were not run; the O20 cards (effects on T5) were not
   re-rendered — they measure a silent track.
 
+## Milestone O22 — the JIT renders the DSP effects: differential execution names two vendored-JIT defects (MPYI's immediate multiplied unsigned; a bit instruction on an M register left its modulo words stale), fixed in the patch ✅ (13 Sep 2026, branch `panel-ui`)
+
+O21 ended with the owner's symptom diagnosed to a class: under `--dsp-rt`
+(the panel's mode) the comb did not ring and the chorus was not detuned
+while the lockstep interpreter rendered both, so one or more DSP56300
+instructions were executed differently by the vendored JIT than by the
+interpreter. This milestone finds them by DIFFERENTIAL EXECUTION — the same
+DSP state under both engines, compared after every block, then after
+every instruction — fixes the two in `vendor/dsp56300`
+(`tools/patches/dsp56300.patch` regenerated), and re-measures the rig.
+Everything under `out/_agents/fx3/` (`O22_measurements.txt` is the
+index; `harness/` the harness, `snap-*.txt` the snapshots, `diff-*.txt`
+the runs, `final*/` the renders, `ls_vs_rt_o22.txt`, `wet_*_o22.txt`).
+
+### The harness (`out/_agents/fx3/harness/difftest.cpp`, on `dsp56k::DSP`)
+
+One lockstep run per card (`out/_agents/fx2/dspq.py` with
+`--dsp-pcwatch 0:<process entry>`, at ~1.05 s of PLAY): `dsp pcwatch` gives
+the module's entry registers (24 hits — the dispatcher `P:0x4b4–0x50d`
+calls each FX process entry TWICE per frame, `r0 = 0 / n7 = x:$20c = 4`
+then `r0 = x:$20e = 8 / n7 = x:$20d = 12`, r7 the instance block, r6 the
+parameter copy), `dsp peek` the memory (X:0–0xbfff, Y:0–0x7fff, P:0–0x6fff;
+the reverb's lines at Y:0x30000–0x3ffff). Two `dsp56k::DSP` instances load
+the same memory and entry registers (sr 0, M linear, `jsr` from a return
+PC). The JIT instance runs with the rt mode's `JitConfig` exactly
+(dynamicPeripheralAddressing, dynamicFastInterrupts, optimizer off,
+maxDoIterations 64, linked blocks, the function table sized to all of P)
+one `dsp.exec()` — one block, or the linked run of blocks — at a time; the
+interpreter instance (host-stepped, `execInterpreter` + `doLoopEnd`) is
+stepped to the same instruction count — its OWN step count: the library's
+counter charges a host-stepped `do` twice, which made the first runs drift
+by one per loop — and every register (a, b, x, y, r/n/m, sr, omr, pc, la,
+lc, sp, sc) and the loaded X/Y ranges are compared. The CCR is compared
+from `getSR()` and reported as a note only (both engines keep it lazily; a
+CCR that matters shows up as data). `--maxinstr 1 --nolink` makes every
+instruction its own block, which names the instruction. The module is run
+for several frames (the same block each time) so a feedback structure
+exercises its loop. `harness/mwtest.cpp` is the micro-test rig (a chosen
+instruction sequence under both engines, as the spike's `jittest.cpp`).
+
+### Defect 1 ✅ fixed: MPYI / MPYRI / MACI multiplied by the immediate as an unsigned word (`jitops_alu.cpp`)
+
+The first data difference in the comb (`P:0x1edc`), one-instruction
+blocks, block 31: **`P:0x1f01 mpyi #>$9bc5d1,x0,b`** (`0141c8 9bc5d1`):
+interpreter `b = 0x000a88fb5c8102`, JIT `b = 0xffefa05d5c8102` — the low
+24 bits agree, the difference is exactly `2·x0·2²⁴`: the JIT multiplied by
+`+0x9bc5d1` (+0.609) where the immediate is the signed fraction `−0x643a2f`
+(−0.391). In the chorus (`P:0xed7`) the same, block 38: **`P:0xeed mpyi
+#>$f44800,x0,a`**, interpreter `a = 0xfff4507000f000`, JIT
+`0x00f3981e00f000`. The DSP56300 Family Manual (MPYI, "Signed Multiply
+With Immediate Operand": `#xxxxxx` is 24-bit immediate long data, a
+two's-complement fraction like every ALU operand) sides with the
+interpreter, whose `alu_mpy` sign-extends both operands. In the JIT's
+`alu_mpy` the ARM64 path did `smull(r64 s1, r32 s1, r32 s2)` with `s2` an
+`Immediate24` DspValue materialised from the raw opcode word (positive as a
+32-bit value), and the x86-64 path `imm24() * 2` the same. The fix
+sign-extends the immediate on both hosts (`signextend<int32_t, 24>`; the
+power-of-two shift path only for a positive immediate; the unsigned-`s2`
+callers untouched). The comb's coefficient chain `mpyi / max a,b / cmp /
+tge` then clamped `b` to its floor 0x1800 — the ring's feedback gone, the
+owner's "very small glitchy loop". The payloads carry eight negative
+immediates (`mpyi #>$e00000,x1,a` ×6, `#>$f84c00`, `#>$f44800`,
+`#>$d00000`, `#>$9bc5d1`, `#>$fcf669`, `maci #>$c04000`, `#>$9c0000`).
+
+### Defect 2 ✅ fixed: a bit instruction on an M register left the JIT's modulo words stale (`jitdspregs.cpp`)
+
+With defect 1 fixed the comb and the chorus were identical over three
+frames, but the dark reverb (`P:0x171b`) still differed: block 89,
+**`P:0x177c move (r4)-n4`** with `r4 = 0x0302e0, n4 = 0x10, m4 = 0x801f` —
+set at `P:0x1776–0x1777` by `move m1,m4 / bset #$f,m4` — interpreter
+`r4 = 0x0302f0`, JIT `0x0302c0`. `M = 0x801f` is the multiple wrap-around
+modulo (`M = 0x8000 + 2^k − 1`, k = 5; DSP56300FM 4.3.3): the low k bits of
+Rn are updated modulo 2^k and the upper bits kept, (0 − 0x10) mod 32 = 0x10
+→ 0x0302f0, the interpreter's. The micro-test isolated it: every `bset` /
+`bclr` on an M register left the JIT's mask/modulo words wrong (mask 0x20,
+modulo garbage) while `move #>$801f,m4` and `move x0,m4` were right —
+`bitmod_D` modifies the pooled M register in place and writes it back
+through `decode_dddddd_write` → `setM` with THE DESTINATION AS ITS OWN
+SOURCE, and `setM`'s "the source is an M register: copy its precomputed
+mod/mask" shortcut copied the destination's own registers, acquired
+write-only just above and never loaded. The fix skips the shortcut when the
+source M register is the destination (the dynamic classification of the
+value follows). The reverb's pointer walked one word too far back every
+frame.
+
+Both fixes carry unit tests in the vendor's `unittests.cpp` (mpyi/maci with
+negative immediates against exact products; the reverb's bset/bclr-on-M
+idiom: mask, modulo and the pointer), run by `dsp56kTestRunner` under the
+JIT and the interpreter — all pass. The patch: 24 files, every one of the
+627 old change lines kept, `git apply --check` on a scratch worktree of
+`3c01813f` OK and the patched tree `diff -r` identical to
+`vendor/dsp56300/source`. The interpreter path is untouched.
+
+### Measured (13 Sep 2026, the M5; `out/_agents/fx3/build/ot_emu`, LTO, built from the working tree; both modes rendered with it, `--seconds 6.5`; `ls_vs_rt_o22.txt`, `wet_rt_o22.txt`)
+
+| card (effect on T7) | lockstep vs rt | rt wet | lockstep wet |
+|---|---|---|---|
+| clean7 | **bit-identical** (0 of 309,564) | — | — |
+| chorus7 | **bit-identical** (0 of 309,559) | −43.4 dBFS, wet peak **6063 Hz** vs the dry's 6075 (detuned) | −43.4, 6063 Hz |
+| comb7 | **bit-identical** (0 of 309,559; a second rt run: one 16-sample run at 5.06 s, −60 dB) | −28.1 dBFS **ringing at 337 samples** (r = 0.954), −23 → −42 dB over 1 s | −28.1, 337, same envelope |
+| dark7 | 77–78 % of samples at **−46 dB** (max 1185); was 98 % at −9 dB | −24.0 dBFS, tail −35 → −44 dB | −24.0/−23.9 |
+
+The dark reverb's residue is not the JIT's semantics: two rt runs differ
+from EACH OTHER (85 %, −45 dB, first difference at 0.151 s vs 0.239 s) as
+much as from lockstep, the harness shows the module identical over three
+frames at both granularities, and a semantics difference is deterministic
+— it is O20's H2 class (whole 16-sample blocks, run-to-run, the ColdFire's
+drain timing) fed into a long-memory effect, 37 dB down from where defect
+2 had it (the comb's one block in one of three runs is the same class).
+⚠️ O21's renders are not a baseline for this binary (O21's lockstep
+clean7 vs this lockstep clean7: 6 % of samples, a different binary/session);
+both modes must come from the same binary, which is what the table does.
+
+### The gates
+
+- Strict oracle vs `out/emu/ot_emu.ref-73c2815`: **28 PASS, 0 FAIL**
+  (`out/_oracle/reports/20260913-131419-o22-jit-fixes.txt`; the batch modes
+  use the interpreter, so byte-identical); ctest **7/7**; the vendor's
+  assembler/JIT/interpreter/optimizer test suites pass with the new cases.
+- `fit.py` on the clean fixture in rt (`rtdrive.py --rt`, otlive2.img):
+  **gain 0.7032, −33.0 dB** (`fit-rt2.out`).
+- Bench flat out `--dsp --dsp-rt`, machine idle: this LTO-only build
+  **995 / 984 emulated ms per wall s**; O21's LTO binary without the fixes,
+  same session, 913–941 — the fixes cost nothing; the PGO flavour built the same way under `out/_agents/fx3/build-pgo` (`pgo.sh --dest/--gen/--prof`, `out/emu` untouched): **1139 / 1146 emulated ms per wall s** (O17b: 1208 on the owner's PGO binary), boot to ready 6.9 s.
+
+### What it does not do
+
+- **MACRI is executed as two no-ops by BOTH engines**: `macri
+  #>$9566,x0,a` (`0141c3 009566`, `P:0x779` in `func_773`, reached from the
+  CHORUS `P:0xee6`, PHASER `P:0xcdd`, FLANGER `P:0xdb3`) is
+  `errNotImplemented` in the interpreter (`op_Macri_xxxx`; the assert
+  compiles out in Release) and in the JIT (`*** JIT errNotImplemented:
+  opcode=$0141C3`, then the extension word `0x009566` decoded as a second
+  unimplemented op). Identical in both, so not a ls-vs-rt divergence and
+  not touched here; the manual's MACRI (`D + S × #xxxxxx`, rounded → D)
+  would change the lockstep output of those three modules. The earlier
+  patch implemented MPYRI the same way; MACRI is its accumulate-and-round
+  sibling.
+- The H2 scheduling residue on the reverb (and, one block in three runs,
+  the comb) remains with the drain-time table (`rtos.cpp`), as O20 left it.
+- Plate and spring were not run; core 1's audio and the cue out are not
+  captured.
+
 ## Milestone O23 — per-track outputs: the eight stems tapped from the DSP's mixdown, over the pipe and onto the output device ✅ (13 Sep 2026, branch `panel-ui`)
 
 The owner's ask: the hardware has only MAIN and CUE, but inside the DSP

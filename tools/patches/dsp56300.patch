@@ -806,6 +806,30 @@ index d20e8641..5480e8d6 100644
  
  		JitConfig m_config;
  		JitBlockChain* m_chain = nullptr;
+diff --git a/source/dsp56kEmu/jitdspregs.cpp b/source/dsp56kEmu/jitdspregs.cpp
+index 54a365d5..980954fb 100644
+--- a/source/dsp56kEmu/jitdspregs.cpp
++++ b/source/dsp56kEmu/jitdspregs.cpp
+@@ -136,7 +136,18 @@ namespace dsp56k
+ 		// if the source is an M reg too we can copy the previously calculated values from the source
+ 		const auto dspReg = _src.getDspReg().dspReg();
+ 
+-		if(dspReg >= DspM0 && dspReg <= DspM7)
++		// octabam (O22, 13 Sep 2026): ... unless the source IS the destination. A bit
++		// instruction on an M register (`bset #$f,m4`: bitmod_D modifies the pooled
++		// register in place and writes it back through decode_dddddd_write -> setM)
++		// arrives here with _src == M<_agu>, and the shortcut then copied the
++		// destination's own mod/mask registers -- acquired write-only above, never
++		// loaded: garbage. The Octatrack's DARK REV (payload A P:0x1776-0x177c:
++		// `move m1,m4 / bset #$f,m4 / move (r4)-n4`) switched m4 to the multiple
++		// wrap-around modulo 0x801f that way and its pointer walked 0x0302c0 in
++		// place of 0x0302f0 under the JIT (DSP56300FM 4.3.3: the low k bits are
++		// updated modulo 2^k, the upper bits of Rn are unchanged). Fall through to
++		// the dynamic classification below, which computes mod/mask from the value.
++		if(dspReg >= DspM0 && dspReg <= DspM7 && static_cast<TWord>(dspReg - DspM0) != _agu)
+ 		{
+ 			const auto m = dspReg - DspM0;
+ 
 diff --git a/source/dsp56kEmu/jitmem.cpp b/source/dsp56kEmu/jitmem.cpp
 index 7b18cc23..a3c93443 100644
 --- a/source/dsp56kEmu/jitmem.cpp
@@ -875,10 +899,66 @@ index 0be2c03f..5d51f901 100644
  		void op_Nop(TWord op);
  		void op_Norm(TWord op)					{ errNotImplemented(op); }
 diff --git a/source/dsp56kEmu/jitops_alu.cpp b/source/dsp56kEmu/jitops_alu.cpp
-index f9f81809..714776e0 100644
+index f9f81809..11f5bda1 100644
 --- a/source/dsp56kEmu/jitops_alu.cpp
 +++ b/source/dsp56kEmu/jitops_alu.cpp
-@@ -999,6 +999,23 @@ namespace dsp56k
+@@ -386,7 +386,34 @@ namespace dsp56k
+ 		AluRef d(m_block, ab, _accumulate, true);
+ 
+ #ifdef HAVE_ARM64
+-		if (_negate)
++		if(_s2.isImmediate() && !_s2Unsigned)
++		{
++			// octabam (O22, 13 Sep 2026): the immediate operand of MPYI / MPYRI /
++			// MACI is a SIGNED 24-bit fraction (DSP56300 Family Manual, MPYI:
++			// "#xxxxxx 24-bit Immediate Long Data", a two's-complement fraction
++			// like every other ALU operand; the interpreter's alu_mpy sign-extends
++			// it). The raw opcode word reached smull/smnegl as a positive 32-bit
++			// value, so `mpyi #>$9bc5d1,x0,b` (payload A P:0x1f01, the comb's
++			// feedback coefficient) multiplied by +0.609 in place of -0.391: the
++			// comb did not ring and the chorus (`mpyi #>$f44800,x0,a`) was not
++			// detuned under --dsp-rt while the lockstep interpreter rendered both.
++			const int32_t imm = signextend<int32_t, 24>(static_cast<int32_t>(_s2.imm24() & 0xffffff));
++			if(!_negate && imm > 0 && asmjit::Support::isPowerOf2(static_cast<uint32_t>(imm)))
++			{
++				const auto shift = static_cast<uint32_t>(log2(imm));
++				m_asm.shl(r64(_s1), asmjit::Imm(shift));
++			}
++			else
++			{
++				RegGP t(m_block);
++				m_asm.mov(r32(t), asmjit::Imm(static_cast<uint32_t>(imm)));
++				if(_negate)
++					m_asm.smnegl(r64(_s1), r32(_s1), r32(t));
++				else
++					m_asm.smull(r64(_s1), r32(_s1), r32(t));
++			}
++		}
++		else if (_negate)
+ 		{
+ 			m_asm.smnegl(r64(_s1), r32(_s1), r32(_s2));
+ 		}
+@@ -417,7 +444,9 @@ namespace dsp56k
+ #else
+ 		if(_s2.isImmediate())
+ 		{
+-			const int64_t i = static_cast<int64_t>(_s2.imm24()) * 2;
++			// octabam (O22): the immediate is a signed 24-bit fraction (see the ARM64 path above)
++			const int64_t i = (_s2Unsigned ? static_cast<int64_t>(_s2.imm24())
++				: static_cast<int64_t>(signextend<int32_t, 24>(static_cast<int32_t>(_s2.imm24() & 0xffffff)))) * 2;
+ 
+ 			if(_negate)
+ 			{
+@@ -425,7 +454,7 @@ namespace dsp56k
+ 			}
+ 			else
+ 			{
+-				if (asmjit::Support::isPowerOf2(i))
++				if (i > 0 && asmjit::Support::isPowerOf2(i))
+ 				{
+ 					const auto shift = static_cast<uint32_t>(log2(i));
+ 					m_asm.shl(r64(_s1), asmjit::Imm(shift));
+@@ -999,6 +1028,23 @@ namespace dsp56k
  		alu_mpy(ab, reg, s, negate, false, false, false, false);
  	}
  
@@ -1128,3 +1208,111 @@ index adbac770..4257ef4d 100644
 +		WriteHook m_writeHook;
  	};
  }
+diff --git a/source/dsp56kEmu/unittests.cpp b/source/dsp56kEmu/unittests.cpp
+index 7a837a65..eca8ca07 100644
+--- a/source/dsp56kEmu/unittests.cpp
++++ b/source/dsp56kEmu/unittests.cpp
+@@ -394,6 +394,55 @@ namespace dsp56k
+ 			verify(dsp.regs().r[1] == 0x3cd);
+ 			verify(dsp.regs().r[2] == 0x3c9);
+ 		});
++
++		// octabam (O22, 13 Sep 2026): an M register switched to the multiple wrap-around
++		// mode IN PLACE by a bit instruction (the Octatrack's DARK REV, payload A
++		// P:0x1776-0x177c: `move m1,m4 / bset #$f,m4 / move (r4)-n4`) must recompute its
++		// modulo words: the JIT's setM copied the destination's own stale mod/mask and
++		// r4 walked to 0x3002c0. (Two runTests: the JIT runner snapshots the addressing
++		// mode per emitted instruction from the live registers, so the bit op has to
++		// execute before the pointer update is compiled.)
++		runTest([&]()
++		{
++			dsp.regs().r[4].var = 0x3002e0;
++			dsp.regs().n[4].var = 0x10;
++			dsp.set_m(4, 0x00001f);
++			emit(0x0ae46f);			// bset #$f,m4  -> m4 = 0x801f
++		}, [&]()
++		{
++			verify(dsp.regs().m[4] == 0x801f);
++			verify(dsp.regs().mMask[4] == 0x1f);
++			verify(dsp.regs().mModulo[4] == -1);
++		});
++		// DSP56300FM 4.3.3: with M = 0x801f (k = 5) the low 5 bits of r4 are updated modulo
++		// 32 and the upper bits stay: (0x00 - 0x10) mod 32 = 0x10 -> 0x3002f0.
++		runTest([&]()
++		{
++			emit("move (r4)-n4");
++		}, [&]()
++		{
++			verify(dsp.regs().r[4] == 0x3002f0);
++		});
++		// ... and back to the plain modulo 32 (lower bound 0x3002e0: 0x3002d0 wraps to 0x3002f0)
++		runTest([&]()
++		{
++			dsp.regs().r[4].var = 0x3002e0;
++			dsp.regs().n[4].var = 0x10;
++			dsp.set_m(4, 0x00801f);
++			emit(0x0ae44f);			// bclr #$f,m4  -> m4 = 0x1f
++		}, [&]()
++		{
++			verify(dsp.regs().m[4] == 0x1f);
++			verify(dsp.regs().mMask[4] == 0x1f);
++			verify(dsp.regs().mModulo[4] == 32);
++		});
++		runTest([&]()
++		{
++			emit("move (r4)-n4");
++		}, [&]()
++		{
++			verify(dsp.regs().r[4] == 0x3002f0);
++		});
+ 	}
+ 
+ 	void UnitTests::aguBitreverse()
+@@ -4392,6 +4441,29 @@ namespace dsp56k
+ 		{
+ 			verify(dsp.regs().a.var != 0);
+ 		});
++
++		// octabam (O22, 13 Sep 2026): the immediate is a SIGNED 24-bit fraction
++		// (DSP56300FM MPYI). The JIT multiplied by the raw opcode word, so a
++		// negative immediate came out as 1.0 + x: 0.5 x -0.5 must be -0.25 ...
++		runTest([&]()
++		{
++			dsp.x0(0x400000);
++			dsp.regs().a.var = 0;
++			emit(0x0141c0, 0xc00000);	// mpyi #>$c00000,x0,a
++		}, [&]()
++		{
++			verify((dsp.regs().a.var & 0xffffffffffffffULL) == 0xffe00000000000ULL);
++		});
++		// ... and the Octatrack comb's feedback coefficient (payload A P:0x1f01)
++		runTest([&]()
++		{
++			dsp.x0(0x0d744f);
++			dsp.regs().b.var = 0;
++			emit(0x0141c8, 0x9bc5d1);	// mpyi #>$9bc5d1,x0,b
++		}, [&]()
++		{
++			verify((dsp.regs().b.var & 0xffffffffffffffULL) == 0xfff57704a37efeULL);
++		});
+ 	}
+ 
+ 	void UnitTests::maci_xxxx()
+@@ -4411,6 +4483,17 @@ namespace dsp56k
+ 			verify(dsp.regs().b.var != 0x00100000000000);
+ 			verify((dsp.regs().b.var & 0xffffffffffffffULL) != 0);
+ 		});
++
++		// octabam (O22): a negative immediate is a signed fraction here too: 0.125 + 0.5 x -0.5 = -0.125
++		runTest([&]()
++		{
++			dsp.x0(0x400000);
++			dsp.regs().b.var = 0x00100000000000;
++			emit(0x0141ca, 0xc00000);               // maci #>$c00000,x0,b
++		}, [&]()
++		{
++			verify((dsp.regs().b.var & 0xffffffffffffffULL) == 0xfff00000000000ULL);
++		});
+ 	}
+ 
+ 	void UnitTests::mpy_su()
