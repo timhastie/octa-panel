@@ -750,3 +750,93 @@ brightness: 15 full, 5 half. Measured against manual 11.5 / 12.4:
 
 The page (`applyLeds`) renders the pair and the brightness; the other LEDs
 stay single-bit with their fixed colour.
+
+## 13 Sep 2026: the crossfader, what the page encoders edit, the scene chords
+
+On the C++ port (`out/emu/ot_emu --interactive`, stock image, OTLIVE
+fixture; the BLANK fixture for the init values). Scratch (gitignored):
+`out/_agents/panel-ctl/` -- `lab_params.py` (own child, no cores: every
+page x encoder with `watchmem`/`writes`, then the fader rows; `lab_params.log`,
+`lab_params.json`), `read_init.py` (`init_8594.json`: the BLANK project's
+values through an own server on 8594), `lab_scenes.py` (own server on 8593
+with the cores: reset, fader, scenes, takes; `lab_scenes_8593.log`, `S_*.txt`/
+`.png`), `check_reset.py` (`R_*`).
+
+### The crossfader is `0x40 <adc>` on the panel UART
+
+The RX parser `0x4009228c` classes a report by its first byte's high nibble:
+`0x2r` keys, `0x3r` encoders, **`0x40` the fader** (one payload byte, the pot's
+ADC value 0..255, row nibble must be 0), `0x7r` a nine-byte report
+(PANEL_LINK.md has the decode). The byte goes through a calibration record at
+`0x1ffffe` (magic `0x1234`; absent under emulation, so `pos = byte >> 1`) into
+sys message kind 4 (`0x40092fac` -> `0x40092f2c` -> `0x40061e0a`), which
+stores `0x460d16c8` (127 = scene A, 0 = scene B: the weight table
+`0x80003c60` reads `0x8000_0000` at 127), needs AUDIO CC OUT = INT or INT+EXT
+(`0x8000004a` bit 0; the fixture has `MIDI_AUDIO_TRK_CC_OUT=3`), echoes CC 48
+= 127 - pos when EXT, and redraws the fader icon (LCD x 104-108, y 59-61).
+
+| sent | `0x460d16c8` | LCD blocks |
+|---|---|---|
+| `0x40 255` / `254` | 127 | 2 / 1 (the icon; the first also the page) |
+| `0x40 128` / `127` | 64 / 63 | 1 |
+| `0x40 64` / `192` | 32 / 96 | 1 |
+| `0x40 0` / `1` | 0 | 1 |
+| rows `0x27`-`0x2f`, `0x37`-`0x3f`, `0x41`, `0x42`, `0x4f` with `0x40` | unchanged | 0 (`0x27`/`0x37`: the tempo readout, 2) |
+
+The server's `/xfader?pos=` (0 = A/left .. 127 = B/right, = CC 48) sends
+`0x40 (2*(127-pos)+1)`; the page's fader drags, wheels and arrows through it.
+Direction confirmed with sound: AMP VOL locks in scene A make the mix 4.4 dB
+quieter at `pos=0` than at `pos=127` (below).
+
+### What the page encoders edit (param_map.json)
+
+From the knob handler `0x40055008` and measured with `knob +1 / +5 / -6` per
+slot on T5 (FLEX) and T1 (STATIC), `writes` naming the store `0x40055170`
+(and the SRAM mirror at `0x40055172`), the LCD box redrawn each time:
+
+| page (first press, kind `0x460d1684`) | slot s of track t = `base` + ... (`base` = `[0x46c82456]` + `[0x100b14cf]`*6322) | T1 / T5 measured |
+|---|---|---|
+| PLAYBACK (0) | `0x8edaa + t*30 + machine*6 + s` (machine byte `base+0x8eda2+t`: 0 STATIC 1 FLEX 2 THRU 3 NEIGHBOR 4 PICKUP) | `0x40170f8a..8f` / `0x40171008..0d` (+6 = FLEX) |
+| LFO (1) | `0x8ee9a + t*24 + 0 + s` | `0x4017107a..7f` / `0x401710da..df` |
+| AMP (2) | `0x8ee9a + t*24 + 6 + s` | `0x40171080..85` / `0x401710e0..e5` |
+| FX1 (3) | `0x8ee9a + t*24 + 12 + s` | `0x40171086..8b` / `0x401710e6..eb` (FILTER) |
+| FX2 (4) | `0x8ee9a + t*24 + 18 + s` | `0x4017108c..91` / `0x401710ec..f1` (DELAY) |
+| LEVEL (row 0x36, any page) | `0x80000c50 + 2t` (pc `0x4004ec5a`), Part copy `base + 0x8ed92 + 2t` (`0x4004ec00`) | 108 -> 109 -> 114 -> 108 |
+
+One detent = one unit, clamped to the descriptor's `[min, min+count-1]`
+(RATE / HOLD / REL / WDTH / VOL at 127 stay on +1); PTCH (min 4, count 121)
+wrote 64 on +1 -- its hook accumulates fractions, so the reset re-reads and
+sends again. The descriptor per page is FUN_40031da4's: PLAYBACK from the
+machine (`[0x400d5f38 + 4*machine]`), LFO `0x400d37f6`, AMP `0x400d3988`,
+FX1/FX2 from the effect id (`base+0x8ed80+t` / `+0x8ed88+t` into
+`0x400d5f58` / `0x400d5fdc`); with E = descriptor - 0x38: name `E+0x4e+6s`,
+init `E+0x96+s`, min `E+0xa2+4s`, count `E+0xd2+4s`, live = bit 0 of nibble
+s of the long at `descriptor+0x18e` (AMP `0x11811111`: F = XVOL is 8, and
+knob F on the AMP page writes nothing, measured). **Init values** = the
+BLANK fixture's bytes on all eight tracks = the descriptor defaults: PB 64 0
+0 127 0 79, LFO 32 32 32 0 0 0, AMP 0 127 127 64 64, FX1 0 127 0 64 0 64,
+FX2 47 0 127 0 127 0, LEVEL 108. `/knob/reset` measured on 8593: AMP VOL 84
+-> 64 (`sent [-20]`), PTCH 70 -> 64 (`[-6, -1]`), STRT 33 -> 0, LEVEL 93 ->
+108; refused: AMP SETUP (`a SETUP page is open`), MIXER, MIDI mode, AMP F.
+
+### The scene chords, end to end
+
+`lab_scenes.py` on the own server (Shift-latched chords are two `/key`
+edges, the same as the page sends):
+
+- `[SCENE A]` (0x23.1) held + `[TRIG 2]` (0x20.1): the Part's slot-A byte
+  `base+0x8ed90` 0 -> 1; `[SCENE B]` (0x23.2) + `[TRIG 3]`: `base+0x8ed91`
+  -> 2. LED rows while SCENE A is held: `01 00 02` = trig 1 red (this slot's
+  scene), trig 9 green (the other slot's), the manual's colours.
+- Lock: SCENE A held, AMP page, knob D (VOL) -64 on T1..T4: the Part VOL
+  bytes do not move (84/64/64/64), the scene block `blob + pattern*0x18b2 +
+  scene*0x100 + 0x8f3e2 + t*0x20` gets byte 15 (= AMP*6 + VOL) = 20/0/0/0
+  (`0x401716d1/f1/711/731`, `0xff` = unlocked), the VOL box is drawn
+  inverted with the locked value while the key is held (`S_lock_held.txt`).
+- Morph: with the cores, PLAY 3 s / STOP at three fader positions: A
+  (`pos=0`) -7.7 dBFS RMS, mid (64) -5.5, B (127) -3.3 (takes 3/4/5 of
+  that server; peak 32768 in all three -- the fixture clips). The parameter
+  boxes keep the Part values; the fader icon moves; the DSP-bound copy is
+  what changes (midi_re_scene.md). Nothing in the panel needed fixing for
+  the flow: the scene keys latch, the chords land, the fader was the
+  missing piece.

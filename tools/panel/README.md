@@ -30,9 +30,11 @@ on either backend).
 
 Almost every control is wired (`tools/panel/key_map.json`, 47 keys, 7
 encoders and 40 LEDs measured — `KEYMAP.md` has the evidence): keys press,
-encoders turn with the mouse wheel or a vertical drag, LEDs follow the
-firmware. Unwired: REC AB/CD and SCALE SETUP are inferred from their FUNC
-layers; the crossfader is decorative.
+encoders turn with the mouse wheel or a vertical drag (endless, as on the
+unit; a double-click puts the parameter the encoder controls back to its
+init value, through the firmware), the crossfader drags (left = scene A,
+right = scene B), LEDs follow the firmware. Unwired: REC AB/CD and SCALE
+SETUP are inferred from their FUNC layers.
 
 ## What is real, and what it took to find
 
@@ -131,6 +133,8 @@ beside it), is a good PR — it is pure discovery, no firmware bytes.
 | `GET /key?row=0x26&bit=0&down=1` | one matrix key edge |
 | `GET /tap?row=0x22&bit=0&n=2&hold=50&gap=150` | `n` presses of one key inside one action (the double-tap chords, see "Loading samples") |
 | `GET /knob?row=0x30&delta=2` | one encoder report (rows 0x30–0x36, signed delta) |
+| `GET /knob/reset?row=0x33` | the parameter this encoder edits on the CURRENT page back to its init value, done by the firmware (detent reports until the page descriptor's default is reached): `{ok, note, knob, name, page, track, addr, before, after, init, range, sent}`; `ok: false` + `note` and nothing sent on a SETUP window, the MIXER, a menu, MIDI mode, or a dead slot (AMP F/XVOL). "Scenes and the crossfader" below, `param_map.json` |
+| `GET /xfader?pos=64` | the crossfader: `pos` 0..127 (0 = leftmost = scene A, 127 = rightmost = scene B, the MIDI CC 48 scale) goes out as the panel board's own fader report `0x40 <byte>`; without `pos` it only reads. Answers the firmware's value `{ok, pos, xf, cc48, byte, scene_a, scene_b}` (`xf` = the firmware's 0x460d16c8, 127 at A; `scene_a/b` = the Part's assigned scenes, 1-based) |
 | `GET /samples` | the sample pool: `{pool, staged, files: [{name, bytes, format}], pending, removed, busy, phase}` |
 | `GET /samples/add?path=<abs>` | copy a Mac file into the pool (converted when needed): `{ok, name, converted, note, format, bytes, pending}` (+ `cmd`, afconvert's argv, when converted) or `{ok: false, error}` |
 | `POST /samples/upload?name=<n>` | the same with the raw file bytes as the body (one file per request, no multipart) |
@@ -321,6 +325,76 @@ The full project loads under either backend (the port's own boot does the
 mount and LOAD PROJECT, `/project` shows its report: `posted`, `saved_bank`
 0, `final_bank` 0; under route A the M6b gate passes: mount, LOAD PROJECT,
 bank A parsed) and the panel stages its AUDIO pool automatically.
+
+## Scenes and the crossfader
+
+Measured 13 Sep 2026 on the port with the OTLIVE fixture and the DSP cores
+(`out/_agents/panel-ctl/`: `lab_params.py` maps the encoders and finds the
+fader message, `lab_scenes.py` is the end-to-end run, `check_reset.py` the
+double-click, logs / JSON / `S_*` `R_*` screens beside them; the evidence
+is in `KEYMAP.md` and `param_map.json`).
+
+**The crossfader is the panel board's pot, reported as `0x40 <adc>` on the
+panel UART** (the same wire as the keys and encoders: PANEL_LINK.md). The
+firmware scales the byte by a calibration record in its boot flash
+(`0x1ffffe`, none under emulation, so `value >> 1`), posts sys message kind
+4, stores the position in `0x460d16c8` (127 = scene A, 0 = scene B),
+rebuilds the morph weights and redraws the fader icon in the LCD's bottom
+right. `/xfader?pos=` sends exactly that byte; the page's fader is a drag
+(the handle, or a click in the bed), a wheel (Shift = 8 steps) or, after a
+click on it, the Left/Right arrows, with the position under it (0 = A at
+the left, 127 = B at the right, the CC 48 value) and the two assigned
+scenes. Nothing is remembered across reloads: the page asks the firmware
+where the fader is on load and every few seconds while idle.
+
+**The flow, as on the unit** (manual 10.3; every step through the matrix,
+the Shift-click latches a key so one mouse can hold a chord):
+
+1. Shift-click **SCENE A**, click **TRIG 2**, click SCENE A again to let go:
+   scene 2 is in slot A (the Part byte `blob+0x8ed90` 0 -> 1, the page's
+   readout under the fader says `scenes 2 / 9`). While SCENE A is held the
+   trig LEDs show the slots: red = the scene in this slot, green = the
+   other slot's (1 and 9 after a load: rows `01 00 02`).
+2. The same with **SCENE B** + **TRIG 3**: `blob+0x8ed91` -> 2.
+3. **A scene lock**: hold SCENE A (Shift-click), turn a page encoder --
+   AMP page, knob D (VOL) down 64 detents -- and let go. The box draws
+   inverted with the locked value while the key is held (manual 10.3.1),
+   the Part's own VOL byte does not move (a lock, not an edit), and the
+   scene block gets the value: `blob + pattern*0x18b2 + scene*0x100 +
+   0x8f3e2 + track*0x20 + (page*6 + slot)` with page 0 PLAYBACK, 1 LFO,
+   2 AMP, 3 FX1, 4 FX2 -- byte 15 for AMP VOL, `0xff` = not locked
+   (`docs/firmware/midi_re_scene.md`). Measured on T1..T4: `..ff 14 ff..` /
+   `..ff 00 ff..` at `0x401716d1/f1/711/731`.
+4. **Move the fader**: the firmware morphs between the A locks and the B
+   locks (or the Part value where a side has none) every DSP frame. With
+   the cores on, a take at each position (PLAY 3 s, STOP): fader at A
+   (`/xfader?pos=0`) **-7.7 dBFS** RMS, at B (127) **-3.3 dBFS**, mid (64)
+   **-5.5 dBFS** -- the four VOL locks (20/0/0/0 in scene 2 against the
+   Part's 84/64/64/64) take 4.4 dB off the mix at A and half of it half
+   way, exactly the manual's interpolation. The LCD shows the fader icon
+   moving (x 104-108, y 59-61); the parameter boxes keep showing the
+   Part values (the morph writes the DSP-bound copy, not the page).
+
+**Double-click an encoder = init value** (deliverable of the same day):
+the server resolves what the encoder edits on the current page -- the
+track (`0x100b14cc`), the page kind (`0x460d1684`), the track's machine
+or effect, the firmware's own page descriptor with its init value, min and
+count (`param_map.json`, from the knob handler `0x40055008`) -- reads the
+Part byte, and sends the difference as detent reports (at most 64 each, 30
+ms of firmware between, re-reading until the value is the init or stops
+moving), so the LCD and the sound follow because the firmware did it.
+Measured (`check_reset.py`): AMP VOL 84 -> 64 (`sent [-20]`, the VOL box
+redrawn), PLAYBACK PTCH 70 -> 64 (`[-6, -1]`: its hook steps in fractions,
+hence the second round), STRT 33 -> 0, LEVEL 93 -> 108 (init 108: every
+track of the BLANK fixture). Refused with `ok: false` and nothing sent: a
+SETUP window (second press of a page key), the MIXER, TEMPO or a menu
+(the popup record's geometry), MIDI mode (the MIDI-track pages take
+another branch of the handler, not mapped), the master track, and a slot
+the descriptor marks dead (AMP F = XVOL: nibble 8 in the enable long).
+The encoders themselves are endless now: no end stops, every detent goes
+out (a wheel burst is capped at +-64 per report), the indicator turns 15
+degrees per detent and returns to 12 o'clock on a reset; VOLUME is a pot
+and unchanged (the monitor's gain, double-click = 75 %).
 
 ## Limits
 

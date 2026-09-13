@@ -227,8 +227,8 @@
   .k.selecting, .knob.selecting { outline:2px solid #e8b23a !important; outline-offset:2px; }
 
   /* knobs: dark cap, lighter skirt ring, white indicator at 12 o'clock.
-     The cap is rotated in JS: a live encoder shows its bounded position
-     (-64..+63 detents over -150..+150 deg, 0 = centre, see turn()); VOLUME stays put. */
+     The cap is rotated in JS: a live encoder is ENDLESS like the unit's (15 deg per
+     detent, the indicator just goes round, see turn()); VOLUME is a pot and stays put. */
   .knob { border-radius:50%; background:radial-gradient(circle at 50% 38%, #4e4e50, #3a3a3c 55%, #262628);
           box-shadow:0 0 0 1px #1a1a1b, 0 3px 6px rgba(0,0,0,.75), inset 0 1px 0 rgba(255,255,255,.12); }
   .knob::before { content:""; position:absolute; inset:-5px; border-radius:50%; border:3px solid #5c5c5e;
@@ -257,16 +257,22 @@
   #note.show { display:flex; }
   #note span { background:rgba(0,0,0,.55); padding:4px 10px; border-radius:4px; }
 
-  /* crossfader (inert): bed with tick marks, slit, handle */
+  /* crossfader: bed with tick marks, slit, handle. LIVE (13 Sep 2026): drag the
+     handle (or click in the bed), wheel over it, or arrow keys after a click;
+     left = scene A, right = scene B, the firmware owns the value (/xfader). */
   #fbed { left:1032px; top:483px; width:208px; height:39px; background:#141415; border-radius:3px;
-          box-shadow:inset 0 1px 3px #000, 0 0 0 1px #2a2a2c; }
+          box-shadow:inset 0 1px 3px #000, 0 0 0 1px #2a2a2c; cursor:ew-resize; }
   #fbed .tick { position:absolute; width:1px; height:4px; background:#d8d5cc; opacity:.8; }
   #fbed .slit { position:absolute; left:8px; right:8px; top:16px; height:7px; background:#000; border-radius:2px;
                 box-shadow:inset 0 1px 2px #000, 0 0 0 1px #202022; }
-  #fhandle { left:1062px; top:478px; width:22px; height:48px; border-radius:3px;
+  #fhandle { left:1062px; top:478px; width:22px; height:48px; border-radius:3px; cursor:ew-resize;
              background:linear-gradient(90deg, #6a6a68, #b9b9b5 30%, #cfcfcb 50%, #a8a8a4 75%, #5e5e5c);
              border:1px solid #1a1a1a; box-shadow:0 2px 4px rgba(0,0,0,.8), inset 0 1px 0 rgba(255,255,255,.4); }
   #fhandle::after { content:""; position:absolute; left:3px; right:3px; top:22px; height:3px; background:#3a3a38; border-radius:1px; }
+  #fhandle:hover, #fbed:hover ~ #fhandle, #fhandle.focus { box-shadow:0 2px 4px rgba(0,0,0,.8), inset 0 1px 0 rgba(255,255,255,.4), 0 0 0 2px rgba(232,178,58,.35); }
+  #fpos { left:1032px; top:527px; width:208px; text-align:center; color:#d8d5cc; font-size:9px; letter-spacing:.06em;
+          text-transform:uppercase; pointer-events:none; }
+  #fpos b { color:#e8b23a; }
 </style>
 </head>
 <body>
@@ -465,7 +471,7 @@ for (const [id, x, y, w, h, shape, col, glyph] of KEYS) {
 for (const [id, x, y, col] of LEDS) { const d = el(`led ${col}`, x, y, 7, 7); d.id = "led-" + id; }
 for (const [id, x, y, r, live] of KNOBS) {
   const k = el("knob" + (live ? " live" : " pot"), x, y, 2 * r - 8, 2 * r - 8);   // pot = VOLUME, the monitor's gain (see MONITOR)
-  k.dataset.id = id; k.dataset.pos = 0;    // live knobs: net detents sent, -64..+63, 0 = centre (not persisted)
+  k.dataset.id = id; k.dataset.pos = 0;    // live knobs: net detents sent since the page loaded (the indicator's angle; endless, not persisted)
   const cap = document.createElement("div"); cap.className = "cap"; k.append(cap);
 }
 for (const [t, x, y, cls] of LABELS) label(t, x, y, cls);
@@ -500,12 +506,13 @@ for (let i = 0; i < 16; i++) { // bank / track pills under the trig keys
   const p = el("pillb", 133 + i * 74.1, 690, 36, 13);
   p.innerHTML = `<b>${"ABCDEFGHIJKLMNOP"[i]}</b>T${(i % 8) + 1}`;
 }
-{ // crossfader tick marks
+{ // crossfader tick marks, and the position readout under the bed
   const bed = $("#fbed");
   for (let i = 0; i <= 10; i++) for (const top of [3, 32]) {
     const t = document.createElement("div"); t.className = "tick";
     t.style.left = (8 + i * 19.1) + "px"; t.style.top = top + "px"; bed.append(t);
   }
+  const r = document.createElement("div"); r.id = "fpos"; r.textContent = "crossfader"; S.append(r);
 }
 
 // ---------------- fit the stage to the window ----------------
@@ -556,7 +563,7 @@ function refreshMapped() {
   document.querySelectorAll(".knob").forEach(el => {
     const r = rowOfKnob(el);
     el.title = !el.classList.contains("live") ? potTitle()
-             : r != null ? `${el.dataset.id}: encoder row ${hex(r)} — wheel/drag turns (-64..+63 from where the firmware sits), double-click returns to 0`
+             : r != null ? `${el.dataset.id}: encoder row ${hex(r)} — endless: wheel/drag turns it (every detent goes to the firmware); double-click sets the parameter it controls on the current page back to its init value (through the firmware)`
              : `${el.dataset.id}: unmapped — use MAP KEYS`;
   });
 }
@@ -643,46 +650,52 @@ function select(el) {
 // encoders: wheel or vertical drag over a knob = detents on its matrix row.
 // Turns are coalesced (80 ms) since every /knob costs a 30 ms emulator run.
 //
-// The unit's encoders are endless; here each live knob is BOUNDED like a
-// pot (emulator convenience, nothing of it reaches the firmware): a virtual
-// position = the net detents sent since the page loaded or the knob was
-// last double-clicked, -64..+63 (128 positions, 127 detents of travel),
-// drawn as the indicator sweeping 300 deg from 7 o'clock (-64) to 5
-// o'clock (+63). It starts at 0 = the centre, NOT at an end: the firmware's
-// parameter sits wherever the project left it (OTLIVE: LEV 108/127, PTCH
-// 0.0 bipolar, 11 Sep 2026), so a knob anchored at its start could never
-// turn down. Only the detents the position actually moved are sent, so at
-// either end nothing more goes out. Double-click sends -position and
-// returns the knob to 0 (= where the firmware was).
-// The firmware honours the full +/-127 per report (STRT 0..127: +25 -> 25,
-// -25 -> 0, +127 -> 127, -127 -> 0, +16 -> 31, 11 Sep 2026) and clamps
-// each PARAMETER at its own range (MIXER MAIN stops at +15), so a knob
-// turned past a parameter's end drifts from its position and the
-// double-click then overshoots back past it; accepted.
-const POS_MIN = -64, POS_MAX = 63, SWEEP = 300;
+// The unit's encoders are ENDLESS and so are these (13 Sep 2026; until then
+// each knob was bounded to -64..+63 as an emulator convenience): no end
+// stops, every detent goes out, the indicator just keeps going round (15
+// deg per detent, 24 per turn, drawn from the net detents sent since the
+// page loaded -- an angle, not a value; the firmware clamps each PARAMETER
+// at its own range, as the unit does). The firmware honours the full
+// +/-127 per report (STRT 0..127: +25 -> 25, -25 -> 0, +127 -> 127, -127
+// -> 0, 11 Sep 2026); a burst of wheel is capped at +-64 per report here.
+// DOUBLE-CLICK = the parameter this encoder controls on the CURRENT page
+// back to its init value, done by the firmware itself (/knob/reset sends
+// the detents that reach the page descriptor's default: KEYMAP.md, the
+// "Encoders" section of 13 Sep 2026, tools/panel/param_map.json); on a
+// SETUP page, a menu or the MIXER the server answers ok:false and sends
+// nothing. The indicator returns to 12 o'clock as the cue.
+const DEG_PER_DETENT = 15, REPORT_MAX = 64;
 const signed = n => (n > 0 ? "+" : "") + n;
 function drawKnob(el) {
-  el.querySelector(".cap").style.transform =
-    `rotate(${-SWEEP / 2 + (+el.dataset.pos - POS_MIN) * SWEEP / (POS_MAX - POS_MIN)}deg)`;
+  el.querySelector(".cap").style.transform = `rotate(${+el.dataset.pos * DEG_PER_DETENT}deg)`;
 }
-document.querySelectorAll(".knob.live").forEach(drawKnob);   // all start at 0 (centre, ~12 o'clock)
+document.querySelectorAll(".knob.live").forEach(drawKnob);   // all start at 12 o'clock
 const pending = new Map();
 function turn(el, detents) {
   if (!detents) return;
   const row = rowOfKnob(el);
   if (row == null) { hint(`"${el.dataset.id}" knob is unmapped — use MAP KEYS`); return; }
-  const pos = +el.dataset.pos;
-  const moved = Math.max(POS_MIN, Math.min(POS_MAX, pos + detents)) - pos;
-  if (!moved) { hint(`${el.dataset.id} at its ${detents > 0 ? "end" : "start"} (${signed(pos)}) — nothing sent`); return; }
-  el.dataset.pos = pos + moved;
+  el.dataset.pos = +el.dataset.pos + detents;
   drawKnob(el);
   const p = pending.get(el) || {n: 0, timer: 0};
-  p.n += moved;                                // |n| <= 127 by construction
+  p.n = Math.max(-REPORT_MAX, Math.min(REPORT_MAX, p.n + detents));
   if (!p.timer) p.timer = setTimeout(() => {
     pending.delete(el);
-    sendKnob(row, p.n, ` (pos ${signed(+el.dataset.pos)})`);
+    sendKnob(row, p.n, ` (${signed(+el.dataset.pos)} detents since load)`);
   }, 80);
   pending.set(el, p);
+}
+async function resetKnob(el) {
+  const row = rowOfKnob(el);
+  if (row == null) { hint(`"${el.dataset.id}" knob is unmapped — use MAP KEYS`); return; }
+  const p = pending.get(el);
+  if (p) { clearTimeout(p.timer); pending.delete(el); if (p.n) await sendKnob(row, p.n); }   // flush what the wheel left
+  hint(`${el.dataset.id}: back to init…`);
+  const r = await fetch(`/knob/reset?row=${hex(row)}`).then(x => x.json());
+  if (r.ok) {
+    el.dataset.pos = 0; drawKnob(el);
+    hint(`${el.dataset.id}: ${r.name} on ${r.page} (T${r.track}) ${r.before === r.after ? "already at init" : `${r.before} → ${r.after}`} (init ${r.init}, ${r.sent.length} report${r.sent.length === 1 ? "" : "s"} sent)`);
+  } else hint(`${el.dataset.id}: not reset — ${r.note}`);
 }
 // Track keys: a quick double tap (two clicks) opens the track's sample slot
 // list, as on the unit. The two clicks are two ordinary presses; the server
@@ -694,15 +707,7 @@ document.addEventListener("dblclick", e => {
   if (!el) return;
   e.preventDefault();
   if (mapMode) return;
-  const row = rowOfKnob(el);
-  if (row == null) { hint(`"${el.dataset.id}" knob is unmapped — use MAP KEYS`); return; }
-  const p = pending.get(el);
-  if (p) { clearTimeout(p.timer); pending.delete(el); }
-  const seen = +el.dataset.pos - (p ? p.n : 0);   // what the firmware has actually received
-  el.dataset.pos = 0;
-  drawKnob(el);
-  if (seen) sendKnob(row, -seen, " (back to 0)");
-  else hint(`${el.dataset.id} already at 0 — nothing sent`);
+  resetKnob(el);
 });
 const wheelAcc = new Map();
 document.addEventListener("wheel", e => {
@@ -733,6 +738,79 @@ document.addEventListener("mousemove", e => {
   if (d) { drag.y -= d * 6; turn(drag.el, d); }
 });
 document.addEventListener("mouseup", () => { drag = null; });
+
+// ---------------- the crossfader ----------------
+// The pot the panel board reads and reports as `0x40 <adc>` on the panel
+// UART (PANEL_LINK.md, 13 Sep 2026); /xfader?pos=0..127 sends exactly that
+// (0 = leftmost = scene A, 127 = rightmost = scene B, the CC 48 scale) and
+// the firmware keeps the value (0x460d16c8), morphs the scene locks and
+// redraws its fader icon. Nothing is remembered here across reloads: the
+// page asks the firmware where the fader is (on load and every few seconds
+// while idle). Drag the handle or click in the bed, wheel over either
+// (Shift = 8 steps), or Left/Right arrows after a click on it.
+const FADER = {pos: null, want: null, timer: 0, drag: false, focus: false, scenes: ""};
+const FBED = $("#fbed"), FHANDLE = $("#fhandle"), FPOS = $("#fpos");
+const F_LEFT = 1040, F_TRAVEL = 170;      // handle left edge: pos 0 at the slit's left end .. pos 127 at its right end
+function drawFader() {
+  if (FADER.pos == null) { FPOS.textContent = "crossfader"; return; }
+  FHANDLE.style.left = (F_LEFT + FADER.pos / 127 * F_TRAVEL) + "px";
+  FPOS.innerHTML = `A <b>${FADER.pos}</b> B${FADER.scenes}`;
+  FHANDLE.title = FBED.title = `CROSSFADER at ${FADER.pos} (0 = scene A, 127 = scene B; = MIDI CC 48)${FADER.scenes} — drag, wheel (Shift ×8) or ←/→ after a click; the firmware morphs the scene locks`;
+}
+async function faderRefresh() {
+  if (FADER.drag || FADER.timer) return;
+  try {
+    const r = await fetch("/xfader").then(x => x.json());
+    if (r.ok && typeof r.pos === "number") {
+      FADER.pos = r.pos;
+      FADER.scenes = r.scene_a ? ` · scenes ${r.scene_a} / ${r.scene_b}` : "";
+      drawFader();
+    }
+  } catch (e) {}
+}
+async function sendFader(pos) {
+  const r = await fetch(`/xfader?pos=${pos}`).then(x => x.json());
+  if (r.ok) {
+    FADER.pos = r.pos; FADER.scenes = r.scene_a ? ` · scenes ${r.scene_a} / ${r.scene_b}` : ""; drawFader();
+    hint(`crossfader ${r.pos} (firmware ${r.xf}, CC 48 = ${r.cc48}; 0x40 ${r.byte} on the panel link)${FADER.scenes}`);
+  } else hint(`crossfader: ${r.note || "not sent"}`);
+}
+function setFader(pos) {
+  pos = Math.max(0, Math.min(127, Math.round(pos)));
+  if (pos === FADER.pos) return;
+  FADER.pos = pos; drawFader();
+  FADER.want = pos;                              // coalesced: the last position wins, one /xfader per 60 ms
+  if (!FADER.timer) FADER.timer = setTimeout(() => { FADER.timer = 0; sendFader(FADER.want); }, 60);
+}
+function faderPosFromX(clientX) {
+  const rect = FBED.getBoundingClientRect(), s = rect.width / 208;   // the stage is scaled to fit
+  return (clientX - rect.left - (F_LEFT - 1032 + 11) * s) / (F_TRAVEL * s) * 127;
+}
+for (const el of [FBED, FHANDLE]) el.addEventListener("mousedown", e => {
+  e.preventDefault();
+  if (mapMode) { hint("the crossfader is a pot on the panel board, not a matrix cell — nothing to bind"); return; }
+  FADER.drag = true; FADER.focus = true; FHANDLE.classList.add("focus");
+  if (el === FBED) setFader(faderPosFromX(e.clientX));
+});
+document.addEventListener("mousemove", e => { if (FADER.drag) setFader(faderPosFromX(e.clientX)); });
+document.addEventListener("mouseup", () => { FADER.drag = false; });
+document.addEventListener("mousedown", e => {
+  if (!e.target.closest("#fbed, #fhandle")) { FADER.focus = false; FHANDLE.classList.remove("focus"); }
+}, true);
+for (const el of [FBED, FHANDLE]) el.addEventListener("wheel", e => {
+  e.preventDefault();
+  if (mapMode || FADER.pos == null) return;
+  const raw = e.deltaY || e.deltaX;
+  if (!raw) return;
+  setFader(FADER.pos + (raw < 0 ? 1 : -1) * (e.shiftKey ? 8 : 1));   // wheel up = towards B (right)
+}, {passive: false});
+document.addEventListener("keydown", e => {
+  if (!FADER.focus || FADER.pos == null) return;
+  if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+    e.preventDefault();
+    setFader(FADER.pos + (e.key === "ArrowRight" ? 1 : -1) * (e.shiftKey ? 8 : 1));
+  }
+});
 
 // ---------------- MAP KEYS drawer ----------------
 function toggleMap() {
@@ -1001,6 +1079,7 @@ function potTitle() {
   return `VOLUME ${vol} % — the monitor's gain (the headphones): wheel or drag turns it 0..100 %, double-click returns to ${VOL_DEFAULT} %; nothing reaches the firmware (the unit's pot is analogue, after the DAC)`;
 }
 function drawPot() {
+  const SWEEP = 300;   // the pot's travel: 7 o'clock (0 %) to 5 o'clock (100 %), as before the encoders went endless
   POT.querySelector(".cap").style.transform = `rotate(${-SWEEP / 2 + vol * SWEEP / 100}deg)`;
   POT.title = potTitle();
   if (MON.gain) MON.gain.gain.value = vol / 100;
@@ -1420,9 +1499,12 @@ async function poll() {
     monPhase(s, phase);
     if (s.seq !== lastSeq) { lastSeq = s.seq; $("#screen").src = "/screen.png?" + s.seq; }
     if (Object.keys(mapLeds).length && !ledStreamOn) applyLeds(await fetch("/leds").then(x => x.json()));
+    // the crossfader: the firmware's value, on the first ready poll and every ~3.5 s after
+    if (!busy && (FADER.pos == null || ++pollN % 10 === 0)) faderRefresh();
   } catch (e) {}
   setTimeout(poll, 350);
 }
+let pollN = 0;
 
 async function loadMap() {
   try {

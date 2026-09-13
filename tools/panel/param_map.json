@@ -1,0 +1,63 @@
+{
+  "what": "What the page encoders A-F (matrix rows 0x30-0x35) and LEVEL (0x36) edit on the five TRACK PARAMETER pages of an audio track, where the value lives, its range and its init value -- so GET /knob/reset?row= can put a parameter back to init through the firmware (the right number of detents). Read by panel_server.py; every number here was measured 13 Sep 2026 on the emulated stock OS 1.40C (out/raw/section_3_MAIN_OS.bin, C++ port, OTLIVE fixture and the BLANK fixture) with out/_agents/panel-ctl/lab_params.py (log/JSON beside it) and read_init.py. Addresses are RAM (image base 0x40000400).",
+  "ram": {
+    "part_ptr": "0x46c82456",
+    "part_index": "0x100b14cf",
+    "cur_track_ui": "0x100b14cc",
+    "page_kind": "0x460d1684",
+    "midi_mode": "0x80000012",
+    "master_track": "0x80000034",
+    "_notes": "part_ptr -> the current bank blob (0x400e21e0 for bank A); base = blob + part_index * 6322 (0x18b2). page_kind after the FIRST press of a page key: 0 PLAYBACK, 1 LFO, 2 AMP, 3 FX1, 4 FX2 (KEYMAP.md). midi_mode != 0 = the MIDI key's mode (the MIDI-track pages, not mapped here). master_track != 0 with track 7 = the master page (descriptor 0x400d2e8a, not mapped)."
+  },
+  "layout": {
+    "part_stride": 6322,
+    "machine_type": "0x8eda2",
+    "fx1_id": "0x8ed80",
+    "fx2_id": "0x8ed88",
+    "pb_base": "0x8edaa",
+    "pb_track_stride": 30,
+    "pb_machine_stride": 6,
+    "page_base": "0x8ee9a",
+    "page_track_stride": 24,
+    "page_stride": 6,
+    "pb_descriptors": "0x400d5f38",
+    "fx1_descriptors": "0x400d5f58",
+    "fx2_descriptors": "0x400d5fdc",
+    "lfo_descriptor": "0x400d37f6",
+    "amp_descriptor": "0x400d3988",
+    "_notes": "From the knob handler 0x40055008 (objdump, 0x40000400 listing): PLAYBACK page 1 slot s of track t = base + 0x8edaa + t*30 + machine[t]*6 + s (machine[t] = byte base+0x8eda2+t: 0 STATIC, 1 FLEX, 2 THRU, 3 NEIGHBOR, 4 PICKUP -- the five 6-byte blocks of a track's 30 bytes); LFO/AMP/FX1/FX2 page 1 slot s = base + 0x8ee9a + t*24 + (kind-1)*6 + s. The store is `moveb %d2,%a2@` at 0x40055170 (and the SRAM mirror at 0x40055172), after clamp(cur + delta, min, min+count-1) with min/count from the page descriptor. The descriptor (FUN_40031da4, E+0x38 pointers): PLAYBACK = long at 0x400d5f38 + 4*machine, LFO 0x400d37f6, AMP 0x400d3988, FX1 = long at 0x400d5f58 + 4*fx1_id[t] (byte base+0x8ed80+t), FX2 = long at 0x400d5fdc + 4*fx2_id[t] (base+0x8ed88+t). Per slot (E = descriptor - 0x38, PARAM_PAGES.md): name E+0x4e+6s, init value E+0x96+s, min long E+0xa2+4s, count long E+0xd2+4s, and the encoder is live only if bit 0 of nibble s of the long at E+0x18e is set (0x400a6994 shifts the 64-bit E+0x18a:E+0x18e by 4s; AMP's is 0x11811111, so nibble 5 = XVOL = 8: knob F on the AMP page writes nothing, measured)."
+  },
+  "level": {
+    "addr": "0x80000c50",
+    "track_stride": 2,
+    "part_offset": "0x8ed92",
+    "min": 0,
+    "count": 128,
+    "default": 108,
+    "_notes": "LEVEL (row 0x36) on any page: byte 0x80000c50 + 2*track (pc 0x4004ec5a) with the Part copy at base + 0x8ed92 + 2*track (pc 0x4004ec00); +1 per detent (108 -> 109 -> 114 -> 108 on T5 and T1). Init 108: all eight tracks of the BLANK fixture (a project saved blank on a real unit, read_init.py on port 8594) and T1/T5 of OTLIVE read 108. Not a descriptor slot, so no E+0x96 default exists for it."
+  },
+  "step_per_detent": 1,
+  "report_chunk": 64,
+  "evidence": {
+    "method": "Own ot_emu --interactive child on a copy of the OTLIVE card, no DSP cores, YES on the clock dialog. For each page key once (PLAYBACK/AMP/LFO/FX1/FX2) and each row 0x30..0x35: `watchmem base+0x8ed80 0x200`, `knob <row> +1`, `writes` (pc:addr:val), the value at the computed address before/after, a peek diff of the region, the LCD diff (blocks, bounding box) from the panel stream, then `knob +5` and `knob -6` (restored). Then LEVEL against 0x80000c50..0x80000c5f. All of it on T5 (FLEX, boot track) and again on T1 (STATIC) for the stride. Fixture: part 0, blob 0x400e21e0, machines [0,0,0,0,1,1,1,1], fx1 ids all 4 (FILTER), fx2 ids all 8 (DELAY).",
+    "T5_FLEX": {
+      "PLAYBACK": "0x40171008..0d (+0x8ee28 = 0x8edaa + 4*30 + 1*6): PTCH 64 (def 64, min 4, count 121: clamped, +1 stays 64? no: 64->64 because PTCH's hook steps in 0.x units -- see step note), STRT 0->1->6, LEN 0->1->6, RATE 127 (max, clamped), RTRG 0->1->6, RTIM 79->80->85; every write pc 0x40055170; LCD boxes redrawn at x 40-75/84-94/104-114, y 2-26 (top row A B C) and y 38-54 (bottom row D E F)",
+      "AMP": "0x401710e0..e5 (+0x8ef00 = 0x8ee9a + 4*24 + 1*6): ATK 0->1->6, HOLD 127 (max), REL 127 (max), VOL 64->65->70, BAL 64->65->70, XVOL 127: no write, no LCD block (nibble 8, not live)",
+      "LFO": "0x401710da..df (+0x8eefa): SPD1/2/3 32->33->38, DEP1/2/3 0->1->6",
+      "FX1": "0x401710e6..eb (+0x8ef06, FILTER 0x400d47aa): BASE 0->1->6, WDTH 127 (max), Q 0->1->6, DPTH 64->65->70, ATK 0->1->6, DEC 64->65->70",
+      "FX2": "0x401710ec..f1 (+0x8ef0c, DELAY 0x400d4ace): TIME 47->48->53, FB 0->1->6, VOL 127 (max), BASE 0->1->6, WDTH 127 (max), SEND 0->1->6",
+      "LEVEL": "0x80000c58 108->109->114->108, Part 0x40170f7a (+0x8ed9a = 0x8ed92 + 4*2)"
+    },
+    "T1_STATIC": {
+      "PLAYBACK": "0x40170f8a..8f (+0x8edaa): the same six names and steps (STATIC and FLEX share the descriptor layout; 0x400d301c vs 0x400d31ae)",
+      "AMP": "0x40171080..85 (+0x8eea0 = 0x8ee9a + 0*24 + 6)",
+      "LFO": "0x4017107a..7f (+0x8ee9a)",
+      "FX1": "0x40171086..8b (+0x8eea6)",
+      "FX2": "0x4017108c..91 (+0x8eeac)",
+      "LEVEL": "0x80000c50 108->109->114->108, Part 0x40170f72 (+0x8ed92)"
+    },
+    "step_note": "One detent = one unit of the stored byte on every live page-1 slot (before+1 after +1, before+5 after +5, back after -6), clamped at max (RATE/HOLD/REL/WDTH/VOL at 127 stayed 127 on +1 and read 121 after -6). PTCH: the store at 0x40055170 wrote 64 on +1 and the value read 64 -- its hook accumulates fractions (the display steps in 0.1 semitones over raw 4..124), so /knob/reset re-reads after every report and sends the remaining difference again, up to six rounds, instead of assuming one unit per detent.",
+    "init_values": "BLANK fixture (out/_projects/blank/BLANK, saved blank on a real unit): every page-1 slot of all eight tracks equals its descriptor default (E+0x96): PLAYBACK PTCH 64 STRT 0 LEN 0 RATE 127 RTRG 0 RTIM 79; LFO SPD 32 32 32 DEP 0 0 0; AMP ATK 0 HOLD 127 REL 127 VOL 64 BAL 64 (XVOL 127); FX1 FILTER BASE 0 WDTH 127 Q 0 DPTH 64 ATK 0 DEC 64; FX2 DELAY TIME 47 FB 0 VOL 127 BASE 0 WDTH 127 SEND 0; LEVEL 108. The OTLIVE fixture's T1 and T5 read the same. Manual cross-check (the parameter chapters state few numbers): BAL centred, PTCH 0.0 (raw 64), HOLD/REL full, VOL 64 -- consistent; the descriptor table is the firmware's own source of a fresh part's values, which is what /knob/reset uses.",
+    "not_mapped": "MIDI mode (0x80000012 != 0: the MIDI-track pages take the other branch of 0x40055008 at 0x40055304), the master track page, the page SETUP windows (second press of a page key: enum editors, KEYMAP.md), the MIXER, TEMPO and other windows -- /knob/reset answers ok:false with a note and sends nothing."
+  }
+}

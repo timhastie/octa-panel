@@ -143,6 +143,32 @@ pieces. It writes `selftest_boot.png` and `selftest_mixer.png` under
 
     .venv/bin/python3 tools/panel/panel_link.py --decode tx.bin --png lcd.png
 
+## Panel -> CPU: the RX parser (13 Sep 2026)
+
+`0x4009228c` (RAM, 0x40000400 listing) runs on the UART's receive
+interrupt over the ring at `0x46100b28` (`0x40092254` fills it). The FIRST
+byte of a report decides its class by its high nibble and its payload
+length; the low nibble is the row:
+
+| first byte | payload | class |
+|---|---|---|
+| `0x2r` | 1 byte | **key matrix row r**, bitmask (set = held); changed bits against the last mask (`0x46100b18[r]`) become key events from the descriptor table at `[0x46c901dc] + (r*8+bit)*12` (+770 with the modifier row's key held), posted to the UI/sys queues |
+| `0x3r` | 1 byte | **encoder r**, signed detent delta; if the previous report is still unread it is ADDED into the pending message (`0x4009250c`), else a 6-byte message `{type, sub, delta, stamp}` is posted (`0x40092526`) |
+| `0x40` | 1 byte | **the crossfader**: the ADC byte 0..255. Scaled by the calibration record at `0x1ffffe` (magic `0x1234`: min `[0x1ffffc]+1`, span from `[0x1ffffa]`, `0x400925ac`), none under emulation so `pos = (byte >> 1) & 127`; `0x40092fac` drops a repeat of the last value (`0x400d16cc`) and `0x40092f2c` writes it into a 2-byte ping-pong message `04 <pos>` at `0x400d16c8/ca` (coalesced while one is pending) and posts it to the sys queue registered in `0x46104ca4`. Sys kind 4 -> `0x40061e0a`: gated on AUDIO CC OUT having INT (`0x8000004a` bit 0), stores `0x460d16c8`, rebuilds the 10 weight longs `0x80003c60`, echoes CC 48 = 127-pos if EXT, runs the STRT/LEN/RATE morph `0x4003f1b4` and redraws the fader icon (`0x4003577c`, five glyphs from `0x400bcd7c`, LCD x 104-108 / y 59-61). Rows `0x41`-`0x4f` are ignored (`0x4009256a` wants row 0) |
+| `0x7r` | 9 bytes | a report copied to `0x46100b48` with its pointer in `0x46100b52` (the panel's handshake/version reply; not seen under emulation) |
+| anything else | -- | the parser stays in its header state |
+
+Measured on the port (`out/_agents/panel-ctl/lab_params.py`, OTLIVE):
+`0x40 255` -> `0x460d16c8` = 127, `0x40 0` -> 0, `128` -> 64, `64` -> 32,
+`192` -> 96, `1` -> 0, `254` -> 127, `127` -> 63, `200` -> 100; each one
+redraws the icon and rebuilds the weights (`0x80003c60` = `0x8000_0000` at
+127 = scene A fully, `0x0000_8000` at 0 = scene B). Rows `0x27`-`0x2f`,
+`0x37`-`0x3f`, `0x41`, `0x42`, `0x4f` with a value byte change nothing
+(`0x27`/`0x37` nudge the tempo readout's redraw, as KEYMAP.md found for
+`0x27`). The panel's own scaling of the pot to `0x40 <byte>` on the
+hardware is not measured here (no unit); the message and the firmware's
+side are.
+
 ## Not yet known
 
 - The meaning of the `0xb5` five bytes and of `0x4n` for n != 3; `60 00` /
@@ -151,5 +177,6 @@ pieces. It writes `selftest_boot.png` and `selftest_mixer.png` under
 - Which physical LED each bitmap bit and each level id is (the boot
   animation at `0x4006307c`-`0x40063178` walks ids 0-15 with levels
   14-30, a starting point for a map).
-- The RX side beyond key/encoder reports (parser callback `0x40092254`
-  ring at `0x46100b28`, consumer `0x4009228c`).
+- The RX side's `0x7r` nine-byte report (its producer on the panel board)
+  and the encoder message's type/sub bytes per row (the descriptor table at
+  `[0x46c901dc]`); keys, encoders and the crossfader are decoded above.

@@ -125,6 +125,42 @@ def setup_window_open(uc):
             and bool(word(0x20) & 0x20))
 
 
+# -- 13 Sep 2026: the page encoders' parameters and the crossfader ------------
+# ARM ALL / DISARM ALL (YES / NO on the bare main screen) never time out under
+# the emulator (KEYMAP.md); the page-1 encoders still edit the page under them,
+# so a reset goes ahead with either on screen. Any other popup (a SETUP
+# window, the MIXER, TEMPO, a menu) means the encoders edit something else.
+ARM_ALL_GEOMETRY = (0x25, 0x17, 0xb8, 0x12)
+DISARM_ALL_GEOMETRY = (0x1e, 0x17, 0xc6, 0x12)
+XFADER = 0x460d16c8         # the crossfader position the morph reads, long 0..127: 127 = scene A
+                            # (leftmost), 0 = scene B (docs/firmware/midi_re_scene.md; measured
+                            # 13 Sep 2026: the weight table 0x80003c60 reads 0x8000_0000 at 127)
+XFADER_ROW = 0x40           # the panel's fader report: `0x40 <adc 0..255>` on the panel UART; the RX
+                            # parser (0x4009228c, class 0x40 with row nibble 0) scales the byte by the
+                            # calibration record at 0x1ffffe (magic 0x1234; none under emulation ->
+                            # value >> 1) and posts sys message kind 4 (0x40092fac -> 0x40092f2c ->
+                            # handler 0x40061e0a, which stores it, rebuilds the weights and redraws
+                            # the fader icon at LCD x 104-108 / y 59-61). PANEL_LINK.md.
+SCENE_A_OFF, SCENE_B_OFF = 0x8ed90, 0x8ed91   # the Part's assigned scenes (0-based), base-relative
+PARAM_MAP_FILE = pathlib.Path(__file__).parent / "param_map.json"
+
+
+def load_param_map(path=PARAM_MAP_FILE):
+    """tools/panel/param_map.json with its hex strings turned into ints
+    (the "_notes" and evidence strings left alone); {} when missing."""
+    try:
+        raw = json.loads(pathlib.Path(path).read_text())
+    except (OSError, ValueError):
+        return {}
+    def conv(v):
+        if isinstance(v, str) and re.fullmatch(r"0x[0-9a-fA-F]+", v):
+            return int(v, 16)
+        if isinstance(v, dict):
+            return {k: (v2 if k.startswith("_") else conv(v2)) for k, v2 in v.items()}
+        return v
+    return conv(raw)
+
+
 KEY_TABLE = 0x400d2954   # per-key jump table: 66 longword handlers
 KEY_COUNT = 66
 IDX_REC, IDX_PLAY, IDX_STOP = 27, 28, 29   # measured: 0x4000a274/0x4000a200/0x4000a1e0
@@ -1115,6 +1151,7 @@ class Panel:
         self.led_bits = bytearray(64)
         self.led_ids = {}
         self.handlers = self._read_table(image)
+        self.param_map = load_param_map()       # what the page encoders edit (param_map.json)
         self._new_link()
         threading.Thread(target=self._loop, daemon=True, name="emu").start()
 
@@ -1746,6 +1783,145 @@ class Panel:
                         " closes the page and, pressed twice more, reopens it)")
             return f"row {row:#04x} delta {delta:+d}{note}"
         return self.do(act, timeout=120)
+
+    # -- 13 Sep 2026: what an encoder edits on the current page, and the reset --
+    def page_param(self, rt, row):
+        """Resolve encoder `row` (0x30-0x36) against the firmware's state:
+        the current track, the page kind, the machine / effect of the
+        track, the page descriptor (param_map.json, measured 13 Sep 2026)
+        -> (info dict, None) or (None, why not). Nothing is sent."""
+        pm = self.param_map
+        if not pm:
+            return None, "param_map.json missing"
+        uc = rt.uc
+        rd = lambda a, n: bytes(uc.mem_read(a, n))                       # noqa: E731
+        u8 = lambda a: rd(a, 1)[0]                                       # noqa: E731
+        u32 = lambda a: int.from_bytes(rd(a, 4), "big")                  # noqa: E731
+        s32 = lambda a: int.from_bytes(rd(a, 4), "big", signed=True)     # noqa: E731
+        ram, lay = pm["ram"], pm["layout"]
+        if u32(ram["midi_mode"]):
+            return None, "MIDI mode: the MIDI-track pages are not mapped"
+        g = popup_geometry(uc)
+        if g is not None and g not in (ARM_ALL_GEOMETRY, DISARM_ALL_GEOMETRY):
+            what = "a SETUP page" if g == SETUP_GEOMETRY else f"a window ({', '.join(hex(v) for v in g)})"
+            return None, f"{what} is open: the encoders edit its boxes, not a page parameter -- nothing sent"
+        track = u8(ram["cur_track_ui"])
+        base = u32(ram["part_ptr"]) + u8(ram["part_index"]) * lay["part_stride"]
+        if row == 0x36:
+            lv = pm["level"]
+            addr = lv["addr"] + lv["track_stride"] * track
+            return {"row": row, "knob": "LEVEL", "name": "LEV", "page": "LEVEL", "track": track + 1,
+                    "addr": addr, "min": lv["min"], "count": lv["count"], "default": lv["default"],
+                    "cur": u8(addr)}, None
+        kind = u32(ram["page_kind"])
+        names = {0: "PLAYBACK", 1: "LFO", 2: "AMP", 3: "FX1", 4: "FX2"}
+        if kind not in names:
+            return None, f"page kind {kind} is not one of the five parameter pages"
+        if track == 7 and u8(ram["master_track"]):
+            return None, "the master track's page is not mapped"
+        slot = row - 0x30
+        if kind == 0:
+            mt = u8(base + lay["machine_type"] + track)
+            desc = u32(lay["pb_descriptors"] + 4 * mt)
+            addr = base + lay["pb_base"] + track * lay["pb_track_stride"] + mt * lay["pb_machine_stride"] + slot
+            page = f"PLAYBACK ({['STATIC', 'FLEX', 'THRU', 'NEIGHBOR', 'PICKUP'][mt] if mt < 5 else mt})"
+        else:
+            if kind == 3:
+                desc = u32(lay["fx1_descriptors"] + 4 * u8(base + lay["fx1_id"] + track))
+            elif kind == 4:
+                desc = u32(lay["fx2_descriptors"] + 4 * u8(base + lay["fx2_id"] + track))
+            else:
+                desc = lay["lfo_descriptor"] if kind == 1 else lay["amp_descriptor"]
+            addr = base + lay["page_base"] + track * lay["page_track_stride"] + (kind - 1) * lay["page_stride"] + slot
+            page = names[kind]
+        if not desc:
+            return None, f"no descriptor for {page}"
+        E = desc - 0x38
+        name = rd(E + 0x4e + 6 * slot, 6).split(b"\0")[0].decode("ascii", "replace")
+        # the enable nibbles are addressed from the descriptor POINTER (E+0x38):
+        # `a3@(398)` in 0x40055008, shifted by 4*slot through 0x400a6994
+        live = (u32(desc + 0x18e) >> (4 * slot)) & 1
+        mn, cnt = s32(E + 0xa2 + 4 * slot), s32(E + 0xd2 + 4 * slot)
+        if not live or name in ("", "---") or cnt < 2:
+            return None, f"encoder {chr(65 + slot)} edits nothing on {page} ({name or '---'} is not live) -- nothing sent"
+        cur = u8(addr)
+        if mn < 0 and cur > 127:
+            cur -= 256
+        return {"row": row, "knob": chr(65 + slot), "name": name, "page": page, "track": track + 1,
+                "addr": addr, "min": mn, "count": cnt, "default": u8(E + 0x96 + slot), "cur": cur}, None
+
+    def knob_reset(self, row):
+        """Put the parameter encoder `row` edits on the CURRENT page back to
+        its init value THROUGH THE FIRMWARE: read the value, send the
+        difference as detent reports (at most +-64 each, 30 ms of firmware
+        between them), re-read, repeat -- up to six rounds, so a hook that
+        does not step one unit per detent still lands. The LCD and the
+        sound follow because the firmware did the edit. Nothing is sent
+        where the page is not mapped (SETUP windows, menus, MIXER, MIDI
+        mode); the dict says what happened either way."""
+        if not (0x30 <= row < 0x37):
+            return False, {"note": "encoder rows are 0x30-0x36"}
+        chunk = int(self.param_map.get("report_chunk", 64) or 64) if self.param_map else 64
+        def act(rt):
+            info, why = self.page_param(rt, row)
+            if info is None:
+                return {"ok": False, "note": why}
+            addr, target, mn = info["addr"], info["default"], info["min"]
+            def read():
+                v = rt.uc.mem_read(addr, 1)[0]
+                return v - 256 if mn < 0 and v > 127 else v
+            before, sent, rounds = info["cur"], [], 0
+            cur = before
+            while cur != target and rounds < 6:
+                step = max(-chunk, min(chunk, target - cur))
+                rt.uart64.rx.extend([row, step & 0xff])
+                rt.run(ms=30)
+                sent.append(step)
+                rounds += 1
+                nxt = read()
+                if nxt == cur:      # the firmware did not move it: stop rather than pile up reports
+                    break
+                cur = nxt
+            after = read()
+            note = ("already at init" if before == target else
+                    "reset" if after == target else
+                    f"stopped at {after} (the encoder did not move the value further)")
+            return {"ok": after == target, "note": note, "knob": info["knob"], "name": info["name"],
+                    "page": info["page"], "track": info["track"], "addr": f"{addr:#x}", "before": before,
+                    "after": after, "init": target, "range": [mn, mn + info["count"] - 1], "sent": sent}
+        ok, res = self.do(act, timeout=120)
+        if not ok:
+            return False, {"note": str(res)}
+        return bool(res.get("ok")), res
+
+    def xfader(self, pos=None):
+        """The crossfader. `pos` 0..127 (0 = leftmost = scene A, 127 =
+        rightmost = scene B, the same scale as MIDI CC 48) is sent the way
+        the panel board reports the pot: `0x40 <byte>` on the panel UART,
+        byte = 2*(127-pos)+1, which the firmware scales to its own 0..127
+        (127 = A). None = just read. Answers the firmware's value either
+        way: {pos, xf, cc48, scene_a, scene_b}."""
+        def act(rt):
+            uc = rt.uc
+            byte = None
+            if pos is not None:
+                p = max(0, min(127, int(pos)))
+                byte = 2 * (127 - p) + 1
+                rt.uart64.rx.extend([XFADER_ROW, byte])
+                rt.run(ms=30)
+            xf = int.from_bytes(uc.mem_read(XFADER, 4), "big", signed=True)
+            out = {"pos": 127 - xf, "xf": xf, "cc48": 127 - xf, "byte": byte}
+            try:
+                pm = self.param_map
+                base = (int.from_bytes(uc.mem_read(pm["ram"]["part_ptr"], 4), "big")
+                        + uc.mem_read(pm["ram"]["part_index"], 1)[0] * pm["layout"]["part_stride"])
+                out["scene_a"] = uc.mem_read(base + SCENE_A_OFF, 1)[0] + 1
+                out["scene_b"] = uc.mem_read(base + SCENE_B_OFF, 1)[0] + 1
+            except Exception:
+                pass
+            return out
+        ok, res = self.do(act, timeout=120)
+        return (True, res) if ok else (False, {"note": str(res)})
 
     # PLAY and STOP as the panel scanner reports them (key_map.json, measured
     # 11 Sep 2026): row 0x25 bit 0 and row 0x24 bit 7. FUNC is 0x25 bit 5.
@@ -2547,6 +2723,19 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/knob":
             ok, res = p.knob(int(args.get("row", "-1"), 0), int(args.get("delta", "0")))
             self._json({"ok": ok, "result": str(res)})
+        elif path == "/knob/reset":
+            # the parameter this encoder edits on the CURRENT page back to its
+            # init value, through the firmware (detent reports): the page's
+            # double-click. ok:false + note where the page is not mapped.
+            ok, res = p.knob_reset(int(args.get("row", "-1"), 0))
+            self._json({"ok": ok, **res})
+        elif path == "/xfader":
+            # the crossfader: ?pos=0..127 (0 = scene A / left, 127 = scene B /
+            # right, = MIDI CC 48) sends the panel's fader report; without
+            # pos it only reads the firmware's value
+            pos = args.get("pos")
+            ok, res = p.xfader(None if pos is None else int(pos))
+            self._json({"ok": ok, **res})
         elif path == "/tap":
             # n presses of one key inside one action (the double-tap chords:
             # /tap?row=0x22&bit=0&n=2 opens track 1's sample slot list)
