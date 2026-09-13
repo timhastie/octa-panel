@@ -172,6 +172,10 @@ EMAC-fixed Unicorn (`scripts/build_unicorn.sh`), `vendor/dsp56300` pinned to
 - The idle pump runs ~0.8× real time (25 emulated ms per ~30 ms wall);
   `/status speed` reads high while idle because idle runs return early.
 
+- **Recording into a DAW (13 Sep 2026, commit 899425b):** Audio ▸ Output
+  Device sends MAIN L/R to channels 1-2 and CUE L/R to 3-4 of any CoreAudio
+  device (BlackHole etc.) via sounddevice; `/audio/devices`, `/audio/output`.
+
 ## Repo / process rules that matter
 
 - **No Elektron bytes in git**: `out/`, `downloads/`, `vendor/`, `.venv/` are
