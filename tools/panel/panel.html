@@ -17,6 +17,9 @@
   /* ---- toolbar (outside the unit) ---- */
   #top { flex:none; background:#121214; border-bottom:1px solid #232326; }
   #bar { display:flex; flex-wrap:wrap; align-items:center; gap:6px 8px; padding:5px 56px 5px 10px; min-height:22px; font-size:11px; }   /* right: room for #topbtn */
+  #bar button.icon { padding:2px 5px; line-height:0; color:#8e8c86; background:transparent; border-color:transparent; }
+  #bar button.icon:hover { color:#d8d5cc; background:#2c2c2e; border-color:#47474a; }
+  #bar button.icon.on { color:#ffd23a; }
   #bar .brand { color:#6f6d68; letter-spacing:.25em; font-size:10px; font-weight:600; }
   #bar .img { color:#bdbab2; font-family:ui-monospace, Menlo, monospace; font-size:10px; }
   #phase { padding:1px 8px; border-radius:9px; font-size:10px; background:#2a2a2c; color:#bdbab2; }
@@ -85,7 +88,7 @@
 
   /* ---- stage ---- */
   #view { flex:1; position:relative; overflow:hidden; }
-  #stage { position:absolute; left:50%; top:50%; width:1420px; height:760px; overflow:hidden;
+  #stage { position:absolute; left:50%; top:8px; width:1420px; height:760px; overflow:hidden; transform-origin:50% 0;
            transform-origin:50% 50%; transform:translate(-50%,-50%) scale(1);
            border-radius:18px; user-select:none; -webkit-user-select:none;
            background:linear-gradient(#1c1c1e, #101011);
@@ -256,7 +259,7 @@
     <span id="phase">…</span>
     <span id="rt" title="x real time: emulated ms per wall s over the last second / 1000 (the unit's own clock = 1.00x)"></span>
     <span id="fault"></span>
-    <button id="monbtn" onclick="toggleMon()" title="sound on/off: reboot the unit with or without the DSP cores (listening: click the HEAD-PHONES jack, VOLUME is its gain)">SOUND</button>
+    <button id="monbtn" class="icon" onclick="toggleMon()" title="sound on/off: reboot the unit with or without the DSP cores (listening: click the HEAD-PHONES jack, VOLUME is its gain)" aria-label="sound"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9H4z" fill="currentColor" stroke="none"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.5 5.5a9 9 0 0 1 0 13"/></svg></button>
     <span id="hint"></span>
   </div>
   <div id="pool">
@@ -475,7 +478,7 @@ for (let i = 0; i < 16; i++) { // bank / track pills under the trig keys
 function fit() {
   const v = $("#view");
   const s = Math.min((v.clientWidth - 16) / STAGE_W, (v.clientHeight - 16) / STAGE_H);
-  S.style.transform = `translate(-50%,-50%) scale(${Math.max(0.1, s)})`;
+  S.style.transform = `translate(-50%,0) scale(${Math.max(0.1, s)})`;   // top-aligned (13 Sep 2026: no gap above the unit)
 }
 window.addEventListener("resize", fit);
 if (window.ResizeObserver) new ResizeObserver(fit).observe($("#view"));   // the toolbar re-wrapping changes the view too
