@@ -46,6 +46,19 @@
 // VIRTUAL_PANEL_SOUND=0|1, VIRTUAL_PANEL_SAVE_DIR=<dir> and
 // VIRTUAL_PANEL_NAV=open:|go:<path> drive it from scripts.
 //
+// Output device (13 Sep 2026): Audio > Output Device lists the Mac's audio
+// devices (GET /audio/devices, fetched when the menu opens) -- Off, then
+// each device with a checkmark on the running one -- and sends the choice
+// as GET /audio/output?device=<name>: the server streams the unit's outputs
+// to it in real time (main L/R on channels 1-2, cue L/R on 3-4, the other
+// four ESAI words on 5-8; a 2-channel device gets main L/R; BlackHole for a
+// DAW). The line under the submenu shows the map. The choice is remembered
+// (UserDefaults outputDevice) and re-sent whenever /status returns to ready
+// (a fresh server after Reload / Open Project knows nothing of it; the
+// server itself keeps the stream across its child's reboots and answers
+// "already on"). VIRTUAL_PANEL_OUTPUT=<name|off> is this launch's choice,
+// not remembered, for scripts.
+//
 // The card (13 Sep 2026, O19): the server's --card <img> boots a PERSISTENT
 // card image with the child's write-back on, so SAVE PROJECT on the unit and
 // the samples put on the card survive a quit. File > New Card from Project...
@@ -362,6 +375,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     static let projectKey = "projectDir"   // UserDefaults: the Open Project... choice
     static let saveDirKey = "saveDir"      // UserDefaults: where the last recording was saved
     static let cardKey = "cardPath"        // UserDefaults: the card image (O19) booted at launch
+    static let outputKey = "outputDevice"  // UserDefaults: the output device's name ("" / absent = off)
 
     let repo: URL
     let server: PanelServer
@@ -400,6 +414,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     var launchCard: URL?                   // VIRTUAL_PANEL_CARD: this launch's card, not remembered
     var navHookMarker = ""
     var interceptedNavs = 0                // audio/wav navigations turned into the save flow
+    // the output device (13 Sep 2026)
+    var audioMenu: NSMenu!
+    var outputMenu: NSMenu!                // Audio > Output Device: Off + every device /audio/devices lists
+    var outputMapItem: NSMenuItem!         // the channel-map line under it (disabled, informative)
+    var outputDevices: [[String: Any]] = []   // /audio/devices as last fetched
+    var outputState: [String: Any]?        // the server's "output" state as last fetched
+    var outputRefreshing = false
+    var launchOutput: String?              // VIRTUAL_PANEL_OUTPUT: this launch's device, not remembered
+    var readyBefore = false                // /status has read ready once: later readies are "ready again"
 
     init(repo: URL, port: Int) {
         self.repo = repo
@@ -473,6 +496,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         if let n = env["VIRTUAL_PANEL_NAV"], !n.isEmpty {
             navHook = n
             Log.write("VIRTUAL_PANEL_NAV: \(n), fired once the page has loaded")
+        }
+        // VIRTUAL_PANEL_OUTPUT=<name|off>: this launch's output device, not
+        // remembered, applied whenever /status returns to ready (like the
+        // remembered choice).
+        if let o = env["VIRTUAL_PANEL_OUTPUT"], !o.isEmpty {
+            launchOutput = o
+            Log.write("VIRTUAL_PANEL_OUTPUT: \(o) (this launch only; applied whenever the unit is ready)")
         }
         startStatusPoll()
     }
@@ -641,6 +671,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         soundItem.target = self
         soundItem.isEnabled = false
         soundItem.toolTip = "The port child runs the DSP cores (--dsp): the main output is captured for the page's monitor and the takes; while it plays the unit runs ~9x slower than real time (~3x slower than without the cores). Switching reboots the unit."
+        audio.addItem(.separator())
+        // Output Device (13 Sep 2026): the unit's outputs on a Mac audio device
+        // (BlackHole for a DAW); the list comes from /audio/devices when the
+        // Audio menu or the submenu opens, the checkmark from the same reply.
+        let outItem = audio.addItem(withTitle: "Output Device", action: nil, keyEquivalent: "")
+        outputMenu = NSMenu(title: "Output Device")
+        outputMenu.autoenablesItems = false
+        outputMenu.delegate = self
+        outItem.submenu = outputMenu
+        outputMapItem = audio.addItem(withTitle: Self.mapLine(nil), action: nil, keyEquivalent: "")
+        outputMapItem.isEnabled = false
+        outputMapItem.toolTip = "Where the unit's outputs land on the chosen device: main L/R on channels 1-2, cue L/R on 3-4, ESAI words 0/1 on 5-6 and 6/7 on 7-8 (as many pairs as the device has; a 2-channel device gets main L/R)."
+        rebuildOutputMenu()
+        audioMenu = audio
         audioItem.submenu = audio
 
         let winItem = NSMenuItem(); main.addItem(winItem)
@@ -1248,6 +1292,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             Log.write("status: phase \(ph), sound \(sound.map { $0 ? "on" : "off" } ?? "unknown")"
                       + (soundNote.isEmpty ? "" : " (\(soundNote))"))
         }
+        // the output device: re-sent whenever the unit returns to ready (a
+        // fresh server knows nothing; the running one answers "already on")
+        if ph == "ready" && phase != "ready" {
+            if let w = outputWanted {
+                applyOutput(w, source: readyBefore ? "ready again after \(phase)" : "ready")
+            }
+            readyBefore = true
+        }
         soundOn = sound
         phase = ph
         // the card (O19)
@@ -1276,8 +1328,119 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         item.isEnabled = enabled
     }
 
-    /// The Audio menu is about to open: refresh the checkbox first.
-    func menuWillOpen(_ menu: NSMenu) { pollStatusOnce() }
+    /// A menu is about to open: a fresh /status for the checkbox and the card
+    /// items; the Audio menu and the Output Device submenu also refresh the
+    /// device list (and the checkmark) from /audio/devices.
+    func menuWillOpen(_ menu: NSMenu) {
+        pollStatusOnce()
+        if menu === audioMenu || menu === outputMenu { refreshOutputMenu() }
+    }
+
+    // MARK: output device
+
+    /// The device to (re)apply: VIRTUAL_PANEL_OUTPUT for this launch, else
+    /// the remembered choice; nil = nothing chosen (the server's default: off).
+    var outputWanted: String? {
+        if let l = launchOutput { return l }
+        if let d = UserDefaults.standard.string(forKey: Self.outputKey), !d.isEmpty { return d }
+        return nil
+    }
+
+    /// The channel-map line under the submenu.
+    static func mapLine(_ out: [String: Any]?) -> String {
+        if let o = out, o["running"] as? Bool == true, let name = o["device"] as? String {
+            let map = (o["map"] as? [String]) ?? []
+            let ch = o["channels"] as? Int ?? 0
+            return "\(name): " + (map.isEmpty ? "\(ch) channels" : map.joined(separator: ", "))
+        }
+        var line = "Output off -- main L/R > 1-2, cue L/R > 3-4, ESAI words 0/1 > 5-6, 6/7 > 7-8"
+        if let n = out?["note"] as? String, !n.isEmpty { line += " (\(n))" }
+        return line
+    }
+
+    /// GET /audio/devices -- the list, the output's state and the capture
+    /// mode in one reply -- then the submenu rebuilt.
+    func refreshOutputMenu() {
+        guard !outputRefreshing, !quitting else { return }
+        outputRefreshing = true
+        server.get("/audio/devices", timeout: 5) { [weak self] ok, r, why in
+            guard let self = self else { return }
+            self.outputRefreshing = false
+            if ok, let r = r {
+                self.outputDevices = (r["devices"] as? [[String: Any]]) ?? []
+                self.outputState = r["output"] as? [String: Any]
+                if r["ok"] as? Bool != true, let e = r["error"] as? String { Log.write("output devices: \(e)") }
+            } else {
+                Log.write("output devices: \(why)")
+                self.outputDevices = []
+                self.outputState = nil
+            }
+            self.rebuildOutputMenu()
+        }
+    }
+
+    /// Off + each device (channels, "default"), the checkmark on the running
+    /// one; the map line follows the state.
+    func rebuildOutputMenu() {
+        guard let menu = outputMenu else { return }
+        let active = outputState?["running"] as? Bool == true ? outputState?["device"] as? String : nil
+        menu.removeAllItems()
+        let off = menu.addItem(withTitle: "Off", action: #selector(chooseOutput(_:)), keyEquivalent: "")
+        off.target = self
+        off.representedObject = "off"
+        off.state = active == nil ? .on : .off
+        if !outputDevices.isEmpty { menu.addItem(.separator()) }
+        for d in outputDevices {
+            guard let name = d["name"] as? String else { continue }
+            let ch = d["channels"] as? Int ?? 0
+            let isDefault = d["default"] as? Bool ?? false
+            let item = menu.addItem(withTitle: "\(name) (\(ch) ch\(isDefault ? ", default" : ""))",
+                                    action: #selector(chooseOutput(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = name
+            item.state = active == name ? .on : .off
+            item.toolTip = ch >= 8 ? "main L/R > 1-2, cue L/R > 3-4, ESAI words 0/1 > 5-6, 6/7 > 7-8"
+                         : ch >= 4 ? "main L/R > 1-2, cue L/R > 3-4" : "main L/R > 1-2"
+        }
+        outputMapItem?.title = Self.mapLine(outputState)
+    }
+
+    /// A pick in the submenu: remembered (Off forgets), sent to the server.
+    @objc func chooseOutput(_ sender: NSMenuItem) {
+        let name = (sender.representedObject as? String) ?? "off"
+        launchOutput = nil     // a choice made here outranks the hook for the rest of the launch
+        if name == "off" { UserDefaults.standard.removeObject(forKey: Self.outputKey) }
+        else { UserDefaults.standard.set(name, forKey: Self.outputKey) }
+        Log.write("output (menu): \(name)\(name == "off" ? "" : " (remembered)")")
+        applyOutput(name, source: "menu")
+    }
+
+    /// GET /audio/output?device=<name|off>: the reply logged (device,
+    /// channels, latency, map), the menu state refreshed; a refusal is
+    /// logged and, from the menu, shown as a sheet.
+    func applyOutput(_ name: String, source: String) {
+        Log.write("output (\(source)): GET /audio/output?device=\(name)")
+        server.get("/audio/output", query: [("device", name)], timeout: 15) { [weak self] ok, r, why in
+            guard let self = self else { return }
+            let out = r?["output"] as? [String: Any]
+            if ok, let r = r, r["ok"] as? Bool == true {
+                let note = r["note"] as? String ?? ""
+                if let o = out, o["running"] as? Bool == true {
+                    let lat = o["latency_ms"].map { "\($0)" } ?? "?"
+                    let map = ((o["map"] as? [String]) ?? []).joined(separator: ", ")
+                    Log.write("output (\(source)): \(o["device"] as? String ?? "?") running, \(o["channels"] as? Int ?? 0) channels, latency \(lat) ms, \(map) -- \(note)")
+                } else {
+                    Log.write("output (\(source)): \(note)")
+                }
+            } else {
+                let e = (r?["error"] as? String) ?? why
+                Log.write("output (\(source)): refused: \(e)")
+                if source == "menu" { self.sheet("The output device was not switched", e) }
+            }
+            self.outputState = out
+            self.rebuildOutputMenu()
+        }
+    }
 
     static func takeName(_ n: Int) -> String { String(format: "octatrack-take-%03d.wav", n) }
 

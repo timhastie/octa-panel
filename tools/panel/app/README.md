@@ -192,6 +192,27 @@ open "out/Virtual Panel.app"
   checkbox stays disabled through the reboot and follows `/status` at
   `ready`. A refusal (already so, busy, route A) is a sheet with the
   server's `note`.
+- **Audio > Output Device** (13 Sep 2026): the unit's outputs on a Mac
+  audio device in real time -- BlackHole for a DAW, or the speakers
+  (`tools/panel/README.md` "Recording into a DAW" has the server side and
+  the numbers). The submenu is built from `GET /audio/devices` whenever
+  the Audio menu or the submenu opens: Off, then each device as `<name>
+  (<n> ch[, default])`, the checkmark on the running one (the same reply
+  carries the server's `output` state); a pick sends `GET /audio/output?
+  device=<name>` and is remembered (UserDefaults `outputDevice`; Off
+  forgets it). The line under the submenu shows the channel map as the
+  server reports it (`BlackHole 16ch: main L/R -> 1-2, cue L/R -> 3-4,
+  ESAI words 0/1 -> 5-6, ESAI words 6/7 -> 7-8`; a 2-channel device
+  `main L/R -> 1-2`; `Output off -- ...` with the full map otherwise).
+  The remembered device is re-sent whenever `/status` returns to `ready`
+  -- the first boot, every respawn, re-insert and sound switch, and a
+  fresh server after Reload / Open Project, which knows nothing of it;
+  the server itself keeps the stream across its child's reboots and
+  answers `already on <name>`, logged as `output (ready again after
+  <phase>): ... -- already on`. A refusal (an unknown device, no
+  `sounddevice` package) is logged and, from the menu, a sheet.
+  `VIRTUAL_PANEL_OUTPUT=<name|off>` is this launch's choice, not
+  remembered, for scripts.
 - **The page's own SAVE links** (`/audio.wav?take=N`, `target=_blank`): a
   `target=_blank` link or `window.open()` reaches the app's `WKUIDelegate`
   (`createWebViewWith`; without one WebKit drops them silently) and is
@@ -293,6 +314,25 @@ under the `Content-Disposition` name `octatrack-main-out.wav`; SIGTERM
 with the save panel's sheet up quit in 333 ms (`quit: ending the open
 sheet`), with the "not available" sheet up in 296 ms. Build: 0 compiler
 warnings, `codesign -vv` valid on the copy and on `out/Virtual Panel.app`.
+
+Output device, measured 13 Sep 2026 (`out/_agents/output/verify_app.py`,
+`verify_app.log`): the built app launched from a shell with
+`VIRTUAL_PANEL_PORT=8598 VIRTUAL_PANEL_OUTPUT="BlackHole 2ch"
+VIRTUAL_PANEL_CARD=out/_agents/output/cards/HOOK.img` (a new card from the
+OTLIVE fixture) logged the hook at once, `/status` read `ready` 7.1 s
+after the spawn and the same second the log had `output (ready): GET
+/audio/output?device=BlackHole 2ch` and `output (ready): BlackHole 2ch
+running, 2 channels, latency 11.6 ms, main L/R -> 1-2`, `/audio/status`
+`capture: all`; a re-insert (`/samples/add` of a generated WAV, then
+`/samples/commit`: `re-inserting the card (reboot, ~40 s)`, `ready`
+again 7.6 s later) logged `output (ready again after re-inserting the
+card (reboot, ~40 s)): ... -- already on BlackHole 2ch` and the stream
+was still running on the fresh child's 8-word capture, with 1 underrun
+(the reboot's gap), 18,369 frames of the boot burst trimmed while it
+re-primed and 1,174 dropped as the fresh child's pacer caught up (all of
+it the idle unit's silence); SIGTERM to
+the app took its server with it (no `panel_server.py --port 8598` left).
+Build: 0 compiler warnings, `codesign -vv` valid.
 
 Window: 1440x860 to start, centered on the first launch, 960x560 minimum,
 size and position remembered (`NSWindow Frame VirtualPanelWindow` in the

@@ -18,7 +18,11 @@ requires-python = ">=3.9"
 dependencies = []
 
 [project.optional-dependencies]
-emu = ["unicorn>=2.1", "textual>=0.80"]
+emu = [
+    "unicorn>=2.1",
+    "textual>=0.80",
+    "sounddevice>=0.5.6",
+]
 
 [tool.uv]
 # Virtual project: do not try to build/install octabam itself, just manage the

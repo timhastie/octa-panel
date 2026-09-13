@@ -309,8 +309,10 @@ render under the vendored JIT on two worker threads driven by the
 ColdFire's own schedule (O17 in `COLDFIRE_PORT.md`), and core 0's
 **main L/R** — the words the ESAI puts out to the DAC, 16-bit (the 24-bit
 word's top two bytes), 44100 Hz — comes over the `--interactive` pipe
-(`audio start main` / `audio read`, O14k). Cue and core 1 are not
-captured. An rt child that cannot start (a binary without `--dsp-rt`, a
+(`audio start main` / `audio read`, O14k). Core 1 is not captured, and
+cue is not in the ring -- but with an output device on ("Recording into a
+DAW" below) the child streams all eight ESAI words and cue L/R goes to
+the device's channels 3-4. An rt child that cannot start (a binary without `--dsp-rt`, a
 host whose DSP memory is not MMU-backed, a boot that faults before
 `ready`) is respawned with the lockstep `--dsp` and `/status sound_note`
 says so; `--port-arg=--dsp` asks for the lockstep cores explicitly;
@@ -373,11 +375,13 @@ the folder already holds and never wiped.
 | route | does |
 |---|---|
 | `GET /status` | adds `sound` (the child runs `--dsp` and its capture is on) and `sound_note` (why not, when not) |
-| `GET /audio/status` | `{sound, on, rate: 44100, captured, end, first, cap, dropped, peak: [l, r], take, takes, note}` — `end` = frames ever captured, `first` = the oldest still in the ring, `cap` = 7 938 000, `dropped` = frames the child overwrote unread, `peak` of the last non-empty read, `take` = `{n, recording, frames, seconds, file, start}` while one is open (else null), `takes` = every take as `{n, file, frames, seconds}`; plus `busy`/`phase` (a reboot in progress), `takes_dir`, and `drain` (what the drain itself costs the pump: reads, wall_ms, max_ms) |
+| `GET /audio/status` | `{sound, on, rate: 44100, captured, end, first, cap, dropped, peak: [l, r], take, takes, note}` — `end` = frames ever captured, `first` = the oldest still in the ring, `cap` = 7 938 000, `dropped` = frames the child overwrote unread, `peak` of the last non-empty read, `take` = `{n, recording, frames, seconds, file, start}` while one is open (else null), `takes` = every take as `{n, file, frames, seconds}`; plus `busy`/`phase` (a reboot in progress), `takes_dir`, and `drain` (what the drain itself costs the pump: reads, wall_ms, max_ms); since 13 Sep 2026 also `capture` (`main` \| `all`: the words per frame the child streams, `all` while an output device is on), `words` (2 \| 8), `peak_cue` (the cue pair's peak of the last 8-word read) and `output` (the device stream, "Recording into a DAW" below) |
 | `GET /audio/pcm?from=<frame>&max=<frames>` | raw LE int16 stereo frames from `max(from, first)`, at most `max` (default 88 200, cap 441 000), `application/octet-stream` with `X-Audio-From` (where the body really starts), `X-Audio-Frames`, `X-Audio-End`, `X-Audio-Rate`; **204** with `X-Audio-End` when `from >= end`. Served from the ring on the HTTP thread: 1–2 ms for 2 s of audio |
 | `GET /audio.wav?take=N` | that take as `audio/wav`, `Content-Disposition: attachment; filename="octatrack-take-NNN.wav"`; a missing take is a 404 JSON |
 | `GET /audio.wav?from=&to=` | ring frames as `octatrack-main-out.wav` (default: everything held); an empty range is a 404 JSON |
 | `GET /audio/enable?on=1\|0` | reboot the child with/without `--dsp`, the card re-insert's own mechanics: `/status phase` reads `switching sound on (reboot, ~1 min)` / `switching sound off (reboot, ~40 s)`, `booted` false meanwhile, the clock dialog closed after; `ok: false` + `note` while a re-insert or switch runs, while booting, when already in that state, or under route A. Takes and the ring survive it |
+| `GET /audio/devices` | the output-capable audio devices PortAudio sees: `{ok, available, devices: [{index, name, channels, rate, default, hostapi}], output, capture, note}` -- rescanned on every call while no stream is open (PortAudio only enumerates at init), so a device plugged in appears once the output is off; `available: false` + `error` without the `sounddevice` package |
+| `GET /audio/output?device=<index\|name\|off>` | start the stream on that device (a name matches exactly, then case-insensitively, then as a unique substring: `device=blackhole`), or stop it; answers `{ok, output, capture, note}` -- `note` reads `already on <name>` when that device is already running (the stream is left alone), a 404 JSON with the `devices` names for an unknown one, 500 with `error` when the package is missing or the device would not open. Without `device=`: the state |
 
 Measured 12 Sep 2026 on the OTLIVE fixture (`out/_agents/monitor-server/`,
 `verify.py`, logs beside it): the drain costs the idle pump ~0.3 ms per
@@ -400,6 +404,90 @@ copy, `out/_agents/audio/tree2`, has them at 48 with looping off, which
 is where the `third-0.wav x 0.70` figure comes from); and the VOLUME pot
 on the panel is the monitor's gain only, as the hardware pot sits after
 the DAC.
+
+## Recording into a DAW
+
+Since 13 Sep 2026 the unit's outputs can go to an audio device on the Mac
+in real time: a virtual device such as
+[BlackHole](https://github.com/ExistentialAudio/BlackHole) (`brew install
+blackhole-16ch`; the DAW records BlackHole's input) or the speakers.
+The server opens a PortAudio output stream (the `sounddevice` package,
+which bundles PortAudio; it is in the `emu` extra of `pyproject.toml`, so
+`uv sync --extra emu` brings it, or into an existing venv `uv pip install
+--python .venv/bin/python3 sounddevice` -- without it `/audio/devices`
+answers `available: false` and everything else works as before) at
+44.1 kHz, int16, 512-frame callbacks, fed from the same drain as the ring
+and the takes. In the app: **Audio ▸ Output Device** (Off, then each
+device; the choice is remembered and re-sent whenever the unit returns
+to ready); by hand:
+
+```sh
+curl 'http://localhost:8563/audio/devices'
+curl 'http://localhost:8563/audio/output?device=BlackHole%2016ch'   # or device=blackhole, or the index
+curl 'http://localhost:8563/audio/status' | python3 -m json.tool      # "output": {...}
+curl 'http://localhost:8563/audio/output?device=off'
+```
+
+**The channel map.** With a device on the child's capture switches to
+`audio start all` -- ALL EIGHT ESAI words per frame (O14k) -- and the
+drain lays them out on the device: **main L/R → channels 1-2, cue L/R →
+3-4, ESAI words 0/1 → 5-6, words 6/7 → 7-8** (the last two pairs are
+zero on the stock firmware; a future mod that uses them is heard), as
+many of those pairs as the device has channels for -- a 2-channel device
+(BlackHole 2ch, the speakers) gets main L/R -- and the stream is opened
+with exactly that many channels, so anything further on the device is
+silent. The ring, the takes and `/audio/pcm` get main L/R de-interleaved
+from the 8-word frames, byte for byte what the `main` capture gave (a
+take made with a device on fits the clean fixture at the same −33.0 dB);
+the switch itself restarts the child's ring, so up to one pacer slice
+(~10 ms) of an open take is lost at the moment a device is chosen or
+dropped. `/audio/status` `output` says how it is going: `device`,
+`channels` (opened) and `device_channels`, `running`, `latency_ms`
+(PortAudio's figure for the device), `buffered_ms` (queued, ahead of the
+callback), `underruns` (callbacks the queue could not fill: zeros went
+out, then the stream re-primes on 100 ms), `dropped` (frames discarded
+oldest-first beyond 250 ms queued while playing: an audible skip),
+`trimmed` (the same while re-priming after a gap -- the fresh child's
+boot burst after a reboot, nothing was due), `pa_underflows` (PortAudio's
+own flag), `pushed` / `played`, `map`, `note`. A device that goes away
+(unplugged, or taken by another app) stops the stream with a `note`
+after 3 s without a callback, nothing else; the server keeps the stream
+across its child's reboots (respawn, re-insert, sound switch: the fresh
+child picks the 8-word capture itself) and only forgets it when it
+exits.
+
+**Drift.** Two clocks meet here: the child's pacer, which delivers
+44,100 frames per wall second, and the device's own sample clock. Over a
+long session their difference accumulates and shows up, now and then, as
+one underrun (a re-prime: ~100 ms of silence) or a drop of the oldest
+frames -- the counters say which and how often; a DAW recording of an
+hour may carry a handful of such seams. Nothing resamples. The latency
+from the PLAY key to the device is the prime (100 ms) plus the drain's
+cadence (20 ms) plus the device's own (11.6 ms on BlackHole).
+
+Measured 13 Sep 2026 (`out/_agents/output/verify.py`, `verify.log`,
+`verify.json`; port 8596, the clean OTLIVE fixture `out/_agents/audio/
+tree2`, `--sound on`, the `--dsp-rt` child): ready in 7.1 s;
+`/audio/devices` listed BlackHole 2ch, External Headphones (default),
+MacBook Pro Speakers, Microsoft Teams Audio (1 ch), two Multi-Output
+Devices; `device=BlackHole 2ch` opened 2 channels at 11.6 ms latency and
+`/audio/status` read `capture: all`, `words: 8` 1.5 s later; a 30 s PLAY
+held `/status rt` 0.993-1.004 with the stream at **underruns 0, dropped
+0, pa_underflows 0, buffered 48-80 ms**, the drain's worst pump 4.1 ms,
+`/audio/pcm` answering 44,100 frames mid-play (the page's headphones
+monitor is unchanged); the take (30.164 s) fits `third-0.wav` at
+**−33.0 dB** (`fit.py`: onset 81, gain 0.7032); `peak_cue` mid-play
+[12765, 12714] against main [18278, 18205], i.e. the fixture's cue words
+carry the second pair 3.1 dB below main; `device=off` stopped the stream
+and the capture was `main` again within a second; an unknown name is a
+404 JSON. Not verified: what the device *receives* -- the independent
+witness (`rec.py`, an input stream on BlackHole from a second process)
+recorded silence, and so does `loop_probe.py` with no emulator at all
+(a sine from one process, a recording from another), which is macOS's
+Microphone permission for the process's host app (every audio input,
+virtual devices included, is silent without it), not the stream; grant
+it and run `verify.py` again for the onset/RMS comparison. Channels 3-4
+were not exercised: this Mac has BlackHole 2ch, not 16ch.
 
 ## No unit to hand? Real projects from public test fixtures
 

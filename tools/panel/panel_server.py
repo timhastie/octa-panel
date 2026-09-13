@@ -60,6 +60,16 @@ Then open http://localhost:8563/. Unmapped keys: the MAP drawer lists every
 table entry; click one, watch the screen, name it. The mapping lives in the
 browser (localStorage) and exports as JSON -- send a completed map back as
 a PR to key_map.json.
+
+The output device (13 Sep 2026): /audio/devices lists the Mac's audio
+devices (PortAudio via the sounddevice package), /audio/output?device=
+<index|name|off> streams the unit's outputs to one of them in real time
+(main L/R on channels 1-2, cue L/R on 3-4, the other four ESAI words on
+5-8; a 2-channel device gets main L/R) -- BlackHole into a DAW, or the
+speakers -- and /audio/status "output" says how it is going (README
+"Recording into a DAW"). With a device on, the child streams all eight
+ESAI words (`audio start all`) and the drain de-interleaves main L/R for
+the ring, the takes and /audio/pcm, which see exactly what they saw.
 """
 import argparse
 import collections
@@ -625,6 +635,268 @@ class TakeWriter:
         return {"n": self.n, "file": str(self.path), "frames": self.frames,
                 "seconds": round(self.frames / AUDIO_RATE, 3), "recording": recording,
                 "start": self.start}
+
+
+# -- the output stage: the unit's outputs on a Mac audio device (13 Sep 2026) --
+#
+# An output stream (the `sounddevice` package: PortAudio over CoreAudio; the
+# `emu` extra of pyproject.toml carries it -- `uv sync --extra emu`, or into
+# an existing venv `uv pip install --python .venv/bin/python3 sounddevice`)
+# on the device the user picks, fed from the same drain as the ring and the
+# takes. With a device on, the child's capture runs `audio start all`: ALL
+# EIGHT ESAI words per frame (O14k: words 2/3 = main L/R, 4/5 = cue L/R,
+# 0/1 and 6/7 whatever the DSP puts there, zero on the fixture). The drain
+# de-interleaves main L/R for the ring, the takes and /audio/pcm -- byte for
+# byte what `audio start main` gives -- and hands the whole frame to the
+# output, which lays it out on the device as main L/R -> channels 1-2, cue
+# L/R -> 3-4, words 0/1 -> 5-6, words 6/7 -> 7-8, as many of those pairs as
+# the device has channels for (a 2-channel device gets main L/R). The stream
+# is opened with exactly that many channels, so anything further on the
+# device is silent. The PortAudio callback (its own thread) pulls from a
+# deque of chunks: it plays nothing until OUTPUT_PRIME_S is queued, puts out
+# zeros and counts an underrun when the queue runs dry (then primes again),
+# and the push drops the OLDEST frames beyond OUTPUT_CAP_S queued so the
+# latency stays bounded -- counted as `dropped` while the stream plays (an
+# audible skip) and as `trimmed` while it is re-priming after a gap (the
+# fresh child's boot burst after a reboot: nothing was due, nothing heard). Two clocks -- the child's pacer (44,100
+# frames per wall second) and the device's own -- so a long session drifts
+# by their difference and shows it as an underrun or a drop now and then.
+# Nothing here touches the emu thread: sounddevice is imported on first use,
+# every PortAudio call is caught, a device that goes away stops the stream
+# with a note.
+
+OUTPUT_BLOCK = 512           # frames per PortAudio callback (11.6 ms)
+OUTPUT_PRIME_S = 0.10        # queued before the stream plays (the drain runs every PACE_POLL_S = 20 ms)
+OUTPUT_CAP_S = 0.25          # queued beyond this: the oldest frames are dropped, and counted
+OUTPUT_STALL_S = 3.0         # no callback for this long while frames arrive: the device is gone, the stream stops
+OUTPUT_ORDER = (1, 2, 0, 3)  # ESAI word pairs onto device channel pairs: main (2/3) -> 1-2, cue (4/5) -> 3-4, 0/1 -> 5-6, 6/7 -> 7-8
+OUTPUT_PAIR_NAMES = ("main L/R", "cue L/R", "ESAI words 0/1", "ESAI words 6/7")
+
+_sd_lock = threading.Lock()
+_sd_state = {}
+
+
+def sounddevice():
+    """The `sounddevice` module, imported on first use (its import
+    initialises PortAudio, which enumerates every CoreAudio device: not at
+    server start, and never fatal). (module | None, note)."""
+    with _sd_lock:
+        if "mod" not in _sd_state:
+            try:
+                import sounddevice as sd
+                _sd_state["mod"], _sd_state["note"] = sd, None
+            except Exception as e:  # ImportError, or PortAudio failing to load
+                _sd_state["mod"] = None
+                _sd_state["note"] = (f"the sounddevice package is not available ({type(e).__name__}: {e}); "
+                                     "`uv sync --extra emu` (or `uv pip install --python .venv/bin/python3 sounddevice`) installs it")
+        return _sd_state["mod"], _sd_state["note"]
+
+
+def audio_devices(refresh=True):
+    """Every output-capable device PortAudio sees, as [{index, name,
+    channels, rate, default, hostapi}]. `refresh` re-initialises PortAudio
+    first, so a device plugged in since the last call appears -- only with
+    no stream open (the caller knows). (list | None, note)."""
+    sd, note = sounddevice()
+    if sd is None:
+        return None, note
+    if refresh:
+        try:
+            sd._terminate()
+            sd._initialize()
+        except Exception as e:
+            note = f"device rescan failed ({type(e).__name__}: {e}); the list may be stale"
+    try:
+        devs = sd.query_devices()
+        default = int(sd.default.device[1])
+    except Exception as e:
+        return None, f"PortAudio: {type(e).__name__}: {e}"
+    out = []
+    for i, d in enumerate(devs):
+        if int(d.get("max_output_channels", 0)) > 0:
+            try:
+                api = sd.query_hostapis(d["hostapi"])["name"]
+            except Exception:
+                api = None
+            out.append({"index": i, "name": d["name"], "channels": int(d["max_output_channels"]),
+                        "rate": float(d["default_samplerate"]), "default": i == default, "hostapi": api})
+    return out, note
+
+
+def resolve_device(spec, devices):
+    """An index, or a name (exact, then case-insensitive, then a unique
+    case-insensitive substring) -> the device dict; LookupError otherwise."""
+    s = str(spec).strip()
+    if s.isdigit():
+        for d in devices:
+            if d["index"] == int(s):
+                return d
+        raise LookupError(f"no output device with index {s}")
+    for d in devices:
+        if d["name"] == s:
+            return d
+    low = s.lower()
+    hits = [d for d in devices if d["name"].lower() == low] or [d for d in devices if low in d["name"].lower()]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        raise LookupError(f"no output device named {s!r}")
+    raise LookupError(f"{s!r} matches {len(hits)} devices: " + ", ".join(d["name"] for d in hits))
+
+
+class AudioOutput:
+    """One PortAudio output stream on one device: Panel._drain_audio pushes
+    the child's frames (2 or 8 words each) laid out for the device, the
+    callback plays them on PortAudio's thread. Counters for /audio/status."""
+
+    def __init__(self, sd, device):
+        self.device = device                         # the dict audio_devices() gave
+        self.index, self.name = device["index"], device["name"]
+        n = int(device["channels"])
+        if n < 2:
+            raise ValueError(f"{self.name} has {n} output channel(s); the unit's outputs need at least 2")
+        self.channels = min(8, n - n % 2)            # 2, 4, 6 or 8: the pairs the device has room for
+        self.units = self.channels // 2              # stereo pairs per device frame
+        self.bpf = self.channels * 2                 # bytes per device frame (int16)
+        self.q = collections.deque()                 # chunks in device frame layout
+        self.off = 0                                 # bytes of q[0] already played
+        self.qbytes = 0
+        self.lock = threading.Lock()
+        self.prime_bytes = int(OUTPUT_PRIME_S * AUDIO_RATE) * self.bpf
+        self.cap_bytes = int(OUTPUT_CAP_S * AUDIO_RATE) * self.bpf
+        self.primed = False
+        self.underruns = 0      # callbacks the queue could not fill: zeros went out, then a re-prime
+        self.dropped = 0        # frames dropped at the push, oldest first, beyond OUTPUT_CAP_S queued WHILE PLAYING (audible)
+        self.trimmed = 0        # ... the same while re-priming after a gap (a reboot's boot burst, a pause): nothing was due
+        self.pushed = 0         # frames the drain handed over
+        self.played = 0         # frames the callback took from the queue
+        self.callbacks = 0
+        self.pa_underflows = 0  # PortAudio's own output-underflow flag on a callback
+        self.words = 2          # words per frame of the last push: 2 = main only, 8 = all
+        self.started = time.time()
+        self.started_mono = time.monotonic()
+        self.last_cb = None
+        self.note = None
+        self.closing = False
+        self.running = False
+        self.stream = sd.RawOutputStream(samplerate=AUDIO_RATE, device=self.index, channels=self.channels,
+                                         dtype="int16", blocksize=OUTPUT_BLOCK, latency="low",
+                                         callback=self._callback, finished_callback=self._finished)
+        self.stream.start()
+        self.running = True
+
+    def channel_map(self):
+        m = [f"{OUTPUT_PAIR_NAMES[k]} -> {2 * k + 1}-{2 * k + 2}" for k in range(self.units)]
+        if self.words == 2 and self.units > 1:
+            m = m[:1] + [f"{self.channels - 2} further channels silent (the capture is main only)"]
+        return m
+
+    def layout(self, data, words):
+        """The child's frames (`words` int16 each) as device frames: the
+        pairs in OUTPUT_ORDER, as many as the device has channels for --
+        memoryview strides, nothing per sample. 2-word frames (the `main`
+        capture) fill the first pair only."""
+        n = len(data) // (words * 2)
+        src = memoryview(data)[:n * words * 2].cast("i")     # one int32 per L/R pair
+        su = words // 2
+        order = OUTPUT_ORDER if words == 8 else (0,)
+        if self.units == 1 and su == 1:
+            return bytes(src)
+        out = bytearray(n * self.bpf)
+        om = memoryview(out).cast("i")
+        for k in range(min(self.units, len(order))):
+            om[k::self.units] = src[order[k]::su]
+        return out
+
+    def push(self, data, words):
+        """From the drain (the emu thread): queue, then drop the oldest
+        beyond the cap. A device that stopped calling back stops the stream."""
+        if not self.running or self.closing:
+            return
+        last = self.last_cb if self.last_cb is not None else self.started_mono
+        if time.monotonic() - last > OUTPUT_STALL_S:
+            self.stop(f"stopped: no callback from {self.name} for {OUTPUT_STALL_S:.0f} s (unplugged, or taken by another app?)")
+            return
+        out = self.layout(data, words)
+        self.words = words
+        with self.lock:
+            self.q.append(out)
+            self.qbytes += len(out)
+            self.pushed += len(out) // self.bpf
+            excess = self.qbytes - self.cap_bytes
+            while excess > 0 and self.q:
+                c = self.q[0]
+                k = min(len(c) - self.off, excess)
+                self.off += k
+                self.qbytes -= k
+                excess -= k
+                if self.primed:
+                    self.dropped += k // self.bpf
+                else:
+                    self.trimmed += k // self.bpf
+                if self.off >= len(c):
+                    self.q.popleft()
+                    self.off = 0
+
+    def _callback(self, outdata, frames, t, status):
+        self.callbacks += 1
+        self.last_cb = time.monotonic()
+        if status and status.output_underflow:
+            self.pa_underflows += 1
+        need = frames * self.bpf
+        with self.lock:
+            if not self.primed:
+                if self.qbytes < self.prime_bytes:
+                    outdata[:need] = bytes(need)
+                    return
+                self.primed = True
+            got = 0
+            while got < need and self.q:
+                c = self.q[0]
+                take = min(len(c) - self.off, need - got)
+                outdata[got:got + take] = bytes(c[self.off:self.off + take])
+                got += take
+                self.off += take
+                self.qbytes -= take
+                if self.off >= len(c):
+                    self.q.popleft()
+                    self.off = 0
+            self.played += got // self.bpf
+            if got < need:
+                outdata[got:need] = bytes(need - got)
+                self.underruns += 1
+                self.primed = False
+
+    def _finished(self):
+        self.running = False
+        if not self.closing and not self.note:
+            self.note = f"the stream on {self.name} ended by itself (device unplugged?)"
+
+    def stop(self, note=None):
+        self.closing = True
+        self.running = False
+        if note:
+            self.note = note
+        try:
+            self.stream.abort(ignore_errors=True)     # not stop(): that waits for a device that may be gone
+            self.stream.close(ignore_errors=True)
+        except Exception as e:
+            self.note = (self.note + "; " if self.note else "") + f"close: {type(e).__name__}: {e}"
+
+    def status(self):
+        with self.lock:
+            qb = self.qbytes
+        try:
+            lat = round(float(self.stream.latency) * 1000.0, 1)
+        except Exception:
+            lat = None
+        return {"device": self.name, "index": self.index, "channels": self.channels,
+                "device_channels": int(self.device["channels"]), "running": self.running,
+                "underruns": self.underruns, "dropped": self.dropped, "trimmed": self.trimmed, "latency_ms": lat,
+                "buffered_ms": round(qb / self.bpf / AUDIO_RATE * 1000.0, 1), "primed": self.primed,
+                "pushed": self.pushed, "played": self.played, "callbacks": self.callbacks,
+                "pa_underflows": self.pa_underflows, "words": self.words, "map": self.channel_map(),
+                "since": self.started, "note": self.note}
 
 
 class PortRx:
@@ -1455,6 +1727,15 @@ class Panel:
         self.takes = []                   # closed takes, oldest first, as /audio/status lists them
         self.take_lock = threading.Lock()
         self.take_seq = self._scan_takes()
+        # The output device (13 Sep 2026, AudioOutput above): the stream the
+        # drain feeds, if one is on; the capture mode the child runs (main =
+        # 2 words a frame, all = 8) and the words per frame the drain parses.
+        self.output = None
+        self.output_lock = threading.Lock()
+        self.output_note = None           # why there is none / what the last attempt said
+        self.audio_mode = "main"
+        self.audio_words = 2
+        self.audio_peak_cue = (0, 0)      # |peak| of the cue pair in the last 8-word read
         self.card = card                  # the FAT16 card image, bytes (route A takes it as is)
         self.card_file = card_file        # ... and the port reads it from this file
         self.pool = pool                  # SamplePool the card's AUDIO was built from
@@ -2588,12 +2869,26 @@ class Panel:
             self.sound = False
             self.sound_note = self.audio_note or SOUND_OFF_NOTE
             return
+        mode = "all" if self._output_live() else "main"
         try:
-            rt.proc.command("audio start main", "ok")
+            rt.proc.command(f"audio start {mode}", "ok")
         except PortError as e:
-            self.sound = False
-            self.audio_note = self.sound_note = f"sound off: the child refused `audio start main` ({e})"
-            return
+            if mode == "all":
+                # an older child without `all`: main L/R only; the output gets that and says so
+                self.output_note = f"the child refused `audio start all` ({e}): the output gets main L/R only"
+                print(f"panel: {self.output_note}")
+                mode = "main"
+                try:
+                    rt.proc.command("audio start main", "ok")
+                except PortError as e2:
+                    e = e2
+                else:
+                    e = None
+            if e is not None:
+                self.sound = False
+                self.audio_note = self.sound_note = f"sound off: the child refused `audio start main` ({e})"
+                return
+        self.audio_mode, self.audio_words = mode, 8 if mode == "all" else 2
         self.audio_on = True
         self.sound = True
         self.audio_note = None
@@ -2619,8 +2914,21 @@ class Panel:
             n = int(head)
             if n:
                 data = bytes.fromhex(hexs.strip())
-                if len(data) != n * 4:
-                    raise PortError(f"audio read: {n} frames announced, {len(data)} bytes of PCM")
+                bpf = self.audio_words * 2
+                if len(data) != n * bpf:
+                    raise PortError(f"audio read: {n} frames announced, {len(data)} bytes of PCM ({self.audio_mode})")
+                out = self.output
+                if self.audio_words == 8:
+                    # eight words a frame (O14k `all`): the whole frame to the
+                    # device; main L/R (words 2/3) on to the ring, the take and
+                    # /audio/pcm -- byte for byte what `main` gives; cue's peak beside
+                    pairs = memoryview(data).cast("i")         # one int32 per L/R pair
+                    if out is not None and out.running:
+                        out.push(data, 8)
+                    self.audio_peak_cue = pcm_peak(pairs[2::4].tobytes())
+                    data = pairs[1::4].tobytes()
+                elif out is not None and out.running:
+                    out.push(data, 2)
                 self.ring.append(data)
                 self.audio_captured += n
                 self.audio_peak = pcm_peak(data)
@@ -2641,6 +2949,123 @@ class Panel:
         if dt > d["max_ms"]:
             d["max_ms"] = dt
         return got
+
+    # -- the output device (13 Sep 2026): AudioOutput above, fed by _drain_audio --
+
+    def _output_live(self):
+        o = self.output
+        return o is not None and o.running
+
+    def _audio_switch(self, rt, mode):
+        """On the emu thread: the child's capture to `mode` (main | all).
+        What is pending is drained first; the frames the child renders
+        between that read and the restart (at most a pacer slice, ~10 ms)
+        do not reach the ring or an open take. No-op when already so, or
+        with the capture off. Returns the mode now."""
+        if not self.audio_on or not isinstance(rt, PortRt) or mode == self.audio_mode:
+            return self.audio_mode
+        self._drain_audio(rt)
+        rt.proc.command(f"audio start {mode}", "ok")
+        self.audio_mode, self.audio_words = mode, 8 if mode == "all" else 2
+        self._dropped_base = self.audio_dropped     # the child's counter restarts with its ring
+        self._dropped_at = 0.0
+        return mode
+
+    def _queue_capture(self, mode):
+        """The child's capture to `mode`, as an action, when there is a
+        child to ask; a child that boots later (respawn, re-insert, sound
+        switch) picks the mode itself in _audio_start."""
+        if self.backend != "port" or not self.booted or self.card_ejected or self.card_busy or self.sound_busy:
+            return
+
+        def act():
+            try:
+                self._audio_switch(self.rt, mode)
+            except PortError as e:
+                self.output_note = f"capture `{mode}`: {e}"
+                print(f"panel: audio capture: {self.output_note}")
+        self.actions.put(act)
+
+    def audio_device_list(self):
+        """/audio/devices: the output-capable devices PortAudio sees (rescanned
+        while no stream is open), the output's state, the capture mode."""
+        with self.output_lock:
+            devices, note = audio_devices(refresh=not self._output_live())
+        if devices is None:
+            return {"ok": False, "available": sounddevice()[0] is not None, "error": note, "devices": [],
+                    "output": self.output_status(), "capture": self.audio_mode}
+        return {"ok": True, "available": True, "devices": devices, "note": note,
+                "output": self.output_status(), "capture": self.audio_mode}
+
+    def set_output(self, spec):
+        """/audio/output?device=<index|name|off>: the output stream onto that
+        device (a running stream on the same device is left as it is: the
+        app re-sends its choice at every ready), or off. The child's capture
+        follows -- all eight words with a device on, main L/R without --
+        through an emu-thread action. (ok, reply)."""
+        spec = (spec or "").strip()
+        with self.output_lock:
+            cur = self.output
+            if spec.lower() in ("", "off", "none"):
+                if cur is not None:
+                    cur.stop("stopped: /audio/output?device=off")
+                    self.output = None
+                    print(f"panel: audio output off (was {cur.name})")
+                self.output_note = None
+                self._queue_capture("main")
+                return True, {"ok": True, "output": self.output_status(), "capture": self.audio_mode,
+                              "note": "output off" + (f" (was {cur.name})" if cur is not None else "")}
+            sd, why = sounddevice()
+            if sd is None:
+                self.output_note = why
+                return False, {"ok": False, "error": why, "output": self.output_status()}
+            if cur is not None and cur.running:
+                devices, _ = audio_devices(refresh=False)
+                try:
+                    dev = resolve_device(spec, devices or [])
+                except LookupError:
+                    dev = None
+                if dev is not None and dev["index"] == cur.index and dev["name"] == cur.name:
+                    return True, {"ok": True, "output": cur.status(), "capture": self.audio_mode,
+                                  "note": f"already on {cur.name}"}
+            if cur is not None:
+                cur.stop("stopped: another device chosen")
+                self.output = None
+            devices, note = audio_devices(refresh=True)
+            if devices is None:
+                self.output_note = note
+                self._queue_capture("main")
+                return False, {"ok": False, "error": note, "output": self.output_status()}
+            try:
+                dev = resolve_device(spec, devices)
+            except LookupError as e:
+                self._queue_capture("main")
+                return False, {"ok": False, "error": str(e), "devices": [d["name"] for d in devices],
+                               "output": self.output_status()}
+            try:
+                out = AudioOutput(sd, dev)
+            except Exception as e:
+                self.output_note = f"{dev['name']}: {type(e).__name__}: {e}"
+                print(f"panel: audio output: {self.output_note}")
+                self._queue_capture("main")
+                return False, {"ok": False, "error": self.output_note, "output": self.output_status()}
+            self.output = out
+            self.output_note = None
+            print(f"panel: audio output -> {out.name} ({out.channels} of {dev['channels']} channels: "
+                  f"{'; '.join(out.channel_map())}; latency {out.status()['latency_ms']} ms)")
+        self._queue_capture("all")
+        return True, {"ok": True, "output": self.output_status(), "capture": self.audio_mode,
+                      "note": f"output on {out.name}: " + "; ".join(out.channel_map())}
+
+    def output_status(self):
+        o = self.output
+        if o is None:
+            return {"device": None, "index": None, "channels": 0, "running": False, "underruns": 0,
+                    "dropped": 0, "latency_ms": None, "buffered_ms": 0.0, "map": [], "note": self.output_note}
+        st = o.status()
+        if self.output_note and not st.get("note"):
+            st["note"] = self.output_note
+        return st
 
     def _open_take(self, rt):
         """PLAY: a new take-NNN.wav gets every frame drained from here on.
@@ -2693,7 +3118,13 @@ class Panel:
                 # where the files land, and what the drain itself costs the pump
                 "busy": self.sound_busy or self.card_busy, "phase": self.phase,
                 "takes_dir": str(self.takes_dir) if self.takes_dir else None,
-                "drain": dict(self.drain)}
+                "drain": dict(self.drain),
+                # the output device (13 Sep 2026): the child's capture mode (main = 2
+                # words a frame, all = 8 while a device is on), the cue pair's peak
+                # of the last 8-word read, and the stream itself
+                "capture": self.audio_mode, "words": self.audio_words,
+                "peak_cue": list(self.audio_peak_cue),
+                "output": self.output_status()}
 
     SOUND_ON_PHASE = "switching sound on (reboot, ~1 min)"
     SOUND_OFF_PHASE = "switching sound off (reboot, ~40 s)"
@@ -3229,6 +3660,16 @@ class Handler(BaseHTTPRequestHandler):
                     frm, data, end = p.ring.read(frm, to - frm)
                     send_wav(data, "octatrack-main-out.wav",
                              [("X-Audio-From", frm), ("X-Audio-Frames", len(data) // 4), ("X-Audio-End", end)])
+            elif path == "/audio/devices":
+                # the output device (13 Sep 2026): what PortAudio sees, + the output's state
+                self._json(p.audio_device_list())
+            elif path == "/audio/output":
+                # ?device=<index|name|off> starts / stops the stream; without it, the state
+                if "device" not in args:
+                    self._json({"ok": True, "output": p.output_status(), "capture": p.audio_mode})
+                else:
+                    ok, rep = p.set_output(urllib.parse.unquote_plus(args.get("device", "")))
+                    self._json(rep, 200 if ok else (404 if "devices" in rep else 500))
             elif path == "/audio/enable":
                 v = args.get("on", "1").lower()
                 if v not in ("1", "0", "on", "off", "true", "false"):
@@ -3242,7 +3683,8 @@ class Handler(BaseHTTPRequestHandler):
                                 "busy": p.sound_busy or p.card_busy})
             else:
                 self._json({"ok": False, "error": "no such audio endpoint",
-                            "endpoints": ["/audio/status", "/audio/pcm", "/audio.wav", "/audio/enable"]}, 404)
+                            "endpoints": ["/audio/status", "/audio/pcm", "/audio.wav", "/audio/enable",
+                                          "/audio/devices", "/audio/output"]}, 404)
         except ValueError as e:
             self._json({"ok": False, "error": f"bad number: {e}"}, 400)
 
@@ -3667,6 +4109,8 @@ def main():
     finally:
         pn = Handler.panel
         pn._close_take(None)     # a take open at exit stays a valid WAV
+        if pn.output is not None:
+            pn.output.stop("server exit")
         if pn.card_ejected and pn.card_mount:
             # the card stays mounted on the Mac (the user may be copying):
             # say so; the next start on it needs it detached first
