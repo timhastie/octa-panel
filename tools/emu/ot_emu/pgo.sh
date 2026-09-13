@@ -6,7 +6,8 @@
 # 1. instrumented build            out/emu-pgo-gen   (-DOT_PGO_GENERATE=ON)
 # 2. training runs on that binary  the bench.py sequence: boot on the OTLIVE
 #                                  card, frame on, PLAY, 16 x `run 250`, quit
-#                                  -- once without and once with --dsp
+#                                  -- once without, once with --dsp (lockstep)
+#                                  and once with --dsp --dsp-rt (the panel's sound mode)
 #                                  (LLVM_PROFILE_FILE -> out/emu-pgo/raw/)
 # 3. llvm-profdata merge           out/emu-pgo/ot_emu.profdata
 # 4. optimised build               out/emu            (-DOT_PGO_PROFILE=...)
@@ -143,6 +144,7 @@ EOF
 	}
 	train nodsp
 	[ "$DSP" = 1 ] && train dsp --dsp
+	[ "$DSP" = 1 ] && train rt --dsp --dsp-rt		# O17b: the JIT workers, the fence, the rings
 	ls -l "$PROF/raw"
 
 	say "3/4 llvm-profdata merge -> $PROFDATA"
