@@ -2036,6 +2036,20 @@ class Panel:
 
     _led_pos = 0
 
+    def led_payload(self):
+        """The LED state the page renders: {"bits": <17 row bytes hex>, "ids": {id: level}}."""
+        with self.lock:
+            ids = dict(self.led_ids)
+            bits = bytes(self.led_bits)
+            if self.link is not None:
+                try:
+                    rows = self.link.led_rows
+                    bits = bytes(rows.get(i, 0) for i in range(17))
+                    ids = dict(self.link.leds)
+                except Exception:
+                    pass
+        return {"bits": bits.hex(), "ids": {f"{k:#04x}": v for k, v in ids.items()}}
+
     def _parse_leds(self, rt):
         """Parse the firmware->panel stream for LED state. Frames seen in a
         real boot: a bare 0x43 hello; `<id> <value>` pairs (brightness init,
@@ -2567,18 +2581,31 @@ class Handler(BaseHTTPRequestHandler):
             # 0xa0+r messages, decoded by panel_link) -- key_map.json's leds
             # are [row, bit] into exactly this. "ids": the 0x3n <id> level
             # nibbles. Without panel_link the old naive parser's bytes remain.
-            with p.lock:
-                ids = dict(p.led_ids)
-                bits = bytes(p.led_bits)
-                if p.link is not None:
-                    try:
-                        rows = p.link.led_rows
-                        bits = bytes(rows.get(i, 0) for i in range(17))
-                        ids = dict(p.link.leds)
-                    except Exception:
-                        pass
-                self._json({"bits": bits.hex(),
-                            "ids": {f"{k:#04x}": v for k, v in ids.items()}})
+            self._json(p.led_payload())
+        elif path == "/leds/stream":
+            # Server-sent events: one `data:` line per LED CHANGE, checked
+            # every 20 ms. The page used to fetch /leds behind its 350 ms
+            # status poll and missed two of every three 125 ms steps of the
+            # running light (13 Sep 2026); pushed changes show every step.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            last, quiet = None, 0.0
+            try:
+                while True:
+                    cur = json.dumps(p.led_payload(), separators=(",", ":"))
+                    if cur != last:
+                        self.wfile.write(f"data: {cur}\n\n".encode()); self.wfile.flush()
+                        last, quiet = cur, 0.0
+                    else:
+                        quiet += 0.02
+                        if quiet >= 5.0:                 # keepalive: a comment line
+                            self.wfile.write(b": ping\n\n"); self.wfile.flush(); quiet = 0.0
+                    time.sleep(0.02)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
         elif path == "/run":
             # sliced, wall-bounded (run_ms): a plain rt.run(ms=5000) in frame
             # mode held the emulator for minutes (12 Sep 2026)

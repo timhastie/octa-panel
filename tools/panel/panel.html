@@ -1378,6 +1378,25 @@ function applyLeds(l) {
   }
 }
 
+// ---------------- LED push stream ----------------
+// Every LED change arrives as a server-sent event (/leds/stream, checked
+// 20 ms apart in the server); the 350 ms status poll only carries the LEDs
+// while the stream is down (it used to be the only source and skipped two
+// of every three steps of the running light at 120 BPM, 13 Sep 2026).
+let ledStreamOn = false, ledStream = null;
+function startLedStream() {
+  if (!window.EventSource) return;
+  try { ledStream = new EventSource("/leds/stream"); } catch (e) { return; }
+  ledStream.onopen = () => { ledStreamOn = true; };
+  ledStream.onmessage = ev => { try { if (Object.keys(mapLeds).length) applyLeds(JSON.parse(ev.data)); } catch (e) {} };
+  ledStream.onerror = () => {                      // the server rebooted / went away: poll until it is back
+    ledStreamOn = false;
+    try { ledStream.close(); } catch (e) {}
+    setTimeout(startLedStream, 2000);
+  };
+}
+startLedStream();
+
 // ---------------- status poll ----------------
 let lastSeq = -1, lastFault = null;
 async function poll() {
@@ -1400,7 +1419,7 @@ async function poll() {
     poolPhase(phase);
     monPhase(s, phase);
     if (s.seq !== lastSeq) { lastSeq = s.seq; $("#screen").src = "/screen.png?" + s.seq; }
-    if (Object.keys(mapLeds).length) applyLeds(await fetch("/leds").then(x => x.json()));
+    if (Object.keys(mapLeds).length && !ledStreamOn) applyLeds(await fetch("/leds").then(x => x.json()));
   } catch (e) {}
   setTimeout(poll, 350);
 }
