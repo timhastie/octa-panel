@@ -419,6 +419,16 @@ namespace ot
 		// THE DATA (O8 step 4): route A's model moves none; with the DSP cores
 		// attached the bytes have to go. `_kick` runs at every start, `_done`
 		// at every completion (a linked channel's before its own link starts).
+		// O17c: a host-port burst kicked through SSRT (the frame handler's pushes)
+		// completes when the DSP has drained it (the gate): with the lockstep
+		// interpreter that drain takes a fixed time per block shape, with the
+		// JIT workers it is a burst in one service -- so the frame handler's
+		// ISR chain ran ~0.5 samples shorter in ColdFire clock and its length
+		// varied with the wall (measured 13 Sep 2026). The hook returns the
+		// samples such a burst takes to drain under lockstep (rtos.cpp
+		// installHostPortMover, THE DRAIN TIMES); the completion is booked at
+		// kick + that, still behind the gate. Unset: the O17 behaviour.
+		void setHostDrainTime(std::function<double(uint32_t)> _fn) { m_hostDrainTime = std::move(_fn); }
 		void setDataHooks(std::function<void(uint32_t)> _kick, std::function<void(uint32_t)> _done)
 		{
 			m_onKick = std::move(_kick);
@@ -480,6 +490,7 @@ namespace ot
 		uint64_t m_started = 0;
 		std::function<void(uint32_t, bool)> m_onTransfer;
 		std::function<void(uint32_t)> m_onKick, m_onDone;
+		std::function<double(uint32_t)> m_hostDrainTime;	// O17c: see setHostDrainTime
 		std::function<bool(uint32_t)> m_canComplete;
 		uint64_t m_gatedWaits = 0;
 	};

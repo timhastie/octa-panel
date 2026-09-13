@@ -377,6 +377,11 @@ namespace ot
 	// what the DspPair's lane model does with a halfword at +0x1c. The RAM
 	// side is contiguous (SOFF/DOFF equal the burst size), the port side is a
 	// fixed address, and a block is NBYTES x the minor-loop count.
+	uint32_t Rtos::tcdWords(const uint32_t _ch) const
+	{
+		return static_cast<uint32_t>(m_edma.tcdField(_ch, 8, 4) * m_edma.minorLoops(_ch) / 4);	// bytes -> DSP words (one per 16-bit cycle pair... a 32-bit write is two halfwords on TXM:TXL = one word)
+	}
+
 	void Rtos::installHostPortMover()
 	{
 		auto* co = m_machine.coprocessor();
@@ -429,8 +434,11 @@ namespace ot
 						// belong to the core's thread (TSan, 13 Sep 2026: seven
 						// reports, all this read against the DMA's write), so
 						// they are made only when a log wants them.
-						if(m_blockLogOn || m_blockDump.is_open())
+						if((m_blockLogOn || m_blockDump.is_open()) && !co->realtime())
 						{
+							// (O17c: not under --dsp-rt -- the peeks below stalled the
+							// frame protocol, measured 13 Sep 2026: the dump's words are
+							// the ColdFire's own RAM and need none of them)
 							// Where DMA0 has just left off, and the tail of what
 							// landed there: the direct test of whether the words
 							// the port sent reached DSP memory.
@@ -470,7 +478,7 @@ namespace ot
 				m_hostWordsIn += hw.size();
 				m_hostNonZeroIn += nz;
 				std::string at;
-				if(m_blockLogOn || m_blockDump.is_open())
+				if((m_blockLogOn || m_blockDump.is_open()) && !co->realtime())
 				{
 					char t[48];
 					std::snprintf(t, sizeof t, " at@%.1f", m_sample);
@@ -480,6 +488,34 @@ namespace ot
 			});
 		// With the cores attached the bus's own time paces a burst (periph.h).
 		m_edma.setBusPaced(true);
+		if(co->realtime() && !(std::getenv("OT_RT_DRAINPACE") && *std::getenv("OT_RT_DRAINPACE") == '0'))
+		{
+			// O17c: THE DRAIN TIMES. Under the lockstep interpreter a pushed block
+			// is drained by the DSP's DMA0 one word per service, and the firmware
+			// handler's six block shapes each take a fixed time to drain (the
+			// DSP's code path at that point of the frame is the same every frame):
+			// measured 13 Sep 2026 over 12,360 frames of the OTLIVE fixture
+			// (`pushlat.py` on the OT_FENCE_TRACE of a --dsp run, ack 0x48 minus
+			// the push, at most 10 distinct values per shape within 0.005 sample).
+			// The JIT workers drain a block in one service, so without this the
+			// ISR chain ran ~0.5 samples shorter and its length followed the wall;
+			// the sequencer's bookkeeping inside that chain (a voice's 8-sample
+			// position bucket) then differed from the reference run to run. Words
+			// = DSP words (halfword pairs); a shape not in the table gets the
+			// interpreter's base rate, two instructions a word.
+			m_edma.setHostDrainTime([this, co](const uint32_t _ch) -> double
+			{
+				const auto words = tcdWords(_ch);
+				const int core = co->selected();
+				struct Shape { int core; uint32_t words; double samples; };
+				static constexpr Shape g_shapes[] = {
+					{0, 336, 0.3400}, {1, 336, 0.1650}, {0, 256, 0.1260}, {0, 64, 0.0320}, {1, 64, 0.0320}, {0, 32, 0.0170}};
+				for(const auto& sh : g_shapes)
+					if(sh.core == core && sh.words == words)
+						return sh.samples;
+				return (2.04 * static_cast<double>(words) + 2.0) / 4160.0;	// DSP instructions per sample (dsp.h g_dspIps)
+			});
+		}
 		m_edma.setCompletionGate([this, co](const uint32_t _ch)
 		{
 			const auto daddr = m_edma.tcdField(_ch, 0x10, 4);
@@ -906,7 +942,10 @@ namespace ot
 				// the gate in bursts of 32 (the completion then lands at most 32
 				// instructions late, and any peripheral access still ends the
 				// burst), except within 32 instructions of the run's end.
-				if(coRt && nd < 2.0 && m_horizonSrc == 4 && !m_wake && (end - m_sample) * m_ips > 34.0)
+				// O17c: only for a completion HELD by the gate (its due time behind
+				// the clock); one due at the horizon lands on its instruction, as
+				// under lockstep (the drain-booked pushes, periph.h setHostDrainTime)
+				if(coRt && nd < -4.0 && m_horizonSrc == 4 && !m_wake && (end - m_sample) * m_ips > 34.0)
 					nd = 32.0;
 				if(nd > static_cast<double>(quantum))
 					nd = static_cast<double>(quantum);

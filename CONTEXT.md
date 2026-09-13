@@ -185,9 +185,14 @@ EMAC-fixed Unicorn (`scripts/build_unicorn.sh`), `vendor/dsp56300` pinned to
   on (fallback to lockstep `--dsp` with a note). Measured on the PGO binary:
   **1208 emulated ms per wall s flat out with sound, paced 1.000× in the
   panel (90 s PLAY, dropped 0), boot 7 s**; old modes byte-identical (strict
-  oracle 28/28). Audio vs the lockstep interpreter: same music, onset within
-  2 samples, ~1 dB quieter on the clipping OTLIVE fixture (the cores'
-  interleave), not the same samples. Diagnostics: `rtstatus`, `cfstatus`,
+  oracle 28/28). Audio vs the lockstep interpreter: O17c (13 Sep 2026)
+  made it THE SAME SAMPLES on the clean fixture — three runs bit-identical
+  to the lockstep capture, fit −33.0 dB — where O17b had "the same music,
+  ~1 dB quieter, not the same samples": six timing mechanisms fixed (the
+  DSP's clock at its waits, the exact boot, the ISR's drain times;
+  COLDFIRE_PORT.md O17c). `OT_RT_POLLLEAD` is 0 now, `OT_RT_BOOTEXACT` /
+  `OT_RT_DRAINPACE` are new knobs, `OT_DSP_FRAMETRACE=1` the frame
+  timeline. Diagnostics: `rtstatus`, `cfstatus`,
   OT_RT_LEAD / OT_RT_FENCE / OT_RT_DOITER knobs; stalls are hunted with
   out/_agents/rt-fence-build/stall_hunt.py. The fence/poll addresses are
   payload A's (P:0x73/0x97/0x4b). Cue out and core 1 are not captured; the

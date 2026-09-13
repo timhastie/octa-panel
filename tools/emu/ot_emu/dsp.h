@@ -345,6 +345,7 @@ namespace ot
 			// (drain / fill) without running its main line.
 			std::atomic<bool> fenced{false}, svc{false};
 			std::atomic<uint64_t> fenceWaits{0}, services{0}, svcInterrupts{0};
+			std::atomic<uint64_t> waitCatchUps{0}, waitCatchUpSum{0};	// O17c: the waits' exits that found the core behind the event's clock, and the instructions caught up (rtstatus)
 			// the worker's wall time, split (seconds, published with the MIPS):
 			// executing blocks (services included), idle at the lead target
 			// (spinning then parked), stopped at the fence
@@ -394,6 +395,12 @@ namespace ot
 		std::vector<uint32_t> m_pushScratch, m_pullScratch;		// the bulk push's words (pushHalfwords), the fast pull's (pullHalfwords)
 		double m_edgeLastApplied = 0.0;			// the executed count of the last edge applied (the bank-take latency's base)
 		std::atomic<bool> m_bankTakePending{false};
+		std::atomic<uint64_t> m_esaiMismatch{0}, m_esaiChecked{0}; std::vector<std::string> m_esaiMismatchLog;	// O17c diagnostic: the ESAI's words against the ring's (the sink; rtstatus esaimism)
+		std::atomic<bool> m_takeSeen{true};		// O17c: THE RENDEZVOUS AT THE TAKE (dsp.cpp rxTake): the ColdFire holds its bank take until core 0 has left P:0x97
+		uint64_t m_takeWaits = 0, m_takeWaitTimeouts = 0; double m_takeWaitS = 0.0;
+		uint64_t m_hcWaits = 0, m_hcWaitTimeouts = 0; double m_hcWaitS = 0.0;
+		uint64_t m_gateDrainWaits = 0, m_gateDrainTimeouts = 0; double m_gateDrainS = 0.0;	// O17c: THE GATE WAITS FOR THE DRAIN (dsp.cpp hostRingEmpty)	// O17c: THE COMMAND RENDEZVOUS (dsp.cpp read, CVR)
+		std::atomic<uint64_t> m_hostEventAt{0};	// O17c: the ColdFire's exact count at its last act on core 0's HTDE wait -- the bank take, the end of a read-back pull (rxTake, pullHalfwords) -- the clock core 0 leaves P:0x97 on (rtWorker, THE WAITS)
 		// O17b: THE FENCE (dsp.cpp). Closed by core 0's bank-word write, opened
 		// by the ColdFire's frameHandled() (INTC0 source 1 unmasked at the end
 		// of the frame handler's exchange). OT_RT_FENCE=0 removes it (the O17
@@ -434,9 +441,10 @@ namespace ot
 		// own clock in the microseconds the ColdFire took to get there (an
 		// idle step is ~40 ns for 520 instructions), missed its next ring
 		// boundary, DMA2 ran dry, and the frame protocol stopped for good.
-		uint64_t m_rtPollLead = 8320;
+		uint64_t m_rtPollLead = 0;		// O17c: 0 -- the host wait keeps the ColdFire's clock (dsp.cpp rtSetup, rtWorker THE HOST-WAIT CATCH-UP)
 		double m_rtSpinUs = 20.0;
 		bool m_rtFastForward = true, m_rtGuard = false, m_rtReadWait = false;
+		bool m_rtBootExact = true; uint64_t m_rtBootReads = 0;	// O17c: THE EXACT BOOT (dsp.cpp rtSetup): no lead and exact host-port reads until the frame clock is on
 		bool m_rtBulk = true;		// O17b: the bulk push / the fast pull (OT_RT_BULK=0: the per-word paths, for the baseline measurement)
 		uint32_t m_rtDoIter = 0;
 		// ColdFire-side bookkeeping
@@ -490,7 +498,13 @@ namespace ot
 		void timerCapture(Core& c) __attribute__((noinline));
 		void instrumentBefore(Core& c, int i, uint32_t pc) __attribute__((noinline));
 		void traceLine(Core& c, int i, uint32_t pc) __attribute__((noinline));
-		void refreshInstrumented() { m_instrumented = m_traceEvery != 0 || m_pcWatchOn || m_sw.core == 0 || m_sw.core == 1; }
+		void refreshInstrumented() { m_instrumented = m_traceEvery != 0 || m_pcWatchOn || m_sw.core == 0 || m_sw.core == 1 || m_frameTraceOn; }
+		// O17c diagnostic (OT_DSP_FRAMETRACE=1, any mode): one stderr line per marker PC of core 0's frame
+		// (the bank word, the take seen, core 1's mailbox seen, the output stage, the return to the DSR2
+		// poll) with the DSP's own clock, the ColdFire's due count and DSR2 -- the frame's timeline against
+		// the audio ring, in both modes, so the ring write's lateness is a number (dsp.cpp frameTraceLine)
+		bool m_frameTraceOn = false; uint32_t m_ftrLast = 0, m_ftrLast1 = 0;
+		void frameTraceLine(Core& c, uint32_t pc, uint64_t exec, double due) __attribute__((noinline));
 		bool m_instrumented = false;
 		Stats m_stats;
 		void note(const char* _kind, uint32_t _val);
@@ -559,7 +573,7 @@ namespace ot
 		// Y:$FFFFD3 and reads Y:$FFFFD4 (docs/firmware/COLDFIRE_PORT.md, O8). Modelled
 		// symmetrically: $D7 = my transmit data, $D6 bit 1 = it is still
 		// unread; $D4 = my receive data, $D3 bit 1 = one is waiting.
-		struct Mailbox { uint32_t data = 0; std::atomic<bool> full{false}; uint64_t words = 0; };	// O17: `full` crosses the two worker threads (data before full, release/acquire)
+		struct Mailbox { uint32_t data = 0; std::atomic<bool> full{false}; uint64_t words = 0; std::atomic<uint64_t> sentAt{0}, takenAt{0}; };	// O17: `full` crosses the two worker threads (data before full, release/acquire); O17c: the sending / taking core's clock (executed units) at the event, for the other core's wait (dsp.cpp rtWorker, THE WAITS)
 		Mailbox m_mail[2];		// m_mail[k]: written by core k, read by core k^1
 		std::vector<std::string> m_trace;
 		std::vector<Event> m_log;

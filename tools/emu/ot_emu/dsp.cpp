@@ -165,6 +165,7 @@ namespace ot
 		setVerbose(false);
 		if(const char* e = std::getenv("OT_DSP_EDGELOG"); e && *e && *e != '0') m_edgeLog = true;	// O16c: one stderr line per bank write seen from a chunk (the guard's evidence)
 		if(const char* e = std::getenv("OT_FENCE_TRACE"); e && *e && *e != '0') m_fenceTrace = true;	// O17b: the per-frame protocol on stderr
+		if(const char* e = std::getenv("OT_DSP_FRAMETRACE"); e && *e && *e != '0') { m_frameTraceOn = true; refreshInstrumented(); }	// O17c: core 0's frame timeline on stderr (dsp.h)
 		for(int i = 0; i < 2; ++i)
 		{
 			m_cores.emplace_back(new Core);
@@ -423,6 +424,30 @@ namespace ot
 				if(!c.rotSeen) { c.rotMin = c.rotMax = rot; c.rotSeen = true; }
 				c.rotMin = std::min(c.rotMin, rot); c.rotMax = std::max(c.rotMax, rot);
 				int32_t words[g_audioSlots];		// this frame by ring word, sign-extended (the pipe's ring takes the whole frame at once)
+				if(m_rt && i == 0 && dsr2 >= 0x8000 && dsr2 <= 0x80ff)
+				{
+					// O17c diagnostic: the eight words the ESAI put out against the ring
+					// words the DMA should have taken them from (the -9 rule): a
+					// mismatch means the DMA2 -> TX0 -> slot path delivered something
+					// other than the ring's content (rtstatus esaimism)
+					const uint32_t* ring = c.mem->getMemAreaPtr(dsp56k::MemArea_X) + 0x8000;
+					for(uint32_t s = 0; s < g_audioSlots && s < _f.size(); ++s)
+					{
+						const uint32_t rw = ring[(dsr2 - 9 + s) & 0xff] & 0xffffff;
+						if(rw != (_f[s][0] & 0xffffff))
+						{
+							m_esaiMismatch.fetch_add(1, std::memory_order_relaxed);
+							if(m_esaiMismatchLog.size() < 12)
+							{
+								char t[96];
+								std::snprintf(t, sizeof t, "frame %llu slot %u dsr2 %06x ring %06x esai %06x", static_cast<unsigned long long>(c.txFrames.load(std::memory_order_relaxed)), s, dsr2, rw, _f[s][0] & 0xffffff);
+								std::lock_guard<std::mutex> g(m_streamMx);
+								m_esaiMismatchLog.emplace_back(t);
+							}
+						}
+					}
+					m_esaiChecked.fetch_add(1, std::memory_order_relaxed);
+				}
 				for(uint32_t ch = 0; ch < g_audioSlots; ++ch)
 				{
 					const uint32_t s = (ch - rot) & 7;
@@ -508,6 +533,8 @@ namespace ot
 					case 0xffffd3: _v = m_mail[i ^ 1].full.load(std::memory_order_acquire) ? 2u : 0u; return true;
 					case 0xffffd4:
 						_v = m_mail[i ^ 1].data;
+						if(m_rt)	// O17c: the taking core's clock, for the sender's wait (rtWorker, THE WAITS)
+							m_mail[i ^ 1].takenAt.store(m_cores[i]->dsp->getInstructionCounter() + m_rtc[i].offset.load(std::memory_order_relaxed), std::memory_order_relaxed);
 						m_mail[i ^ 1].full.store(false, std::memory_order_release);
 						return true;
 					case 0xffffd6: _v = m_mail[i].full.load(std::memory_order_acquire) ? 2u : 0u; return true;
@@ -520,6 +547,8 @@ namespace ot
 					if(_a != 0xffffd7)
 						return false;
 					m_mail[i].data = _v & 0xffffff;
+					if(m_rt)	// O17c: the sending core's clock, for the receiver's wait (rtWorker, THE WAITS)
+						m_mail[i].sentAt.store(m_cores[i]->dsp->getInstructionCounter() + m_rtc[i].offset.load(std::memory_order_relaxed), std::memory_order_relaxed);
 					m_mail[i].full.store(true, std::memory_order_release);
 					++m_mail[i].words;
 					noteFrom(i, "mail", _v & 0xffffff);
@@ -588,6 +617,20 @@ namespace ot
 	// instructions) instead of the next instruction, the FIFO read-back. The
 	// audio contract for this mode is functional (same onset within 16
 	// samples, level within 1 dB, same content), not the Phase B bytes.
+	//
+	// O17c (13 Sep 2026): THE WAITS AND THE RENDEZVOUS. The bytes were not
+	// the lockstep bytes because the DSP's clock at the points where it waits
+	// for the host or the other core, and the ColdFire's clock at the points
+	// where it waits for the DSP, were wherever the wall left them. Now: a
+	// wait's fast-forward never passes the other party's clock and its exit
+	// lands on the event's clock (THE WAITS), the ColdFire holds its own clock
+	// at the bank take, the command poll and the drain gate until the worker
+	// has answered (THE RENDEZVOUS AT THE TAKE, THE COMMAND RENDEZVOUS, THE
+	// GATE WAITS FOR THE DRAIN), the boot is exact (THE EXACT BOOT: the DSP's
+	// frame phase against the RTOS clock is lockstep's), and the frame
+	// handler's pushes complete at the lockstep interpreter's drain times
+	// (rtos.cpp THE DRAIN TIMES). On the clean fixture the rt capture is
+	// bit-identical to the lockstep capture (docs O17c).
 	// =====================================================================
 
 	bool DspPair::rtSetup()
@@ -613,7 +656,27 @@ namespace ot
 			m_rtLead = static_cast<uint64_t>(!e || !*e || !std::strcmp(e, "frame") ? frame : std::atof(e));
 		}
 		m_fence = envDouble("OT_RT_FENCE", 1.0) != 0.0;
-		m_rtPollLead = static_cast<uint64_t>(envDouble("OT_RT_POLLLEAD", 8320.0));
+		// O17c: THE HOST WAIT KEEPS THE COLDFIRE'S CLOCK. The poll lead is 0: core
+		// 0's clock at P:0x97 never runs past the ColdFire's, and when the host
+		// acts (the bank take, the end of a pull) the worker brings its clock up
+		// to the exact count of that act before the poll runs (rtWorker, THE
+		// HOST-WAIT CATCH-UP) -- lockstep's timing of the take, which the frame's
+		// ring write depends on (measured 13 Sep 2026: the DSP saw the take at
+		// E+0..2.2 samples of its own clock with the 2-sample lead, wrote the
+		// audio ring after DMA2 had entered the half, and the first sample of
+		// the block came out stale; docs O17c). The knob stays for the measurement.
+		m_rtPollLead = static_cast<uint64_t>(envDouble("OT_RT_POLLLEAD", 0.0));
+		// O17c: THE EXACT BOOT (OT_RT_BOOTEXACT=0 to switch it off, for the
+		// measurement). Until the ColdFire's frame clock is on, the workers run
+		// with no lead and every host-port read is a rendezvous at the exact
+		// count: the ColdFire's boot polls the DSP for every word of the
+		// upload, so the number of instructions its boot takes -- which is the
+		// DSP's clock at the RTOS handoff, i.e. the phase of the DSP's frames
+		// against the RTOS's own clock -- was wall-time-dependent (measured 13
+		// Sep 2026: 3213-3329 samples per run against lockstep's 2877.39), and
+		// the sequencer's microtiming of a voice against the frame grid with it
+		// (a second voice 7 samples off the reference; docs O17c).
+		m_rtBootExact = envDouble("OT_RT_BOOTEXACT", 1.0) != 0.0;
 		m_rtPollHist = envDouble("OT_RT_POLLHIST", 0.0) != 0.0;
 		m_rtBulk = envDouble("OT_RT_BULK", 1.0) != 0.0;
 		m_rtWaitLog = envDouble("OT_RT_WAITLOG", 0.0) != 0.0;
@@ -751,6 +814,18 @@ namespace ot
 		// DSR2 poll was executed, ~30k instructions a frame at ~200 MIPS).
 		if(envDouble("OT_RT_DSR2FF", 1.0) != 0.0)	// diagnostic: 0 = the DSR2 poll executed, as O17 had it
 			m_cores[0]->dsp->getJit().addVolatileP(g_dsr2PollPc);
+		// O17c: THE WAITS' exits are block entries (rtWorker catches the core's
+		// clock up to the event there): the blocks after the polls
+		m_cores[0]->dsp->getJit().addVolatileP(0x99);
+		m_cores[0]->dsp->getJit().addVolatileP(0xa5);
+		m_cores[1]->dsp->getJit().addVolatileP(0x59);
+		m_cores[1]->dsp->getJit().addVolatileP(0x8f);
+		if(m_frameTraceOn)
+		{
+			// O17c diagnostic: the output stage's head and tail as block entries, so the frame trace sees them
+			m_cores[0]->dsp->getJit().addVolatileP(0x1cb);
+			m_cores[0]->dsp->getJit().addVolatileP(0x205);
+		}
 
 		// 3. THE THREADS. Each waits for its boot ROM to finish (sendWord says
 		// so), then runs execJit() to the posted targets until told to stop.
@@ -834,7 +909,7 @@ namespace ot
 		uint64_t lastPub = ~0ull, lastSkew = 0, blocks = 0;
 		uint64_t statCtr = dsp.getInstructionCounter(), statSkipped = 0, statBlocks = 0;
 		uint64_t spins = 0;
-		uint32_t last = ~0u;
+		uint32_t last = ~0u, prevPc = ~0u;	// prevPc: the entry PC of the last block executed (O17c, THE WAITS)
 		int run = 0, same = 0;
 		auto tStat = Clock::now(), tSpin = tStat, tState = tStat;
 		// the wall-time split: 0 busy (executing blocks or a service), 1 idle at
@@ -893,7 +968,7 @@ namespace ot
 			const uint64_t ctr = dsp.getInstructionCounter();
 			const uint32_t gen = m_rtGen.load(std::memory_order_acquire);
 			const uint64_t dueNow = m_rtDue.load(std::memory_order_acquire);
-			const uint64_t due = dueNow + m_rtLead;	// the LEAD (the file comment): executed work may run this far ahead
+			const uint64_t due = dueNow + ((m_rtBootExact && !m_frameOn.load(std::memory_order_relaxed)) ? 0 : m_rtLead);	// the LEAD (the file comment): executed work may run this far ahead; O17c: none before the frame clock (THE EXACT BOOT)
 			uint64_t target = due > off ? due - off : 0;
 			const uint64_t pollTarget = dueNow + m_rtPollLead > off ? dueNow + m_rtPollLead - off : 0;	// ... a poll's idle step only this far (THE POLL LEAD, dsp.h)
 			const int pred = r.pred.load(std::memory_order_acquire);
@@ -915,14 +990,78 @@ namespace ot
 				dsp.processExternalInterrupts();
 			}
 			const uint32_t pc = dsp.getPC().toWord();
+			// O17c: THE WAITS. Three of payload A/B's polls wait for something
+			// that is not on this core's own clock: core 0's HTDE wait after the
+			// bank word (P:0x97: the host's take, and the end of its read-back
+			// pull), core 0's wait for core 1 to take its mailbox word (P:0xa3)
+			// and core 1's waits for core 0's two words (P:0x57, P:0x8d). Under
+			// lockstep the waiting core's clock IS the other party's clock (the
+			// ColdFire's count; the other core interleaved by the quantum), so it
+			// leaves the wait at the event's clock. Here each such wait (1) is
+			// fast-forwarded no further than the other party's clock (the posted
+			// count for the host; the other core's published count plus the skew
+			// for the mailbox) instead of the work lead, so the waiting core never
+			// runs past the event, and (2) on its exit -- the block after the poll
+			// -- the core's clock is brought UP to the event's clock through its
+			// peripheral events (idleStep) if it is behind: the host's act posts
+			// its exact count (m_hostEventAt, rxTake / pullHalfwords), the mailbox
+			// hooks record the sending / taking core's clock (Mailbox::sentAt /
+			// takenAt). ❌ Measured before this (13 Sep 2026): with a 2-sample poll
+			// lead core 0 left P:0x97 at E+0..2.2 samples of its own clock for a
+			// take at E+0.004, and with the work lead as the bound of P:0xa3 it left
+			// the mailbox wait 3-24 samples late when core 1 sat idle at ITS lead
+			// -- the frame's ring write then landed after DMA2 had entered the
+			// half (the block's first samples came out stale, whole blocks on a
+			// long wait), and a 24-sample wait skipped a frame and dried DMA2 (the
+			// O17b stall). With the waits on the other party's clock the DSP's
+			// frame timeline is lockstep's to within the burst grain.
+			const bool hostWait = _i == 0 && pc == g_htdeWaitPc;
+			const bool mailWait = _i == 0 ? pc == 0xa3 : (pc == 0x57 || pc == 0x8d);
+			uint64_t waitBound = target;
+			if(hostWait)
+				waitBound = pollTarget;
+			else if(mailWait && m_bootDone[_i ^ 1].load(std::memory_order_acquire) && !o.faulted.load(std::memory_order_relaxed))
+			{
+				const uint64_t oExec = o.reached.load(std::memory_order_acquire) + o.offset.load(std::memory_order_relaxed) + m_rtSkew;
+				const uint64_t b = oExec > off ? oExec - off : 0;
+				if(b < waitBound)
+					waitBound = b;
+			}
+			if(m_rtFastForward && pc != prevPc && ((_i == 0 && ((pc == 0x99 && prevPc == g_htdeWaitPc) || (pc == 0xa5 && prevPc == 0xa3)))
+				|| (_i == 1 && ((pc == 0x59 && prevPc == 0x57) || (pc == 0x8f && prevPc == 0x8d)))))
+			{
+				// the wait's exit: the event's clock, in this core's counter units
+				const uint64_t ev = _i == 0 ? (pc == 0x99 ? m_hostEventAt.load(std::memory_order_acquire) : m_mail[0].takenAt.load(std::memory_order_acquire))
+					: m_mail[0].sentAt.load(std::memory_order_acquire);
+				const uint64_t tgt = ev > off ? ev - off : 0;
+				uint64_t cu = dsp.getInstructionCounter();
+				if(cu < tgt)
+				{
+					r.waitCatchUps.fetch_add(1, std::memory_order_relaxed);
+					r.waitCatchUpSum.fetch_add(tgt - cu, std::memory_order_relaxed);
+				}
+				while(cu < tgt && !m_stop.load(std::memory_order_relaxed))
+				{
+					const auto skipped = dsp.idleStep(tgt - cu);
+					r.skipped.fetch_add(skipped, std::memory_order_relaxed);
+					cu = dsp.getInstructionCounter();
+				}
+				prevPc = pc;
+				if(_i == 0 && pc == 0x99)
+					m_takeSeen.store(true, std::memory_order_release);	// THE RENDEZVOUS AT THE TAKE (rxTake): the wait is left
+			}
 			// THE FENCE: core 0 at its bank-word write while the ColdFire is
 			// still inside the previous frame's exchange
 			const bool fenced = _i == 0 && m_fence && pc == g_bankIdPc && !m_fenceOpen.load(std::memory_order_acquire)
 				&& (m_frameOn.load(std::memory_order_acquire) || m_inExchange.load(std::memory_order_acquire));
 			bool work = ctr < target && !fenced;
-			// THE POLL LEAD (dsp.h): the host wait at P:0x97 at its bound waits for the ColdFire's clock instead of burning its own
-			const bool hostWait = _i == 0 && pc == g_htdeWaitPc;
-			if(hostWait && same >= 8 && ctr >= pollTarget && m_rtFastForward)
+			// THE POLL LEAD (dsp.h) / O17c THE WAITS: a wait at its bound waits for the other party's clock instead of burning its own
+			// -- unless what it waits for is already there (the poll then exits: run it). ❌ Without the
+			// exception core 1 sat idle at P:0x57 with its bound at core 0's clock while core 0 sat idle
+			// at P:0xa3 with its bound at core 1's: the word was there and neither ran its poll (a 2 s
+			// wait timeout, a faulted core, measured 13 Sep 2026).
+			const bool waitDone = hostWait ? !c.hdi().hasTX() : (mailWait && (_i == 0 ? !m_mail[0].full.load(std::memory_order_acquire) : m_mail[0].full.load(std::memory_order_acquire)));
+			if((hostWait || mailWait) && same >= 8 && ctr >= waitBound && m_rtFastForward && !waitDone)
 				work = false;
 			if(pred == 1 && !c.hdi().hasTX() && !fenced)
 				work = true;
@@ -1063,7 +1202,7 @@ namespace ot
 				run = 0;
 			if((same >= 8 || (run >= 8 && pc == g_dsr2PollPc)) && m_rtFastForward && pred == 0 && !(dsp.regs().sr.var & 0x8000) && !dsp.hasPendingInterrupts())
 			{
-				const uint64_t bound = hostWait ? pollTarget : target;	// THE POLL LEAD: the host wait's idle step stops at the poll bound; the DSP's own waits (the ring boundary, the mailbox) run to the work lead
+				const uint64_t bound = waitBound;	// THE POLL LEAD / THE WAITS: a wait's idle step stops at the other party's clock; the DSP's own wait (the ring boundary, P:0x4b) runs to the work lead
 				const uint64_t room = bound > ctr ? bound - ctr : 1;
 				const auto skipped = dsp.idleStep(room);
 				r.skipped.fetch_add(skipped, std::memory_order_relaxed);
@@ -1106,7 +1245,10 @@ namespace ot
 					static_cast<long long>(static_cast<int64_t>(dsp.getPeriph(0)->getTargetClock()) - static_cast<int64_t>(ctr)), c.hdi().rxData().size());
 				m_rtTrace.emplace_back(line);
 			}
+			if(m_frameTraceOn)
+				frameTraceLine(c, pc, ctr + off, static_cast<double>(dueNow));
 			dsp.exec();
+			prevPc = pc;
 			++blocks;
 			const uint64_t ctr2 = dsp.getInstructionCounter();
 			if(ctr2 - lastPub >= g_rtPublish || lastPub > ctr2)
@@ -1351,6 +1493,16 @@ namespace ot
 			// every m_rtCheckQuantum), and a read sees the core as it is -- at
 			// most the lead plus a check quantum behind the count, which only
 			// makes a poll go round once more.
+			if(m_rtBootExact && !m_frameOn.load(std::memory_order_relaxed))
+			{
+				// O17c: THE EXACT BOOT -- the observed core at the exact count, as
+				// lockstep's catchUp has it (rtSetup says why)
+				rtPost(0);
+				++m_rtBootReads;
+				if(rtWait(0, m_sel & 1))
+					m_rtAtPosted = m_rtPosted;
+				return;
+			}
 			rtPost(m_rtReadQuantum);
 			if(!m_rtReadWait)
 				return;
@@ -1608,19 +1760,24 @@ namespace ot
 			const uint64_t due = static_cast<uint64_t>(m_due);
 			lag[i] = booted && due > exec[i] ? due - exec[i] : 0;
 		}
+		std::string esaiLog;
+		{
+			std::lock_guard<std::mutex> g(m_streamMx);
+			for(const auto& l : m_esaiMismatchLog) { esaiLog += l; esaiLog += "; "; }
+		}
 		std::snprintf(b, sizeof b,
 			"rtstatus ok=%d mips0=%.1f mips1=%.1f xmips0=%.1f xmips1=%.1f busy0=%.2f busy1=%.2f cpu0=%.2f cpu1=%.2f "
 			"frames=%llu due=%.0f exec0=%llu exec1=%llu lag0=%llu lag1=%llu "
 			"posts=%llu wakes=%llu parks0=%llu parks1=%llu waits=%llu waitto=%llu wait=%.3f skipwaits=%llu skipwait=%.3f "
 			"edges=%llu applied=%llu edgesinpull=%llu edgelate mean=%.1f max=%.0f (dsp instr) skipedges=%llu skipedgelate mean=%.1f max=%.0f "
-			"skewwaits0=%llu skewwaits1=%llu skewto0=%llu skewto1=%llu ff0=%llu ff1=%llu blocks0=%llu blocks1=%llu "
+			"skewwaits0=%llu skewwaits1=%llu skewto0=%llu skewto1=%llu waitcu0=%llu(%llu) waitcu1=%llu(%llu) ff0=%llu ff1=%llu blocks0=%llu blocks1=%llu "
 			"pulls=%llu pull=%.3f pullshort=%llu dropped=%llu faulted=%d%d guardticks=%llu guardwindows=%llu treqdropped=%llu "
 			"| pc0=%06x pc1=%06x rxring0=%zu rxring1=%zu tx0=%d cmds0=%llu cmds1=%llu banktakemax=%.2f "
 			"| fence=%s inexch=%d frameon=%d edgesq=%u c0fenced=%d c0idle=%d c1idle=%d fenceopens=%llu fencewaits=%llu edgegate mean=%.1f dropped=%llu stale=%llu svc0=%llu svc1=%llu svcint0=%llu svcint1=%llu pullsfast=%llu pushes=%llu "
-			"| cfwait skip=%.3f lag=%.3f pull=%.3f pullword=%.3f(%llu) kick=%.3f(%llu) push=%.3f post=%.3f fenceopen=%.3f (wall s) "
+			"| cfwait skip=%.3f lag=%.3f pull=%.3f pullword=%.3f(%llu) kick=%.3f(%llu) push=%.3f post=%.3f fenceopen=%.3f take=%.3f(%llu,to %llu) (wall s) "
 			"| worker0 busy=%.3f idle=%.3f fence=%.3f worker1 busy=%.3f idle=%.3f fence=%.3f (wall s) "
 			"| core0 hsr=%02x hcr=%02x hpcr=%02x tgt=%lld tcr=%06x dcr2=%06x dsr2=%06x dco2=%06x ctr=%llu | core1 hsr=%02x tgt=%lld ctr=%llu "
-			"| knobs lag=%llu lead=%llu polllead=%llu skew=%llu postq=%llu readq=%llu checkq=%llu spin=%.0fus ff=%d guard=%d doiter=%u fenceknob=%d",
+			"| esaimism=%llu/%llu %s bootreads=%llu hcwait=%.3f(%llu,to %llu) gatedrain=%.3f(%llu,to %llu) | knobs lag=%llu lead=%llu polllead=%llu skew=%llu postq=%llu readq=%llu checkq=%llu spin=%.0fus ff=%d guard=%d doiter=%u fenceknob=%d",
 			m_rtOk ? 1 : 0,
 			m_rtc[0].mips.load(), m_rtc[1].mips.load(), m_rtc[0].xmips.load(), m_rtc[1].xmips.load(),
 			m_rtc[0].busy.load(), m_rtc[1].busy.load(), m_rtc[0].cpuS.load(), m_rtc[1].cpuS.load(),
@@ -1637,6 +1794,8 @@ namespace ot
 			static_cast<unsigned long long>(m_rtSkipEdges), m_rtSkipEdges ? m_rtSkipEdgeLateSum / static_cast<double>(m_rtSkipEdges) : 0.0, m_rtSkipEdgeLateMax,
 			static_cast<unsigned long long>(m_rtc[0].skewWaits.load()), static_cast<unsigned long long>(m_rtc[1].skewWaits.load()),
 			static_cast<unsigned long long>(m_rtc[0].skewTimeouts.load()), static_cast<unsigned long long>(m_rtc[1].skewTimeouts.load()),
+			static_cast<unsigned long long>(m_rtc[0].waitCatchUps.load()), static_cast<unsigned long long>(m_rtc[0].waitCatchUpSum.load()),
+			static_cast<unsigned long long>(m_rtc[1].waitCatchUps.load()), static_cast<unsigned long long>(m_rtc[1].waitCatchUpSum.load()),
 			static_cast<unsigned long long>(m_rtc[0].skipped.load()), static_cast<unsigned long long>(m_rtc[1].skipped.load()),
 			static_cast<unsigned long long>(m_rtc[0].blocks.load()), static_cast<unsigned long long>(m_rtc[1].blocks.load()),
 			static_cast<unsigned long long>(m_rtPulls), m_rtPullS,
@@ -1658,6 +1817,7 @@ namespace ot
 			static_cast<unsigned long long>(m_rtPullsFast), static_cast<unsigned long long>(m_rtPushes),
 			m_rtSkipWaitS, m_rtWaitS, m_rtPullS, m_rtPullWordS, static_cast<unsigned long long>(m_rtPullWordWaits),
 			m_rtKickS, static_cast<unsigned long long>(m_rtKicks), m_rtPushS, m_rtPostS, m_fenceOpenS,
+			m_takeWaitS, static_cast<unsigned long long>(m_takeWaits), static_cast<unsigned long long>(m_takeWaitTimeouts),
 			m_rtc[0].busyS.load(), m_rtc[0].idleS.load(), m_rtc[0].fenceS.load(),
 			m_rtc[1].busyS.load(), m_rtc[1].idleS.load(), m_rtc[1].fenceS.load(),
 			m_rtc[0].hsr.load(), c0.hdi().readControlRegister() & 0xff, m_rtc[0].hpcr.load(),
@@ -1667,6 +1827,9 @@ namespace ot
 			m_rtc[1].hsr.load(),
 			static_cast<long long>(m_rtc[1].tgt.load()),
 			static_cast<unsigned long long>(m_rtc[1].ctr.load()),
+			static_cast<unsigned long long>(m_esaiMismatch.load()), static_cast<unsigned long long>(m_esaiChecked.load()), esaiLog.c_str(), static_cast<unsigned long long>(m_rtBootReads),
+			m_hcWaitS, static_cast<unsigned long long>(m_hcWaits), static_cast<unsigned long long>(m_hcWaitTimeouts),
+			m_gateDrainS, static_cast<unsigned long long>(m_gateDrainWaits), static_cast<unsigned long long>(m_gateDrainTimeouts),
 			static_cast<unsigned long long>(m_rtLagMax), static_cast<unsigned long long>(m_rtLead), static_cast<unsigned long long>(m_rtPollLead), static_cast<unsigned long long>(m_rtSkew),
 			static_cast<unsigned long long>(m_rtPostQuantum), static_cast<unsigned long long>(m_rtReadQuantum), static_cast<unsigned long long>(m_rtCheckQuantum),
 			m_rtSpinUs, m_rtFastForward ? 1 : 0, m_rtGuard ? 1 : 0, m_rtDoIter, m_fence ? 1 : 0);
@@ -2036,6 +2199,7 @@ namespace ot
 
 	uint32_t DspPair::rxTake()
 	{
+		bool bankTake = false;	// O17c: this take is core 0's bank word (the rendezvous below)
 		{
 			Core& c = cur();
 			if(m_rt)
@@ -2045,6 +2209,8 @@ namespace ot
 				// lockstep arithmetic in the same unit.
 				if(!m_pulling.load(std::memory_order_relaxed) && m_sel == 0 && m_bankTakePending.exchange(false, std::memory_order_relaxed))
 				{
+					bankTake = true;
+					m_takeSeen.store(false, std::memory_order_seq_cst);	// before the pop: the worker's poll may pass on its own service
 					const double e = m_edgeLastApplied;
 					const auto lat = m_due > e ? static_cast<uint64_t>(m_due - e) : 0;
 					++c.bankTakes; c.bankTakeSum += lat;
@@ -2069,10 +2235,42 @@ namespace ot
 			if(m_rt && !m_pulling.load(std::memory_order_relaxed))
 			{
 				// O17b: the take of a bank word: the core polls HTDE at P:0x97, which its own peripheral service sets -- a core idle at its poll bound gets that service now (rtService)
+				// O17c: the exact count of the take goes first, so the worker's
+				// host-wait catch-up lands its clock on the take (rtWorker, THE WAITS)
+				rtPost(0);
+				m_hostEventAt.store(static_cast<uint64_t>(m_due), std::memory_order_release);
 				RtCore& r = m_rtc[m_sel & 1];
 				r.svc.store(true, std::memory_order_seq_cst);
 				if(r.parked.load(std::memory_order_seq_cst))
 					rtWake(m_sel & 1);
+				if(bankTake)
+				{
+					// O17c: THE RENDEZVOUS AT THE TAKE. On the chip (and under
+					// lockstep) core 0 sees HTDE within an instruction of the host's
+					// take and leaves its wait (P:0x97) before the host's next command
+					// -- the 0x89 that refills HOTX with the read-back -- arrives ~45
+					// ColdFire instructions later; here the worker's service and poll
+					// take microseconds of wall, so without this the read-back's FIFO
+					// fill cleared HTDE first and core 0 stayed at P:0x97 through the
+					// whole pull (0.7 samples: measured 13 Sep 2026, `waitcu0` ~1 per
+					// frame of ~1500 instructions), its frame work and ring write
+					// that much late. The ColdFire holds here until the worker has
+					// left the wait (the exit sets m_takeSeen; rtWorker, THE WAITS),
+					// bounded at 2 ms for a dead core.
+					const auto t0 = Clock::now();
+					uint64_t spins = 0;
+					++m_takeWaits;
+					while(!m_takeSeen.load(std::memory_order_acquire) && !m_stop.load(std::memory_order_relaxed))
+					{
+						if(r.faulted.load(std::memory_order_relaxed) || ((++spins & 255) == 0 && secondsSince(t0) > 0.002))
+						{
+							++m_takeWaitTimeouts;
+							break;
+						}
+						cpuRelax();
+					}
+					m_takeWaitS += secondsSince(t0);
+				}
 			}
 		}
 		return c.lastRx;
@@ -2117,7 +2315,33 @@ namespace ot
 			switch(r)
 			{
 			case 0: b = c.icr; break;
-			case 1: b = c.cvr.load(std::memory_order_acquire); break;
+			case 1:
+				if(m_rt && c.hcPending.load(std::memory_order_acquire) && !m_pulling.load(std::memory_order_relaxed))
+				{
+					// O17c: THE COMMAND RENDEZVOUS. Under lockstep the DSP takes a host
+					// command at its next instruction, so the handler's HC poll sees
+					// it taken at its first read; the worker takes it at its next
+					// block, microseconds of wall later, and the poll went round a
+					// wall-dependent number of times (its instruction count with it).
+					// Hold here -- the ColdFire's clock does not move -- until the
+					// worker has taken it, bounded at 2 ms for a dead core.
+					RtCore& r = m_rtc[m_sel & 1];
+					const auto t0 = Clock::now();
+					uint64_t spins = 0;
+					++m_hcWaits;
+					while(c.hcPending.load(std::memory_order_acquire) && !m_stop.load(std::memory_order_relaxed))
+					{
+						if(r.faulted.load(std::memory_order_relaxed) || ((++spins & 255) == 0 && secondsSince(t0) > 0.002))
+						{
+							++m_hcWaitTimeouts;
+							break;
+						}
+						cpuRelax();
+					}
+					m_hcWaitS += secondsSince(t0);
+				}
+				b = c.cvr.load(std::memory_order_acquire);
+				break;
 			case 2: b = isrRead(); break;
 			case 3: b = c.ivr; break;
 			case 5: b = (rxPeek() >> 16) & 0xff; break;
@@ -2348,6 +2572,21 @@ namespace ot
 			}
 			r.pred.store(0, std::memory_order_release);
 			m_pullCore.store(-1, std::memory_order_release);
+			if(!c.hdi().hasTX())
+			{
+				// O17c: the host took the last read-back word -- HTDE, which core 0
+				// polls at P:0x97 through the whole pull, comes back with the
+				// core's next service: post the exact count of this moment and ask
+				// for that service, so the poll passes at the ColdFire's clock of
+				// the pull's end (rtWorker, THE HOST-WAIT CATCH-UP), as lockstep's
+				// per-word catchUp had it
+				rtPost(0);
+				if((m_sel & 1) == 0)
+					m_hostEventAt.store(static_cast<uint64_t>(m_due), std::memory_order_release);
+				r.svc.store(true, std::memory_order_seq_cst);
+				if(r.parked.load(std::memory_order_seq_cst))
+					rtWake(m_sel & 1);
+			}
 		}
 		else
 		for(size_t i = 0; i < _n; ++i)
@@ -2759,8 +2998,39 @@ namespace ot
 	}
 
 	// The stopwatch and the PC watch, in that order, before the instruction.
+	// O17c diagnostic (dsp.h m_frameTraceOn): the marker PCs of payload A's frame on core 0.
+	// P:0x73 the bank word (after the fence), P:0x99 the take seen (the HTDE poll passed),
+	// P:0xa5 core 1's mailbox reply seen, P:0x1cb the output stage (the ring write), P:0x4b
+	// the return to the DSR2 poll (the frame's work done; printed once per return).
+	// Core 1 (payload B): P:0x57 its wait for the bank id, 0x59 the id consumed, 0x8d its wait for
+	// core 0's second word, 0x8f that word consumed.
+	void DspPair::frameTraceLine(Core& c, const uint32_t pc, const uint64_t exec, const double due)
+	{
+		const bool core1 = &c == m_cores[1].get();
+		if(core1)
+		{
+			if(pc != 0x57 && pc != 0x59 && pc != 0x8d && pc != 0x8f)
+				return;
+			if((pc == 0x57 || pc == 0x8d) && m_ftrLast1 == pc)
+				return;
+			m_ftrLast1 = pc;
+			std::fprintf(stderr, "ftr1 pc=%03x exec=%.4f due=%.4f ctr=%llu\n", pc, static_cast<double>(exec) / g_dspIps, due / g_dspIps,
+				static_cast<unsigned long long>(c.dsp->getInstructionCounter()));
+			return;
+		}
+		if(pc != 0x73 && pc != 0x99 && pc != 0xa5 && pc != 0x1cb && pc != 0x205 && pc != 0x4b && pc != 0x54 && pc != 0x64)
+			return;
+		if(pc == 0x4b && m_ftrLast == 0x4b)
+			return;
+		m_ftrLast = pc;
+		std::fprintf(stderr, "ftr pc=%03x exec=%.4f due=%.4f dsr2=%06x ctr=%llu\n", pc, static_cast<double>(exec) / g_dspIps, due / g_dspIps,
+			c.px->read(0xffffe7, dsp56k::Nop) & 0xffffff, static_cast<unsigned long long>(c.dsp->getInstructionCounter()));
+	}
+
 	void DspPair::instrumentBefore(Core& c, const int i, const uint32_t pc)
 	{
+		if(m_frameTraceOn)
+			frameTraceLine(c, pc, c.executed, m_due);
 		if(m_sw.core == i)
 		{
 			if(pc == m_sw.start) { m_sw.t0 = c.executed; m_sw.armed = true; }
@@ -2957,9 +3227,40 @@ namespace ot
 		}
 		else
 			self->catchUp(true);
-		const bool empty = !m_cores[_core & 1]->hdi().hasRXData();
+		bool empty = !m_cores[_core & 1]->hdi().hasRXData();
 		if(!m_rt)
 			return empty;
+		if(!empty && !m_rtc[_core & 1].faulted.load(std::memory_order_relaxed))
+		{
+			// O17c: THE GATE WAITS FOR THE DRAIN. The completion is booked at the
+			// kick plus the lockstep drain time (rtos.cpp THE DRAIN TIMES) and
+			// the worker drains the block in one service, microseconds of wall
+			// after the push -- usually long before the booked time, but a
+			// worker inside a long block or a wait got there later, the gate
+			// held, and the ColdFire's clock stepped on past the booked time
+			// (measured 13 Sep 2026: 350-430 completions per 4 s of PLAY later
+			// than booked, up to a sample; every divergence from the reference
+			// began at one). Hold here instead -- the ColdFire's clock does not
+			// move -- until the ring is drained, bounded at 2 ms for a dead core.
+			RtCore& r = self->m_rtc[_core & 1];
+			r.svc.store(true, std::memory_order_seq_cst);
+			if(r.parked.load(std::memory_order_seq_cst))
+				self->rtWake(_core & 1);
+			const auto t0 = Clock::now();
+			uint64_t spins = 0;
+			++self->m_gateDrainWaits;
+			while(m_cores[_core & 1]->hdi().hasRXData() && !m_stop.load(std::memory_order_relaxed))
+			{
+				if(r.faulted.load(std::memory_order_relaxed) || ((++spins & 255) == 0 && secondsSince(t0) > 0.002))
+				{
+					++self->m_gateDrainTimeouts;
+					break;
+				}
+				cpuRelax();
+			}
+			self->m_gateDrainS += secondsSince(t0);
+			empty = !m_cores[_core & 1]->hdi().hasRXData();
+		}
 		++self->m_gateCalls;
 		if(!empty)
 		{

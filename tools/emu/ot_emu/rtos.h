@@ -397,6 +397,7 @@ namespace ot
 		uint64_t hostNonZeroIn() const { return m_hostNonZeroIn; }
 		void setDspDrainPacing(bool _on) { m_edma.setDrainPaced(_on); m_edma.setBusPaced(!_on); }
 		void setBlockLog(bool _on) { m_blockLogOn = _on; }
+		uint32_t tcdWords(uint32_t _ch) const;		// O17c: a host-port TCD's block in DSP words
 		// O9d: every host-port block's CONTENT, binary, taken at the move
 		// (a later peek cannot tell "nothing sent" from "consumed"). Record:
 		// u8 dir('>'/'<'), u32 frame, u16 ch, u8 core, u32 ram, u32 nwords, u16[nwords].

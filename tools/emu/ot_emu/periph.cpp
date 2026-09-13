@@ -1,4 +1,6 @@
 #include "periph.h"
+#include <cstdio>
+#include <cstdlib>
 
 #include <ctime>
 
@@ -318,6 +320,7 @@ namespace ot
 			m_onKick(_ch);
 		setCsr(_ch, static_cast<uint16_t>(csr(_ch) & ~DONE));
 		++m_started;
+		static const bool s_trace = [] { const char* e = std::getenv("OT_FENCE_TRACE"); return e && *e && *e != '0'; }();	// O17c diagnostic
 		if(_paced && m_busPaced && m_canComplete)
 		{
 			// The chip's own number (periph.h): the burst occupies the
@@ -325,7 +328,19 @@ namespace ot
 			// word, and the drain gate holds the completion beyond that if
 			// the DSP has not taken the words yet.
 			const auto words = static_cast<double>(tcdField(_ch, 8, 4) * minorLoops(_ch)) / 2.0;
-			m_due.emplace(_ch & 15, m_now + words * g_fbSamplesPerWord);
+			const auto ok = m_due.emplace(_ch & 15, m_now + words * g_fbSamplesPerWord);
+			if(s_trace)
+				std::fprintf(stderr, "ftrace %.3f edma kick ch%u paced words=%.0f due=+%.3f booked=%d outstanding=%zu\n", m_now, _ch, words, words * g_fbSamplesPerWord, ok.second ? 1 : 0, m_due.size());
+		}
+		else if(!_paced && m_hostDrainTime && m_canComplete && paced(_ch))
+		{
+			// O17c: THE DRAIN TIMES (periph.h setHostDrainTime): the SSRT-kicked
+			// host-port burst completes at kick + the lockstep interpreter's
+			// drain time of its shape, behind the gate as before
+			const double t = m_hostDrainTime(_ch);
+			m_due.emplace(_ch & 15, m_now + t);
+			if(s_trace)
+				std::fprintf(stderr, "ftrace %.3f edma kick ch%u drain-paced due=+%.4f outstanding=%zu\n", m_now, _ch, t, m_due.size());
 		}
 		else if(_paced && !(m_drainPaced && m_canComplete))
 			// The DSP delivers its frame on ITS clock, so the completion is

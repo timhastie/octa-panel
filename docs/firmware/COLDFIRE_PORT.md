@@ -5551,3 +5551,181 @@ card re-insert reboots to `ready` in 7.6 s with `--dsp-rt` and
 - The batch keeps the lockstep interpreter; `--dsp-rt` is `--interactive`
   only, cue and core 1 are not captured, the DSP-side instruments do not
   observe the workers — all as O17.
+
+## Milestone O17c — `--dsp-rt` renders the lockstep bytes: the DSP's clock at every wait, the exact boot, the ISR's drain times ✅ (13 Sep 2026, branch `panel-ui`)
+
+O17b left the real-time mode "the same music, not the same samples": on
+the clean fixture (`out/_agents/audio/otlive2.img`, the O14k reference
+project, T1 playing `third-0.wav` at 0.7032) the driver
+`out/_agents/jit-spike/rtdrive.py` + `out/_agents/audioq/fit.py` fit the
+lockstep `--dsp` capture to the sample at **gain 0.7032, residual −33.0 dB**
+and the `--dsp-rt` capture at **gain 0.577, −10.7 dB** (a second run −11.8;
+`OT_RT_LEAD=2` −7.4, `OT_RT_POLLLEAD=0` −15.1, `OT_RT_DSR2FF=0` −20.5,
+`OT_RT_BULK=0` −8.1, `OT_RT_DOITER=0` −9.5; every run different) — the
+owner hears crackling on clean kicks and dropouts. This milestone finds
+six mechanisms with instruments, fixes them in `tools/emu/ot_emu` alone
+(the vendored patch is untouched), and ends with the rt capture
+**bit-identical to the lockstep capture: 0 mismatches of 199,358 samples,
+L and R, in three consecutive runs (−33.0 dB, gain 0.7032 each)**. Logs,
+captures and the scripts under `out/_agents/audiofix/`.
+
+### The instruments (all kept; the scripts under `out/_agents/audiofix/`)
+
+- **The per-block diff** (`perframe.py`, `hits.py`, `slips.py`, `corr.py`):
+  the rt capture aligned to the lockstep capture, the error per 16-sample
+  block in dB, the wrong samples by position, the stale test (a wrong
+  sample equal to the lockstep sample 32 earlier = the ring word from the
+  previous revolution), a per-block shift search. It said: one stale
+  sample at the block's first position in a third of the blocks, whole
+  stale blocks now and then, and long stretches in each hit's tail where
+  every sample is wrong by −10 dB with a per-block gain 0.5–1.0.
+- **The frame trace** (`OT_DSP_FRAMETRACE=1`, any mode; `ftr.py`): one
+  stderr line at core 0's marker PCs — the bank word `P:0x73`, the take seen
+  `P:0x99`, core 1's reply `P:0xa5`, the output stage `P:0x1cb`/`0x205`
+  (made volatile P addresses under the trace), the return to the DSR2 poll
+  `P:0x4b` — and core 1's `0x57/0x59/0x8d/0x8f`, with the DSP's own clock,
+  the ColdFire's due count and DSR2. Lockstep: the take at +0.79 samples
+  after the bank word (the lazy chunk's grain), the output stage at +1.26,
+  DSR2 = 0x79 there — **the ring write has ~0.5 samples of slack before
+  DMA2 enters the half it writes**. rt: the take at +0.37 median, p99 1.8,
+  max 3.0; the output stage past +2.0 in 255 of 11,400 frames.
+- **The exchange timeline** (`OT_FENCE_TRACE=1`; `exch.py`, `pushlat.py`):
+  per frame, the ColdFire's ack, commands, pulls, pushes and acks in its
+  own clock. Lockstep: the whole exchange 3.36 samples, every push's
+  completion a constant of its shape (`pushlat.py` over 12,360 frames:
+  core 0's 336-word push 0.340, core 1's 0.165, the 256-word forward 0.126,
+  the 64-word ones 0.032, the 32-word one 0.017; ≤ 10 distinct values each,
+  within 0.005). rt: 2.85 samples, every push done 0.015 after its kick,
+  with a wall-dependent tail up to 2 samples.
+- **The block dump under rt** (`--block-dump`, `blockdiff*.py`): every
+  host-port block of every frame against the lockstep dump. It separated
+  "the DSP was given different data" from "the DSP computed differently",
+  and found the ColdFire's own blocks differing (below). The dump had
+  stalled the rt protocol (the mover's `peekWord`/`blockNote` peeks into
+  the core's registers from the ColdFire's thread); they are skipped under
+  `--dsp-rt` now, the dump's words are the ColdFire's own RAM.
+- **The ESAI-vs-ring check** (`rtstatus esaimism=`): in the sink, the eight
+  words the ESAI put out against the ring words the −9 rule says DMA2 took
+  them from. 0 mismatches until a stall — the DMA2/ESAI/sink path is
+  faithful; what differed was the ring's content.
+- **Determinism**: two rt runs were not bit-identical to each other (66k
+  mismatches), so a JIT arithmetic divergence (the spike's CCR U bit) was
+  ruled out; every mechanism below is timing.
+
+### What was wrong, in the order found (`dsp.cpp` THE WAITS / THE RENDEZVOUS AT THE TAKE / THE COMMAND RENDEZVOUS / THE EXACT BOOT / THE GATE WAITS FOR THE DRAIN; `rtos.cpp` THE DRAIN TIMES; `periph.h` `setHostDrainTime`)
+
+1. **The DSP's clock at the take.** Under lockstep core 0 leaves its HTDE
+   wait (`P:0x97`) at the ColdFire's clock of the take. Under rt the poll
+   lead (2 samples) let the worker's clock run to E+2 while the ColdFire
+   caught up its 13-sample lead, so the take was seen at E+0…2.2 of the
+   DSP's own clock, and the ring write that follows (`P:0x25b`, r1 = the
+   other half) landed after DMA2 had entered that half: the block's first
+   ring words came out stale (the previous revolution's samples: the
+   crackle), whole blocks when the wait was longer (the dropouts). Fix:
+   `OT_RT_POLLLEAD` defaults to 0 (the wait's fast-forward never passes the
+   ColdFire's clock); the bank take and the end of a read-back pull post
+   the exact count (`m_hostEventAt`); at the wait's exit (`P:0x97 → 0x99`,
+   a volatile address) the worker idle-steps its clock up to that count
+   through its peripheral events.
+2. **The read-back refill race.** After the take the ColdFire's `0x89`
+   refills HOTX with the read-back within 45 of its instructions (~0.5 µs
+   of wall); the worker's service and poll take microseconds, so HTDE was
+   clear again before the poll ran and core 0 stayed at `P:0x97` through
+   the whole pull (0.7 samples: `waitcu0` ≈ one per frame of ~1,500
+   instructions) — on the chip and under lockstep it leaves at the take.
+   Fix: THE RENDEZVOUS AT THE TAKE — `rxTake` holds (its clock frozen,
+   ~1 µs, `take=` in `rtstatus`) until the worker has left the wait
+   (`m_takeSeen`).
+3. **The mailbox waits.** Core 0's wait for core 1 to take its word
+   (`P:0xa3`) and core 1's for core 0's two words (`P:0x57`, `0x8d`) were
+   fast-forwarded to the work lead; with the other core idle at its own
+   bound the wait left 3–24 samples late (the frame's work, ring write and
+   all: a whole stale block, a skipped frame, DMA2 dry — the O17b stall,
+   reproduced once in 4 s). Fix: a mailbox wait's fast-forward is bounded
+   by the other core's published clock plus the skew, the mailbox hooks
+   record the sending/taking core's clock (`Mailbox::sentAt/takenAt`) and
+   the wait's exit catches up to it; a wait whose condition already holds
+   runs its poll instead of idling (❌ the first cut deadlocked both cores
+   idle at each other's bound with the word already there: a 2 s wait
+   timeout and a faulted core).
+4. **The boot's phase.** The DSP's due count is booked per ColdFire
+   instruction from the first one, the RTOS's sample clock starts at the
+   handoff, so the DSP's frame clock sits `boot instructions / 3990`
+   samples ahead of the RTOS clock — 2877.39 under lockstep, **3213–3329
+   per rt run**, because the loader's 53,627 host-port polls (TXDE/RXDF for
+   every uploaded word) spun a wall-dependent number of times. The
+   sequencer's bookkeeping against the frame grid moved with it: the
+   fixture's second voice (core 1's track, a 64-sample position that walks
+   16 a frame) started 7–8 samples off the reference, and the two voices
+   comb-filtered to −10 dB from ~30 ms into each hit. Fix: THE EXACT BOOT
+   (`OT_RT_BOOTEXACT=1`, default) — until the frame clock is on the
+   workers run with no lead and every host-port read is a rendezvous at
+   the exact count (`bootreads=53627`, the offset **2877.418, identical
+   run to run**; boot to `ready` 8.0–8.9 s LTO-off, was 7).
+5. **The ISR's drain times.** The frame handler's pushes are kicked
+   through SSRT (unpaced) and complete at the drain gate: the lockstep
+   interpreter's DMA0 drains a word per service, a constant per block
+   shape (above); the JIT worker drains a block in one service, so the
+   completion came 0.015 samples after the kick — the ISR chain 0.5
+   samples shorter, and its length following the wall (350–430 of 74,000
+   completions per run later than that, up to a sample; every divergence
+   from the reference began at one, `blockdiff*.py`: the first differing
+   block was the ColdFire's own record for core 1, rendered inside that
+   chain, its 8-sample position bucket flipped). Fix: THE DRAIN TIMES —
+   under rt `Edma::start` books an SSRT-kicked host-port burst at the kick
+   plus the lockstep drain time of its shape (`installHostPortMover`: the
+   six measured shapes, two instructions a word for any other,
+   `OT_RT_DRAINPACE=0` to switch off); THE GATE WAITS FOR THE DRAIN —
+   `hostRingEmpty` holds (clock frozen, `gatedrain=` in `rtstatus`, ~400
+   holds of ~10 µs per 4 s) instead of letting the ColdFire step past the
+   booked time; and the rt gate-stepping rule (32 instructions) applies only
+   to a completion already past due, so a booked one lands on its
+   instruction. Measured after: 0.340 / 0.166 / 0.126 / 0.032 / 0.032 /
+   0.017 with max = median.
+6. **The command poll.** The handler polls CVR's HC until the DSP takes
+   the command — at its next instruction under lockstep, at its next block
+   (wall) under rt, a wall-dependent number of iterations. Fix: THE COMMAND
+   RENDEZVOUS — a CVR read with a command pending holds until the worker
+   has taken it (`hcwait=` in `rtstatus`, ~0.3 µs each).
+
+### Measured (13 Sep 2026, the M5, macOS 26.5; `out/_agents/audiofix/`)
+
+| build / run | gain | residual (fit.py) | vs the lockstep capture |
+|---|---|---|---|
+| lockstep `--dsp` (`ls1`, `ls2`) | 0.7032 | −33.0 dB | — (byte-identical to the O14k reference and to each other) |
+| `--dsp-rt` HEAD (`rt2`…`rt7`) | 0.54–0.65 | −7.2 … −14.0 dB | 17–64 % of the samples wrong |
+| + the take's clock (fix1) | 0.59 / 0.70 | −11.5 / −32.8 dB | one run stalled at 3.3 s |
+| + the mailbox waits, the take rendezvous (fix3) | 0.42–0.60 | −5.2 … −13.3 dB | the DSP's timeline lockstep's; the ColdFire's blocks differ from frame 3 |
+| + the exact boot (fix4) | 0.54–0.70 | −10.1 … −32.8 dB | one run in three right; the rest a coin flip per trig |
+| + the drain times, the command rendezvous (fix6) | 0.60–0.70 | −11.7 / −20.6 / −32.7 dB | the held gates at the divergences |
+| + the gate waits for the drain (fix7, three consecutive runs) | **0.7032** | **−33.0 / −33.0 / −33.0 dB** | **0 mismatches of 199,358 samples, L and R** |
+
+Flat out (`bench.py --dsp --dsp-rt`, the LTO build): **1042 and 1020 emulated ms per wall s** (two runs, 4 s of PLAY in 16 × `run 250`; O17b measured 1015–1058 on its LTO build).
+The same on the LTO binary with no instrument on (`final-lto-1..3`): **−33.0 dB,
+gain 0.7032, three of three; inside the 4 s of PLAY 0 mismatching frames
+against the lockstep capture in all three** (`rtdrive.py` itself timed the
+play at 1164–1218 emulated ms per wall s); after the driver's STOP, two of
+the three differ from lockstep in 1,447 frames (4.06–4.24 s, max |diff|
+1292, the two identical to each other) — a binary post-STOP outcome, not
+measured further. Boot to `ready`: 6.8–7.4 s LTO, 8.0–8.9 s LTO off (was
+7 / 7.9). Three PLAY/STOP cycles of 6 s (`stall_hunt.py`, `hunt-lto/`):
+1016–1027 per cycle, no stall. The strict oracle on the old modes: **28 PASS, 0 FAIL** (ctest 7/7, 37 s; `out/_oracle/reports/20260913-071250.txt`). The vendored tree and
+`tools/patches/dsp56300.patch` are unchanged (`git -C vendor/dsp56300
+diff` equals the patch byte for byte).
+
+### What it does not do
+
+- The drain-time table knows payload A's six block shapes (and the
+  interpreter's base rate for any other); a payload with other shapes gets
+  the two-instructions-a-word rate — deterministic, not lockstep's.
+- The sink's de-rotation (`rot = (DSR2 − 9) & 7`) still takes ring words
+  0..rot−1 of a de-rotated frame from the next ring sample; with the exact
+  boot the rt phase is lockstep's (rot ≤ 2, main L/R inside one sample)
+  and the captures agree, but a boot with rot ≥ 3 would put main R one
+  sample behind L in the capture (seen on the random-phase runs before
+  the exact boot: R = lockstep's R delayed by one sample, L exact). The
+  batch capture has the same rule and the oracle pins its bytes, so it is
+  left as it is.
+- The waits are bounded (2 ms) for a dead core and counted (`take=`,
+  `hcwait=`, `gatedrain=`, `waitto`); the diagnostics (`OT_DSP_FRAMETRACE`,
+  `esaimism=`, `waitcu0/1=`) stay in.
