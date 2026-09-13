@@ -120,13 +120,16 @@ namespace ot
 		{
 			const auto& s = m_burstStats;
 			std::fprintf(stderr, "burst stats: bursts=%llu burstInstr=%llu exactInstr=%llu "
-				"endPeriph=%llu endWake=%llu endHorizon=%llu endSpin=%llu endGate=%llu endPc=%llu idleSkips=%llu instructions=%llu quantum=%d stepfast=%d\n",
+				"endPeriph=%llu endWake=%llu endHorizon=%llu endSpin=%llu endGate=%llu endPc=%llu idleSkips=%llu instructions=%llu quantum=%d stepfast=%d"
+				" exactWake=%llu exactHorizon frame=%llu ata=%llu pit=%llu dtim=%llu edma=%llu\n",
 				static_cast<unsigned long long>(s.bursts), static_cast<unsigned long long>(s.burstInstr),
 				static_cast<unsigned long long>(s.exactInstr), static_cast<unsigned long long>(s.endPeriph),
 				static_cast<unsigned long long>(s.endWake), static_cast<unsigned long long>(s.endHorizon),
 				static_cast<unsigned long long>(s.endSpin), static_cast<unsigned long long>(s.endGate),
 				static_cast<unsigned long long>(s.endPc), static_cast<unsigned long long>(m_idleSkips),
-				static_cast<unsigned long long>(m_machine.instructions()), burstQuantum(), burstStepFast() ? 1 : 0);
+				static_cast<unsigned long long>(m_machine.instructions()), burstQuantum(), burstStepFast() ? 1 : 0,
+				static_cast<unsigned long long>(s.exactWake), static_cast<unsigned long long>(s.exactBySrc[0]), static_cast<unsigned long long>(s.exactBySrc[1]),
+				static_cast<unsigned long long>(s.exactBySrc[2]), static_cast<unsigned long long>(s.exactBySrc[3]), static_cast<unsigned long long>(s.exactBySrc[4]));
 		}
 	}
 
@@ -387,25 +390,35 @@ namespace ot
 					if(!p.hw.empty())
 					{
 						const int core = m_kickSel[_ch & 15];
-						// Where DMA0 has just left off, and the tail of what
-						// landed there: the direct test of whether the words
-						// the port sent reached DSP memory.
-						const auto ddr = co->peekWord(core, 'R', 0);	// 'R' = DMA0's DDR, see DspPair
-						char t[160];
 						std::string tail;
-						// The burst's own timeline in SAMPLES: kicked, and the
-						// completion the drain gate released -- the frame
-						// period is read off consecutive frames' stamps.
-						std::snprintf(t, sizeof t, " kicked@%.1f done@%.1f landed@", p.kicked, m_sample);
-						tail += t;
-						std::snprintf(t, sizeof t, "%04x:", ddr >= 8 ? ddr - 8 : 0);
-						tail += t;
-						for(uint32_t k = 0; k < 8 && ddr >= 8; ++k)
+						// The note is the block log's / the block dump's; its
+						// reads of DMA0's pointer and the landed words are the
+						// DSP's own registers and memory, which under --dsp-rt
+						// belong to the core's thread (TSan, 13 Sep 2026: seven
+						// reports, all this read against the DMA's write), so
+						// they are made only when a log wants them.
+						if(m_blockLogOn || m_blockDump.is_open())
 						{
-							std::snprintf(t, sizeof t, " %06x", co->peekWord(core, 'X', ddr - 8 + k));
+							// Where DMA0 has just left off, and the tail of what
+							// landed there: the direct test of whether the words
+							// the port sent reached DSP memory.
+							const auto ddr = co->peekWord(core, 'R', 0);	// 'R' = DMA0's DDR, see DspPair
+							char t[160];
+							// The burst's own timeline in SAMPLES: kicked, and the
+							// completion the drain gate released -- the frame
+							// period is read off consecutive frames' stamps.
+							std::snprintf(t, sizeof t, " kicked@%.1f done@%.1f landed@", p.kicked, m_sample);
 							tail += t;
+							std::snprintf(t, sizeof t, "%04x:", ddr >= 8 ? ddr - 8 : 0);
+							tail += t;
+							for(uint32_t k = 0; k < 8 && ddr >= 8; ++k)
+							{
+								std::snprintf(t, sizeof t, " %06x", co->peekWord(core, 'X', ddr - 8 + k));
+								tail += t;
+							}
+							tail = co->blockNote(core) + tail;
 						}
-						noteBlock('>', _ch, p.saddr, p.hw, p.nonZero, co->blockNote(core) + tail);
+						noteBlock('>', _ch, p.saddr, p.hw, p.nonZero, tail);
 						m_pendingOut[_ch & 15] = {};
 					}
 				}
@@ -423,9 +436,14 @@ namespace ot
 				++m_hostBlocksIn;
 				m_hostWordsIn += hw.size();
 				m_hostNonZeroIn += nz;
-				char at[48];
-				std::snprintf(at, sizeof at, " at@%.1f", m_sample);
-				noteBlock('<', _ch, daddr, hw, nz, co->blockNote(m_kickSel[_ch & 15]) + at);
+				std::string at;
+				if(m_blockLogOn || m_blockDump.is_open())
+				{
+					char t[48];
+					std::snprintf(t, sizeof t, " at@%.1f", m_sample);
+					at = co->blockNote(m_kickSel[_ch & 15]) + t;
+				}
+				noteBlock('<', _ch, daddr, hw, nz, at);
 			});
 		// With the cores attached the bus's own time paces a burst (periph.h).
 		m_edma.setBusPaced(true);
@@ -548,17 +566,30 @@ namespace ot
 	double Rtos::nextEvent() const
 	{
 		double best = (m_frame || m_frameFromDsp) ? m_nextFrame : 1e300;
+		m_horizonSrc = 0;
 		if(m_ataIrqDue != 0.0 && m_ataIrqDue < best)
+		{
 			best = m_ataIrqDue;
+			m_horizonSrc = 1;
+		}
 		double e;
 		for(const auto* p : {&m_pit0, &m_pit1})
 			if(p->nextExpiry(e) && e < best)
+			{
 				best = e;
+				m_horizonSrc = 2;
+			}
 		for(const auto& t : m_dtim)
 			if(t.nextMatch(e) && e < best)
+			{
 				best = e;
+				m_horizonSrc = 3;
+			}
 		if(m_edma.nextDue(e) && e < best)
+		{
 			best = e;
+			m_horizonSrc = 4;
+		}
 		return best;
 	}
 
@@ -741,7 +772,8 @@ namespace ot
 		const bool gateEnds = _s.untilGate;
 		const bool spinEnds = _s.idleSkip;
 		Coprocessor* const co = m_machine.coprocessor();
-		const bool syncCo = dspSyncAtTick();
+		const bool coRt = co && co->realtime();		// O17: its bank-word edge (an atomic count) ends a burst; sync() applies it
+		const bool syncCo = dspSyncAtTick() || coRt;	// the rt mode needs the sync (its edges and its posts live there)
 		m_wake = true;
 
 		while(m_sample < end)
@@ -833,6 +865,16 @@ namespace ot
 				// long would not be, which is what the horizon prevents.
 				const double lim = std::min(nextEvent(), end);
 				double nd = (lim - m_sample) * m_ips - 2.0;
+				// O17: behind the eDMA's drain gate (a completion due in the past,
+				// granted when the DSP has taken the block) the exact loop steps
+				// one instruction at a time until the gate clears, ~100 ns each --
+				// bit-exact completion timing for the lockstep modes, 18 M steps
+				// in 4 s of play. The rt mode's contract is functional: it steps
+				// the gate in bursts of 32 (the completion then lands at most 32
+				// instructions late, and any peripheral access still ends the
+				// burst), except within 32 instructions of the run's end.
+				if(coRt && nd < 2.0 && m_horizonSrc == 4 && !m_wake && (end - m_sample) * m_ips > 34.0)
+					nd = 32.0;
 				if(nd > static_cast<double>(quantum))
 					nd = static_cast<double>(quantum);
 				if(_s.budget && nd > static_cast<double>(_s.budget - executed))
@@ -844,6 +886,7 @@ namespace ot
 					// and the tail across an event. m_wake is cleared BEFORE
 					// the step so a wake raised inside it is never lost.
 					++m_burstStats.exactInstr;
+					if(m_wake) ++m_burstStats.exactWake; else ++m_burstStats.exactBySrc[m_horizonSrc & 7];	// O17 diagnostic: what forced it
 					m_wake = false;
 					if(!stepOnce())
 						return Stop::Illegal;
@@ -898,6 +941,7 @@ namespace ot
 					++i;		// once per instruction (the prototype counted twice)
 					if(m_machine.takePeriphTouched()) { ++m_burstStats.endPeriph; break; }
 					if(m_wake) { ++m_burstStats.endWake; break; }
+					if(coRt && (i & 63) == 0 && co->edgePending()) { ++m_burstStats.endWake; break; }	// O17: the DSP's edge, applied by sync() below (asked every 64 instructions: an atomic load in the hot loop, and the lateness is the lag's)
 					// O15e: the gate went dirty on this instruction (a create
 					// or a dispatch): the pair, then the loop's top asks it.
 					if(gateEnds && m_gateDirty) { ++m_burstStats.endGate; break; }

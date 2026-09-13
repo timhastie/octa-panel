@@ -94,6 +94,12 @@ namespace ot
 		// state becomes observable to the CPU -- at every burst end and exact
 		// step; the co-processor calls it itself before any host-port access.
 		virtual void sync() {}
+		// O17: a co-processor running on its own threads (DspPair --dsp-rt).
+		// `edgePending` is its bank-word edge, raised from a DSP thread as an
+		// atomic count; the burst loop ends on it and sync() applies it (the
+		// host-word hook) on the CPU's thread. Both false for every other mode.
+		virtual bool realtime() const { return false; }
+		virtual bool edgePending() const { return false; }
 		// O9b: called when core `_core` puts a word in its host port OUTSIDE a
 		// read-back pull -- the DSP's bank id, which on hardware is what the
 		// frame interrupt announces (the frame handler reads it with no ready

@@ -315,6 +315,7 @@ class PortProc:
     def wait_ready(self, timeout):
         """Consume the boot report until the ready line; PortDied on exit or silence."""
         deadline = time.perf_counter() + timeout
+        rt_refused = None       # the child's own `dsp-rt : cannot start ...` line (O17), if it printed one
         while True:
             try:
                 line = self.lines.get(timeout=max(0.0, deadline - time.perf_counter()))
@@ -322,7 +323,11 @@ class PortProc:
                 self.kill()
                 raise PortDied(f"no ready line within {timeout:.0f} s; last: {self.tail()}")
             if line is None:
+                if rt_refused:
+                    raise PortDied(rt_refused)
                 raise PortDied(f"exited (rc {self.proc.poll()}) before ready; last: {self.tail()}")
+            if line.startswith("dsp-rt") and "cannot start" in line:
+                rt_refused = line.strip()
             if line.startswith("ready "):
                 f = dict(kv.split("=", 1) for kv in line.split()[1:] if "=" in kv)
                 self.ready = (float(f.get("sample", 0)), int(f.get("frames", 0)))
@@ -446,7 +451,8 @@ class RtMeter:
 AUDIO_RATE = 44100
 AUDIO_RING_S = 180           # the server-side ring: 180 s x 44100 x 4 B = 31.8 MB, allocated on the first frame
 AUDIO_READ_MAX = 441000      # frames per `audio read` (10 s = 3.5 MB of hex on one line); looped while full
-SOUND_ON_NOTE = "sound on -- while it plays the unit runs slower than real time with the DSP cores (/status rt says how much; ~0.15x on the M5, 12 Sep 2026)"
+SOUND_ON_RT_NOTE = "sound on -- the DSP cores run in real time (--dsp-rt: the JIT workers on the lockstep schedule, O17; /status rt says the rate)"
+SOUND_ON_NOTE = "sound on -- the lockstep --dsp child: while it plays the unit runs ~0.2x real time (/status rt says how much)"
 SOUND_OFF_NOTE = "sound off: the port child runs without the DSP cores"
 
 
@@ -1046,6 +1052,15 @@ class Panel:
         # current one delivers; audio_on says its capture is running.
         self.sound_wanted = bool(sound) and backend == "port"
         self.sound = False
+        # O17 (12 Sep 2026): with sound on the child runs --dsp-rt (the DSP
+        # cores under the JIT on worker threads, real time). rt_wanted is
+        # what the NEXT sound-on child boots with; an rt child that cannot
+        # start (the binary's `dsp-rt : cannot start` line, or an exit
+        # before `ready`) turns it off and the child is respawned with the
+        # lockstep --dsp (~0.2x while playing). sound_rt says what the
+        # current child runs.
+        self.rt_wanted = True
+        self.sound_rt = False
         if backend != "port":
             self.sound_note = "no sound under route A (the DSP cores are the port's)" if sound else SOUND_OFF_NOTE
         else:
@@ -1257,8 +1272,11 @@ class Panel:
             if self.internal_clock:
                 argv.append("--internal-clock")
         argv += self.port_args
-        if self.sound_wanted and "--dsp" not in argv:
-            argv.append("--dsp")        # the DSP cores: sound, ~9x slower than real time while playing (~3x the wall time of no cores)
+        if self.sound_wanted and "--dsp" not in argv and "--dsp-rt" not in argv:
+            # the DSP cores: --dsp-rt = real time (O17); --dsp = the lockstep
+            # interpreter, ~0.2x while playing (the fallback, and what an
+            # explicit --port-arg=--dsp asks for)
+            argv.append("--dsp-rt" if self.rt_wanted else "--dsp")
         return argv
 
     def _boot_port(self, phase=None):
@@ -1269,7 +1287,25 @@ class Panel:
         proc = PortProc(self._port_argv(), log_path=log)
         self.proc = proc
         try:
-            proc.wait_ready(self.BOOT_TIMEOUT)
+            try:
+                proc.wait_ready(self.BOOT_TIMEOUT)
+            except PortDied as e:
+                if not (self.sound_wanted and self.rt_wanted and "--dsp-rt" in proc.argv):
+                    raise
+                # O17: the real-time child did not come up (a binary without
+                # --dsp-rt, a host whose DSP memory is not MMU-backed, a boot
+                # that faults): once more with the lockstep cores -- sound at
+                # ~0.2x -- and /status says why (sound_note, backend_note).
+                self.rt_wanted = False
+                self.sound_rt = False
+                self.backend_note = ((self.backend_note + "; ") if self.backend_note else "") + \
+                    f"the --dsp-rt child did not boot ({e}); respawned with the lockstep --dsp"
+                print(f"panel: {self.backend_note}")
+                proc.kill()
+                proc = PortProc(self._port_argv(), log_path=log)
+                self.proc = proc
+                proc.wait_ready(self.BOOT_TIMEOUT)
+            self.sound_rt = "--dsp-rt" in proc.argv
             rt = PortRt(proc, meter=self.meter)
             self.rt = rt
             self.booted = True
@@ -1783,7 +1819,9 @@ class Panel:
         self.audio_on = True
         self.sound = True
         self.audio_note = None
-        self.sound_note = SOUND_ON_NOTE
+        self.sound_note = SOUND_ON_RT_NOTE if self.sound_rt else SOUND_ON_NOTE
+        if not self.sound_rt and self.backend_note and "--dsp-rt child did not boot" in self.backend_note:
+            self.sound_note += " -- the --dsp-rt child did not boot (backend_note says why)"
 
     def _drain_audio(self, rt):
         """Everything the child captured since the previous drain, into the
@@ -2451,7 +2489,8 @@ class Handler(BaseHTTPRequestHandler):
                             "restarts": p.restarts,
                             "card_busy": p.card_busy,       # a /samples/commit re-insert in progress
                             "clock": p.clock_note,          # what the boot-time YES found
-                            "sound": p.sound,               # the child runs --dsp and its main out is captured
+                            "sound": p.sound,               # the child runs the DSP cores and its main out is captured
+                            "sound_rt": p.sound_rt,         # O17: ... under --dsp-rt (real time); False = the lockstep --dsp (~0.2x) or no cores
                             "sound_note": p.sound_note})
         elif path.startswith("/samples"):
             self._samples(path, args)
@@ -2463,6 +2502,13 @@ class Handler(BaseHTTPRequestHandler):
             addr, n = int(args.get("addr", "0"), 0), min(int(args.get("len", "4"), 0), 4096)
             ok, res = p.do(lambda rt: bytes(rt.uc.mem_read(addr, n)).hex(), timeout=30)
             self._json({"ok": ok, "addr": f"{addr:#x}", "hex": res if ok else None, "result": None if ok else res})
+        elif path == "/rtstatus":
+            # O17: the port child's `rtstatus` line (the DSP workers' MIPS, waits, edges, faults)
+            if p.backend != "port" or p.proc is None:
+                self._json({"ok": False, "result": f"backend is {p.backend}"})
+            else:
+                ok, st = p.do(lambda rt: rt.proc.command("rtstatus", "rtstatus"), timeout=30)
+                self._json({"ok": ok, "rtstatus": st if ok else None, "result": None if ok else st, "sound_rt": p.sound_rt})
         elif path == "/port":
             # the port child itself: argv, pid, its own status line, the tail of its report
             if p.backend != "port" or p.proc is None:
@@ -2567,10 +2613,10 @@ def main():
                     help="seed the sample pool with every WAV/AIFF in DIR (converted when the unit "
                          "would not read it), in addition to the project's sibling AUDIO; repeatable")
     ap.add_argument("--sound", choices=("on", "off"), default="on",
-                    help="on (default): the port child runs --dsp and its main output is captured "
-                         "(/audio/status, /audio/pcm, /audio.wav, takes on PLAY..STOP; boot ~1 min, the "
-                         "sequencer ~9x slower than real time while it plays, ~3x slower than without the cores); off: no DSP cores, no sound. "
-                         "--port-arg=--dsp is the same as on; --sound off wins over it")
+                    help="on (default): the port child runs --dsp-rt (the DSP cores in real time, O17) and its main output is captured "
+                         "(/audio/status, /audio/pcm, /audio.wav, takes on PLAY..STOP); an rt child that cannot start is respawned "
+                         "with the lockstep --dsp (~0.2x real time while it plays; /status sound_note says so); off: no DSP cores, no sound. "
+                         "--port-arg=--dsp asks for the lockstep cores explicitly; --sound off wins over it")
     a = ap.parse_args()
 
     # Default to the STOCK image: out/mainos_bus.bin is whatever the last

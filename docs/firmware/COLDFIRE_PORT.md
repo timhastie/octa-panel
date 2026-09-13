@@ -4847,3 +4847,347 @@ above is the deterministic-handshake proof.
   the fallback.
 - `OT_DSP_STATS` prints at destruction, as in O16b; `OT_DSP_EDGELOG` is a
   diagnostic and prints nothing without the variable.
+
+## Milestone O17 — `--dsp-rt`: the DSP cores as JIT workers on the lockstep schedule ✅ built, ⚠️ not real time (12–13 Sep 2026, branch `panel-ui`)
+
+The spike (`out/_agents/jit-spike/SPIKE.md`) proved the vendored JIT
+(dsp56300 at `3c01813f`, HAVE_ARM64) executes both of this firmware's DSP
+programs once five defects are patched, and that free-running cores are a
+dead end (the frame protocol reads the bank id with no ready check and
+halts on thread-level jitter). This milestone builds the design it
+recommended instead: **the ColdFire stays the master of emulated time and
+O16c's booking is kept exactly, but the backlog is executed by two worker
+threads under the JIT** — one per core, each run to the booked count and
+never past it — so the ColdFire's bursts and the cores' chunks overlap in
+wall time and the ordering the firmware depends on is lockstep's by
+construction. `--dsp-rt` is opt-in, `--interactive` only; every other mode
+is untouched (the strict oracle: 28/28 byte-identical, ctest 7/7). The
+panel spawns it with `--sound on` and falls back to `--dsp` when it cannot
+start. **Real time was the target and is not reached: the unit plays at
+0.62–0.65x (3.2x the lockstep 0.2x), for reasons measured below.**
+`dsp.cpp`, `dsp.h`, `machine.h`, `rtos.cpp/.h`, `main.cpp`,
+`tools/patches/dsp56300.patch` (vendor/dsp56300 in place),
+`tools/panel/panel_server.py`, `tools/panel/README.md`.
+
+### What changed — the design as built (`dsp.cpp`, "THE REAL-TIME MODE")
+
+- **Workers on the lockstep schedule.** `DspPair(ratio, ips, rt=true)`
+  starts two pthreads (16 MB stacks — the JIT compiles on the core's
+  thread; `ThreadPriority::High` = QoS user-initiated; the ColdFire's
+  thread joins that band under `--dsp-rt`). Each waits for its boot ROM
+  to jump (`sendWord` says so and records the core's **offset**: lockstep's
+  `executed := limit` while held, so `executed = counter + offset` from
+  then on), then loops: read the posted due count (one shared cache
+  line, `m_rtDue`/`m_rtGen`; the worker subtracts its offset and adds the
+  lead), run `execJit()` — the peripheral service, then one block and its
+  linked children — while its counter is below the target, publish the
+  counter every 256 instructions and exactly when it stops (`reached`,
+  its own line), spin 200 µs on an empty target, then park on a condition
+  variable (the poster stores the count, bumps the generation and looks
+  at `parked`, both seq_cst, so a post is never lost).
+- **The touch points post; observing ones wait for nothing new.** Every
+  O16c touch point (sync at burst ends and exact steps, host-port
+  read/write, `pushHalfwords`/`pullHalfwords`/`hostRingEmpty`,
+  `tickSamples`, the probes) goes through `rtCatchUp`: a post when the
+  count moved by a quantum (writes 32, reads 32), and a wait only when a
+  core LAGS the count by more than `OT_RT_LAG` (4160 = one sample; read at
+  the burst ends every 512 counts). A core behind the count only makes the
+  host look faster to it — a word lands earlier in DSP time, a command is
+  taken earlier — which the protocol lives with; a core AHEAD is what
+  broke the spike, and the target forbids it. Tick booking is unchanged
+  (`m_due`, the boot's per-instruction ratio and the RTOS's per-sample
+  clock); the boot posts every 512 ticks (it has no sync).
+- **A bounded lead.** `OT_RT_LEAD` (default 8320 = 2 samples): the workers
+  may run that far ahead of the count. Traced through the frame protocol
+  the DSP's own timeline is unchanged by it — it sees the host's actions
+  L later in its time, the ColdFire sees the bank-word edge L earlier —
+  and the double-buffered blocks land well inside the frame; **4 samples
+  measured healthy, 8 stalls the protocol** (`edgesinpull` 13 at 16, core
+  0 parked at P:0x97 with its bank word untaken: the next bank word lands
+  while the ColdFire is still inside the previous frame's bus-paced
+  read-back pull), which is the firmware's timing assumption the spike
+  named.
+- **The bank-word edge.** Every peripheral write made by JIT code carries
+  the PC of the instruction (the vendored `Jitmem::storePcCurrentOp`), so
+  the HDI08 transmit callback on core 0's thread identifies P:0x73 →
+  HOTX and raises an atomic count (`m_edgePending`, raised inside
+  read-back pulls too, as `stepBody` has it); `Rtos::runLoop` asks
+  `Coprocessor::edgePending()` every 64 instructions of a burst and ends
+  it, and `sync()` applies the existing host-word hook on the ColdFire's
+  thread (`rtApplyEdges`, with the lateness recorded: the count minus the
+  edge's executed count). O16c's edge guard is not the default: as a
+  per-tick rendezvous (`OT_RT_GUARD=1`, 29.9 M guard ticks in 4 s) it
+  costs nothing measurable and changes nothing measurable — 583 vs 581
+  emulated ms per wall s, mean lateness 85 vs 116 DSP instructions —
+  because the lead already keeps the workers ahead of the count.
+- **The two cores' interleave.** Each worker holds itself within
+  `OT_RT_SKEW` (512) instructions of the other (`rtSkewWait`: the mailbox
+  handshake at P:0x74/0xa3 and 0x57/0x8d would otherwise spend a core's
+  budget spinning on the other), except when the other is idle for the
+  current post (at its target, stopped at a skip's edge, its pull's word
+  there) — ❌ without that exception core 1 waited the full 200 ms
+  timeout 728 times in one `run 250`. A read-back pull runs its core past
+  the count until HOTX holds the word (`RtCore::pred`), and the other core
+  follows it to the same point, as `runCoreUntil` steps the other core.
+- **The idle skip** (`rtTickSamples`): the whole skip is posted with the
+  workers armed to stop at the first bank-word edge inside it
+  (`m_skipArmed`/`m_skipEdge`); the ColdFire's clock lands on the sample
+  boundary after the edge (lockstep's per-sample grain, `skipedges`), the
+  targets come down to it, and the edge is delivered there.
+- **Host commands** go through the library's cross-thread door
+  (`injectExternalInterrupt`) and a per-core `kick` the worker turns into
+  the core's interrupt queue before its next block — ❌ a zero peripheral
+  delay stored from the ColdFire's thread was overwritten by the core's
+  own service and the command waited for the next ESAI slot, up to 520
+  instructions: 29 M extra exact ColdFire steps behind the eDMA's drain
+  gate in 2 s. ICR host flags via `setPendingHostFlags01`; HCP is not
+  raised in HSR (the core's register); an INIT with TREQ (never written by
+  the firmware) does not clear the receive ring from this thread
+  (`treqdropped`).
+- **The shared window** is one memory through the MMU: after the two
+  `Memory` objects exist, one 256 KB shm object is mapped `MAP_FIXED` over
+  words 0x30000–0x3ffff of all six views (2 cores × P/X/Y), verified
+  word for word at setup; the mode is refused when `Memory` is not
+  MMU-backed. `setSharedWindow`'s redirect and cross-core opcode-cache
+  hook and the write hook are not installed (the JIT reads and writes
+  through host pointers; the hook would touch the other core's JIT from
+  the wrong thread).
+- **The audio pipe**: the ESAI sink on core 0's thread pushes de-rotated
+  frames into the ring under `m_streamMx`; `setAudioStream`,
+  `takeAudioStream` and `streamStatus` lock it. No pacer thread: wall
+  pacing is `pace on` as before.
+- **The gate in bursts.** Behind the eDMA's drain gate the exact loop
+  steps one instruction at a time (~100 ns each, bit-exact completion
+  timing for the lockstep modes: 18 M steps in 4 s); the rt mode steps the
+  gate in bursts of 32 (`rtos.cpp`, the completion lands at most 32
+  instructions late).
+- **The eDMA mover's block notes** (`Rtos::installHostPortMover`) read
+  DMA0's pointer and the landed words through `peekWord` at every
+  completion; they are the block log's and the block dump's, and are now
+  made only when one of those is on (the note string was built and
+  dropped otherwise) -- under `--dsp-rt` those are the core's thread's
+  registers and memory, and every one of the thread sanitizer's reports
+  was that read against the DMA's write (below). Byte-neutral: the log's
+  content when on is what it was.
+- **The poll fast-forward, JIT edition.** A block re-entered eight times
+  in a row with no DO loop open, nothing pending and no pull running is a
+  poll (P:0x57, 0x8d, 0x97, 0xa3: one instruction on itself), and payload
+  A's three-block DSR2 poll re-entered at its head P:0x4b is the one
+  multi-block loop allowed (its iteration count in b1 — the DSP's own idle
+  meter, written to X:$3f80/$3f81 after the bank word — is kept faithful,
+  seven instructions per skipped iteration); the worker then advances to
+  its next peripheral event through `DSP::idleStep` and executes the poll
+  once. Measured: it matters at idle (the cores cost ~0.2 of a core each
+  at 1.00x idle, `xmips` 0.4) and hardly while playing — on this fixture
+  core 0 executes 180–190 M of its 183.5 M instructions per emulated
+  second, i.e. the DSP is loaded ~95 % and there is nothing to skip.
+- **Faults never block the ColdFire**: a PC outside P memory stops the
+  core (`faulted`, the last 64 block-entry PCs in the report); a core that
+  does not reach the count within 2 s of a ColdFire wait is faulted by the
+  waiter; a read-back word not there within 100 ms is `not in time`.
+  `~DspPair` sets stop, wakes and joins the workers before anything they
+  touch is destroyed; `quit`/EOF go through the existing path.
+- **Commands and knobs**: `rtstatus` (`--dsp-rt` only; MIPS per core and
+  executed MIPS, busy fraction, worker CPU seconds, core 0's ESAI frames,
+  the count and each core's lag, posts/wakes/parks, waits, edges raised /
+  applied / inside pulls with their lateness, skip edges, skew waits,
+  fast-forwarded instructions, pulls and their time, read-back words not
+  in time, dropped host words, faults, the knobs, the first read-back
+  words not in time with both workers' state), `cfstatus` (any mode: the
+  ColdFire's instruction count and clock — the rate meter that settled the
+  bottleneck below), and `OT_RT_LAG / LEAD / SKEW / POSTQ / READQ /
+  READWAIT / CHECKQ / TICKPOST / SPIN_US / FF / GUARD / DOITER /
+  WORKER_QOS / TRACE` (diagnostics; the defaults are the mode) plus
+  `OT_SELFPROF=<hz>` (an in-process sampler of the main thread, because
+  the macOS `sample` tool, `lldb -p` and TSan's symbolizer all hang on
+  this process — its MMU-backed DSP memory maps three 64 MB views per
+  core). The interpreter's per-instruction instruments (`--dsp-trace`,
+  `--dsp-pcwatch`, `--dsp-stopwatch`, `--dsp-watch`, `--dsp-map`,
+  `--dsp-writes`, `--dsp-no-idle`) do not observe the JIT workers (a note
+  in the boot log says so).
+- **The panel** (`tools/panel/panel_server.py`, `tools/panel/README.md`
+  "Hearing the unit"): `--sound on` spawns the child with `--dsp-rt`; an
+  rt child that reports `dsp-rt : cannot start` or exits before `ready`
+  is respawned once with the lockstep `--dsp`, `backend_note` says why and
+  `sound_note` says what to expect (~0.65x rt, ~0.2x lockstep); `/status`
+  adds `sound_rt`; `GET /rtstatus` relays the child's `rtstatus` (`ok`
+  false with the reason when the child has none). The owner's
+  `out/emu/ot_emu` predates `--dsp-rt`, so until `pgo.sh` rebuilds it the
+  panel takes the fallback (measured below).
+
+### Every vendor fix (`tools/patches/dsp56300.patch`, 864 lines, 20 files; proven with `git apply --check` on a scratch worktree of `3c01813f`, the applied diff byte-identical to the patch)
+
+The spike's five, each found by an instrument (SPIKE.md): (1) the JIT
+function tables pre-sized to all of P at setup (`notifyProgramMemWrite
+(sizeP-1)`: they grow only with the P addresses the same core writes, and
+core 1's entry P:0x38000 is written by core 0 through the window — a null
+call on the core 1 thread); (2) `setDmaTriggerOnArm` (`dma.cpp`
+`checkTrigger`: a channel armed with its request already holding fires
+once for a non-host-stepped core too — DMA2 armed with TDE set never
+started); (3) `JitConfig::dynamicFastInterrupts = true` (payload A's
+dispatcher lives inside the vector area P:0x40–0xaf, reached by a plain
+`jmp`; the JIT compiled it as two-word fast-interrupt blocks returning to
+the interrupted PC); (4) `pushPCSR` pushes the next PC in Dynamic mode
+unless the processing mode is FastInterrupt (`jitops_helper.cpp`, a csel;
+`jsr` from such a block pushed the interrupted PC and re-entered forever);
+(5) the peripheral-write PC (`jitblock.h/.cpp` `m_pcCurrentOp`,
+`jitmem.h/.cpp` `storePcCurrentOp` in both `writePeriph` emitters,
+`callDSPMemWritePeriph` invalidates it after; `dsp.h`
+`get/setPcCurrentInstruction`). Plus `setPeripheralsUnderMaskedInterrupt`
+(O8's defect 3 as a flag for a non-host-stepped core), the HDI08 transmit
+FIFO (`setTransmitFifoDepth`, 1024 here) with the receive-side burst
+drain, and three of this milestone's own: (6) **the FIFO transmit
+request is level-sensitive** (`hdi08.cpp`: with a FIFO, room is a standing
+request and the DMA fills it as a burst in one service — ❌ the spike's
+edge-triggered shape delivered one word per service whenever the host
+drained the FIFO between two services, and every core-1 read-back pull ran
+its core 5000–8300 instructions past the count; then every eDMA push
+found both cores ahead and its drain gate stepped 1100+ instructions
+instead of lockstep's 494); (7) the DRS bound check (`dma.cpp`: the
+request source is a 5-bit field indexing a 21-entry array; the spike
+crashed in `setDCR` on a garbage DCR); (8) `setDelayCycles(0)` stores a
+zero target instead of reading the DSP's instruction counter (it is
+called from the host's thread by `writeRX`/`readTX`/`clearRX`); and a
+diagnostic getter (`getExecPeripheralsFunc`). The spike's
+diagnostics-only hunks (`peripherals.cpp` DSR2/peripheral-write logs,
+`jitblockchain.cpp` compile timer) are not carried.
+
+### Measured (12–13 Sep 2026, the M5 Max, macOS 26; logs under `out/_agents/jit-build/`; a stuck spike process, `build-tsan/ot_emu --dsp-rt` pid 51757 at 98 % of a core, ran throughout — not this session's to kill)
+
+**The gate.** `oracle.sh out/emu/ot_emu.ref-73c2815 <cand> --build-dir`,
+strict, no tolerance: **28 PASS, 0 FAIL** (ctest 7/7) on the LTO-off build
+(`20260912-230157-jit-build-early`) and on the LTO build
+(`20260912-235112-jit-build-lto`, then `20260913-000250-jit-build-lto-final`,
+`-final2` and `20260913-001015-jit-build-lto-final3` on the final source,
+sha `b98fd9b51b9e`). Batch, `--interactive --dsp` and no-DSP are
+byte-identical.
+
+**Speed** (`bench.py <tag> --dsp --dsp-rt`, the extra arguments forward as
+they are; 4 emulated s of PLAY in 16 × `run 250`, emulated ms per wall s):
+
+| build | `--dsp --dsp-rt` | `--dsp` (lockstep) | no `--dsp` | `ready` rt / lockstep |
+|---|---|---|---|---|
+| LTO (`build-lto`) | **664** (6.03 s) | 197 (20.33 s) | 1326 (3.02 s) | 7.9 s / 15.4 s |
+| LTO off (`build`) | 578–602 | 180–186 | 1072 | 9.9 s / 16.7 s |
+
+Paced (`pace on 1`, the panel's shape): **rt median 0.647 (0.594–0.684)**
+over 3 minutes of PLAY (port 8582, below), 0.999 (0.989–1.010) idle. The
+target — ≥ 1000 flat out, 1.00 ± 0.02 paced — is not met.
+
+**Where the wall goes** (LTO off, 4 s of PLAY = 6.9 s wall, `rtstatus`
+and `cfstatus`): the ColdFire executes the same 85.0 M instructions per
+emulated second in all three modes (`cfstatus`: no-DSP 340215712 in 4000
+ms, lockstep 340211222, rt 342733498), so its own emulation is the no-DSP
+3.7 s (LTO: ~2.8 s) plus ~1.1 s of posts (5.6 M, ~200 ns each: two
+seq_cst atomics on a line both workers spin on); the waits are the idle
+skips (1.3–1.6 s: the cores' work the ColdFire cannot overlap) and the
+read-back pulls (0.7 s = 14 µs each: the command's handoff, the handler,
+the 256-word FIFO burst at ~30 ns a word on the DSP side and the 256 pops
+on the ColdFire's); explicit lag waits 0.01 s. Core 0 is busy 0.37 of the
+wall at ~300 MIPS (115 executed MIPS: 190 M executed instructions per
+emulated second, the DSP is loaded), core 1 0.35. Per frame (0.363 ms
+real) that is ~0.34 ms of ColdFire (0.25 with LTO) plus ~0.24 ms of core
+0, serialized except within the lead — which the protocol caps at ~4
+samples (above) — so the practical ceiling of this design on this build
+is ~0.65x, ~0.8x with LTO+PGO, and real time would need either the
+cores a frame ahead of the ColdFire's clock (the protocol forbids it) or
+a ColdFire that runs its 85 M instructions in well under 0.6 s.
+
+**The rendezvous (the design's go/no-go).** A post is one store and one
+generation bump (~200 ns with the workers spinning on the line, 1.4 M per
+emulated second while playing); a wait that has to run a lagging core
+the last sample costs 30–60 µs and happens 20–350 times in 4 s; the
+per-tick guard costs and gains nothing measurable (above); the first
+read-back word of a pull is there 14 µs after the kick on average.
+Wakes: 100–300 per 4 s with the 200 µs spin (with no spin, 4.5 M wakes
+and 213 emulated ms per wall s: every pull waited for a parked worker).
+
+**The panel** (`panel_e2e_rt.py`, `panel_server.py --port 8582 --sound
+on` on the OTLIVE fixture, the LTO binary as `--port-bin`): `ready` after
+7.6 s, `sound_rt` true; **idle** 999.7 emulated ms per wall s, `/status rt`
+median 0.999 (0.989–1.010), child 67 % of a core (`ps -M`: ColdFire 17 %,
+the two workers 24 % each spinning idle); **PLAY 181 s**: 117110 emulated
+ms in 181.18 s wall = 646 per wall s (per-second 577–692), `/status rt`
+n=180 median 0.647 (0.594–0.684), child 283 % (93 / 95 / 95 %); frames
+kept coming for the whole run (`audio` captured 6,615,700 frames, no
+halt); `rtstatus` after PLAY: edges 347,574 applied 347,574,
+**edges-in-pull 0, faults 00, dropped 0, pullshort 0**, waits 266, edge
+lateness mean 160 DSP instructions (max 5180), skew timeouts 0; the take
+`out/_panel_takes_8582/take-001.wav` 5,564,210 frames = 126.2 s, 22.3 MB,
+decodes. LED chase by wall clock (LED-state changes on `/leds`, two per
+16th): 122 ms mean in the first 12 s of PLAY (~1x: the first bar, before
+the load builds) and 122 ms mean / 123 ms median again after 60 s of
+steady PLAY on a second run (port 8583, rt 0.619) — at 0.62x a 16th takes
+~200 ms of wall; the running light's cadence does not follow it, which is
+a question for the panel's LED decoding, not this milestone.
+**Fallback** (`panel_fallback_8584.py`: `panel_server.py --port 8584
+--sound on` with `--port-bin out/emu/ot_emu.ref-73c2815`, a binary without
+`--dsp-rt`): the rt child prints its usage and exits rc 2 on the unknown
+flag before `ready`, the server respawns it with the lockstep `--dsp`,
+`ready` after 18.8 s, `/status` `sound` true, `sound_rt` false,
+`backend_note` "the --dsp-rt child did not boot (exited (rc 2) before
+ready; last: usage: ...); respawned with the lockstep --dsp",
+`sound_note` says the lockstep child plays at ~0.2x, `/rtstatus`
+`{ok: false, result: "PortError: unknown command rtstatus"}`, `rt` 1.00
+idle; SIGTERM on the server leaves no child. Until `out/emu/ot_emu` is
+rebuilt from this tree (`pgo.sh`) that is what the owner's panel does.
+
+**A/B** (`out/_agents/jit-build/ab/`: `lockstep-ref-73c2815.wav` = the
+spike's `run-ref-4s` capture on the frozen reference, `rt-lto.wav` = the
+same `rtdrive.py` script on this binary with `--dsp-rt`, 199,358 vs
+199,373 frames, `cmpwav2.py` and `perwindow.py`): onset frame **78 vs 82
+(4 samples)**; RMS **−5.13 vs −4.39 dBFS (0.74 dB)**, both peak at
+32767 (the fixture clips); per 0.25 s window the best lag is −4 samples
+in 13 of 17 windows with signal and +60 / −36 in the others (the
+15/17-frame jitter O16c documented, a loop restart moved a frame), the
+gain fit 0.55–0.98, the residual median −5.4 dB (−15.7 dB in the last
+second, −10 dB in the first): the same loops at the same level and time,
+not the same samples — the functional contract, not the Phase B bytes.
+Both WAVs are in the log dir for listening.
+
+**Shutdown** (`shutdown_rt.py`, during a paced PLAY with `audio start`):
+`quit` 47 ms, EOF 37 ms, SIGTERM 18 ms; no process left.
+
+**Thread sanitizer.** A Debug build with `-fsanitize=thread -O1 -DNDEBUG`
+(`build-tsan`; NDEBUG because the vendored `Jitmem::writeDspMemory`
+asserts on a static out-of-range address that the MMU scratch area
+absorbs in Release): the JIT-emitted code is not instrumentable, only the
+C++ handshakes are. With TSan's own symbolizer on, the child hung in it
+after `ready` (the same macOS symbolication that hangs `sample` and
+`lldb -p` on this process); with `symbolize=0` (`tsan-run/`, addresses
+symbolized offline with `atos -l 0x100000000`) it booted to `ready` in
+322 s and played, and every report -- 10 in the first 2.5 s of PLAY --
+was one pattern: the eDMA mover's `peekWord` reads (DMA0's DDR through
+`Peripherals56362::read`, the landed words through `Memory::get`) on the
+ColdFire's thread against core 0's DMA writes (`DmaChannel::execTransfer`
+from `HDI08::exec` in the worker's peripheral service) -- 13 reports by
+the time that run was stopped, 7 at `Memory::get` and 6 at
+`Peripherals56362::read`, no other pattern. Fixed as above; the rerun on
+the fixed binary (`tsan-run2/`, same launch) booted to `ready` in 343 s
+and played the whole 20 s of PLAY (1344 s wall, 930,822 frames captured,
+the take decodes, rc 0) with **no report**: no `tsan.log.*` written and
+no ThreadSanitizer line on the child's stderr.
+
+### What it does not do
+
+- **Real time.** 0.62–0.65x paced, 664 emulated ms per wall s flat out
+  with LTO. The lockstep-schedule premise — the cores never past the
+  ColdFire's count, at most a few samples ahead — serializes the cores'
+  frame work with the ColdFire's own emulation; the counters above say
+  which part is which. A larger lead breaks the frame protocol (8
+  samples measured), so the next lever is the ColdFire itself (its 85 M
+  instructions per emulated second at ~90–120 M per wall second) or a
+  read-back path that does not cost 14 µs a block.
+- The audio is functional, not byte-identical: the O16a Phase B contract
+  cannot be met by any threaded design (O16c), and `phase_b.sh` is not
+  run on `--dsp-rt` captures.
+- `--dsp-rt` is `--interactive` only (the batch keeps the interpreter);
+  cue and core 1 are still not captured; the DSP-side instruments do not
+  see the workers.
+- The workers spin 200 µs before parking: ~0.2 of a core each at 1.00x
+  idle.
+- `rtstatus` reads its counters without a rendezvous (racy by design,
+  diagnostic); the report at exit and the probes rendezvous first.
+- The macOS `sample`, `lldb -p` and TSan's symbolizer hang on this
+  process (the MMU-backed DSP memory's six 64 MB views); `OT_SELFPROF` is
+  what profiles it.

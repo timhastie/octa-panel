@@ -421,7 +421,8 @@ namespace ot
 		// under `run(_ms, true)`), and the PC reached a caller's address
 		// (`runToPc`, `runToMainSpin`, `callAsMain`'s return).
 		struct BurstStats { uint64_t bursts = 0, burstInstr = 0, exactInstr = 0,
-			endPeriph = 0, endWake = 0, endHorizon = 0, endSpin = 0, endGate = 0, endPc = 0; };
+			endPeriph = 0, endWake = 0, endHorizon = 0, endSpin = 0, endGate = 0, endPc = 0,
+			exactWake = 0, exactBySrc[8] = {}; };	// O17 diagnostic: exact steps by cause (a wake, or the horizon source: frame/ata/pit/dtim/edma)
 		const BurstStats& burstStats() const { return m_burstStats; }
 		// The knobs, read once from the environment: OT_BURST = the quantum
 		// (default 4096; 0 = every instruction exact, the pre-O15a loop),
@@ -518,6 +519,7 @@ namespace ot
 		bool anyPending() const;
 		bool nextExpiry(double& _out) const;
 		double nextEvent() const;
+		mutable uint8_t m_horizonSrc = 0;	// O17 diagnostic: which source nextEvent() answered with (0 frame, 1 ata, 2 pit, 3 dtim, 4 edma)
 		void recordCreate();
 
 		Machine& m_machine;

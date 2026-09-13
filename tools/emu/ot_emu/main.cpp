@@ -31,6 +31,13 @@
 #include "machine.h"
 #include "rtos.h"
 #include "dsp.h"
+
+#include <mach/mach.h>
+#include <pthread.h>
+#include <thread>
+#include <atomic>
+#include <unordered_map>
+#include <dlfcn.h>
 #include "wav.h"
 
 namespace
@@ -250,8 +257,83 @@ namespace
 		return "?";
 	}
 
+	// O17 diagnostic: OT_SELFPROF=<hz> -- a sampler thread suspends the main
+	// thread <hz> times a second, reads its program counter (Mach thread
+	// state) and, at exit, prints the busiest addresses on stderr with the
+	// image's load address (symbolize with `atos -o <binary> -l <load>`). The
+	// macOS `sample` tool never returned on this process (12 Sep 2026).
+	struct SelfProfiler
+	{
+		std::thread thread;
+		std::atomic<bool> stop{false};
+		mach_port_t target = MACH_PORT_NULL;
+		std::unordered_map<uint64_t, uint32_t> hist;
+		uint64_t samples = 0;
+		void start(const double _hz)
+		{
+			target = pthread_mach_thread_np(pthread_self());
+			thread = std::thread([this, _hz]
+			{
+				const auto period = std::chrono::duration<double>(1.0 / _hz);
+				while(!stop.load(std::memory_order_relaxed))
+				{
+					std::this_thread::sleep_for(period);
+					if(thread_suspend(target) != KERN_SUCCESS)
+						continue;
+#if defined(__aarch64__)
+					arm_thread_state64_t st;
+					mach_msg_type_number_t n = ARM_THREAD_STATE64_COUNT;
+					if(thread_get_state(target, ARM_THREAD_STATE64, reinterpret_cast<thread_state_t>(&st), &n) == KERN_SUCCESS)
+					{
+						const uint64_t pc = arm_thread_state64_get_pc(st);
+						++hist[pc & ~0x3ull];
+						++samples;
+					}
+#endif
+					thread_resume(target);
+				}
+			});
+		}
+		void finish()
+		{
+			if(!thread.joinable())
+				return;
+			stop.store(true);
+			thread.join();
+			std::vector<std::pair<uint32_t, uint64_t>> top;
+			for(const auto& [pc, n] : hist)
+				top.emplace_back(n, pc);
+			std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+			Dl_info info{};
+			dladdr(reinterpret_cast<void*>(&serveInteractiveMarker), &info);
+			std::fprintf(stderr, "selfprof: %llu samples, image %s at %p\n", static_cast<unsigned long long>(samples), info.dli_fname ? info.dli_fname : "?", info.dli_fbase);
+			for(size_t i = 0; i < top.size() && i < 60; ++i)
+			{
+				Dl_info fi{};
+				dladdr(reinterpret_cast<void*>(top[i].second), &fi);
+				std::fprintf(stderr, "selfprof: %6u %5.1f%% 0x%llx %s+%llu\n", top[i].first, 100.0 * top[i].first / static_cast<double>(samples), static_cast<unsigned long long>(top[i].second),
+					fi.dli_sname ? fi.dli_sname : "?", fi.dli_saddr ? static_cast<unsigned long long>(top[i].second - reinterpret_cast<uint64_t>(fi.dli_saddr)) : 0ull);
+			}
+		}
+		static void serveInteractiveMarker() {}
+	};
+
 	int serveInteractive(ot::Machine& _m, ot::Rtos& _rtos, ot::DspPair* _dsp)
 	{
+		SelfProfiler prof;
+		if(const char* e = std::getenv("OT_SELFPROF"); e && std::atof(e) > 0.0)
+			prof.start(std::atof(e));
+		struct ProfEnd { SelfProfiler& p; ~ProfEnd() { p.finish(); } } profEnd{prof};
+#ifdef __APPLE__
+		// O17: the ColdFire's thread joins the DSP workers' scheduling band.
+		// The workers run at QOS_CLASS_USER_INITIATED (the vendored
+		// ThreadPriority::High -- Apple silicon's performance cores); the main
+		// thread at the default class was left to an efficiency core beside
+		// them and ran its own emulation at half speed (measured 12 Sep 2026:
+		// the same instruction count as lockstep's, twice the wall).
+		if(_dsp && _dsp->rt())
+			pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+#endif
 		// The first `tx` answers everything since the boot: the panel's
 		// whole screen and LED state is in that stream (the boot's full draw,
 		// then diffs), and a decoder fed from byte 0 has all of it.
@@ -413,6 +495,43 @@ namespace
 				paceRatio = 0.0;
 				paceStop = ot::Rtos::Stop::Time;
 				reply("ok");
+				continue;
+			}
+			if(cmd == "rtstatus")
+			{
+				// O17: the real-time mode's counters -- MIPS per core (the
+				// counter's rate; xmips = executed, without the fast-forward),
+				// worker busy fraction and CPU seconds, core 0's ESAI frames,
+				// the due count and each core's lag behind it, posts / wakes /
+				// waits, edges raised / applied / inside pulls with their
+				// lateness, skew waits, fast-forwarded instructions, read-back
+				// words not in time, dropped host words, faults, the knobs.
+				// `err rtstatus needs --dsp-rt` otherwise.
+				if(w.size() != 1)
+				{
+					reply("err usage: rtstatus");
+					continue;
+				}
+				if(!_dsp || !_dsp->rt())
+				{
+					reply("err rtstatus needs --dsp-rt");
+					continue;
+				}
+				reply(_dsp->rtStatus() + " | cfinstr=" + std::to_string(_m.instructions()) + " ms=" + std::to_string(_rtos.ms()));
+				continue;
+			}
+			if(cmd == "cfstatus")
+			{
+				// O17: the ColdFire's own instruction count and the emulated clock
+				// (a rate meter for any mode: instructions per wall second between
+				// two calls is what the ColdFire's thread itself achieves).
+				if(w.size() != 1)
+				{
+					reply("err usage: cfstatus");
+					continue;
+				}
+				std::snprintf(buf, sizeof buf, "cfstatus instructions=%llu ms=%.3f", static_cast<unsigned long long>(_m.instructions()), _rtos.ms());
+				reply(buf);
 				continue;
 			}
 			if(cmd == "pacestatus")
@@ -811,6 +930,7 @@ int main(int _argc, char** _argv)
 	bool namesEarly = false;	// write the SET/PROJECT names BEFORE the mount -- see O7b
 	std::string hostPortLog;	// every write into the DSP host-port window -> FILE (O8)
 	bool dsp = false;			// O8: put the two real DSP cores behind the host port
+	bool dspRt = false;			// O17: --dsp-rt -- the cores under the JIT on worker threads, on the lockstep schedule (dsp.cpp, THE REAL-TIME MODE); --interactive only
 	double dspRatio = ot::DspPair::g_dspIps / ot::DspPair::g_cfIps, dspIps = ot::DspPair::g_dspIps;	// their clock, in DSP instructions per ColdFire instruction / per sample (dsp.h says where 4160 comes from)
 	std::string dspLog;			// every host-side event on the DSP pair -> FILE
 	uint64_t dspTrace = 0;		// a status line per core every N DSP instructions
@@ -876,6 +996,7 @@ int main(int _argc, char** _argv)
 		else if(a == "--names-early")			namesEarly = true;
 		else if(a == "--hostport-log" && i + 1 < _argc)	hostPortLog = _argv[++i];
 		else if(a == "--dsp")					dsp = true;
+		else if(a == "--dsp-rt")				{ dsp = true; dspRt = true; }
 		else if(a == "--dsp-ratio" && i + 1 < _argc)	dspRatio = std::atof(_argv[++i]);
 		else if(a == "--dsp-ips" && i + 1 < _argc)	dspIps = std::atof(_argv[++i]);
 		else if(a == "--dsp-log" && i + 1 < _argc)	dspLog = _argv[++i];
@@ -916,6 +1037,14 @@ int main(int _argc, char** _argv)
 
 	if(sequencer)
 		mount = true;			// M6c needs the card mounted and the project loaded
+	if(dspRt && !interactive)
+	{
+		// The batch modes keep the lockstep interpreter (their reports and
+		// captures are byte-identical across builds, the oracle's contract);
+		// the rt mode's audio is functional, not byte-identical.
+		std::printf("dsp-rt     : cannot start the real-time mode: --dsp-rt needs --interactive (the batch keeps the lockstep interpreter)\n");
+		return 2;
+	}
 	if(interactive && !mainLevelGiven)
 		mainLevel = 64;			// the batch never posts it unless asked (byte-identical reports); the pipe wants audible voices
 
@@ -978,7 +1107,18 @@ int main(int _argc, char** _argv)
 	std::unique_ptr<ot::DspPair> dspPair;
 	if(dsp)
 	{
-		dspPair = std::make_unique<ot::DspPair>(dspRatio, dspIps);
+		dspPair = std::make_unique<ot::DspPair>(dspRatio, dspIps, dspRt);
+		if(dspRt && !dspPair->rtOk())
+		{
+			std::printf("dsp-rt     : cannot start the real-time mode: %s\n", dspPair->rtWhy().c_str());
+			return 2;
+		}
+		if(dspRt)
+		{
+			std::printf("dsp-rt     : each core under the JIT on its own worker thread, run to the ColdFire's booked due count and never past it (O17); the shared window aliased through the MMU (six views); rtstatus reports it\n");
+			if(dspTrace || !dspPcWatch.empty() || !dspStopwatch.empty() || !dspWatch.empty() || !dspMap.empty() || !dspWrites.empty() || dspNoIdle)
+				std::printf("dsp-rt     : note: --dsp-trace/--dsp-pcwatch/--dsp-stopwatch/--dsp-watch/--dsp-map/--dsp-writes/--dsp-no-idle are the interpreter's per-instruction instruments and do not observe the JIT workers (OT_RT_FF=0 is the rt fast-forward's switch)\n");
+		}
 		dspPair->setLog(!dspLog.empty());
 		dspPair->setTrace(dspTrace);
 		dspPair->setTraceFrom(dspTraceFrom);
