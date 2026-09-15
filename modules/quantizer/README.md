@@ -175,7 +175,24 @@ Dn,Dy`, long compares, `mulu.l Dy,Dx`).
 Image: `REMIX=quantizer make bus` → `out/mainos_bus.bin`, 1,112,560
 bytes, **1,250 bytes changed** vs `out/raw/section_3_MAIN_OS.bin`
 (`build.log`; the unit at `0x400d6b80`, the tables at `0x400d7100..`).
-Panel: `tools/panel/panel_server.py --image <remix> --project
+
+⚠️ **For a unit, build it with `make cf`, not `make bus`** (15 Sep 2026).
+`make bus` rebuilds the FX2 chooser from the remix's rows and this remix
+has none, so its image offers NONE as the only EFFECT 2 effect: the
+fourteen stock effects keep their code and dispatch (the report's `KEPT
+STOCK`; both DSP payloads are byte-identical to stock) but cannot be
+selected. Eleven of the 1,250 bytes are exactly that — the three `lea`
+sites that find the chooser list (`0x400d6090` → a one-row list at
+`0x400d6b00`), the viewport literal (7 → 1) and the row itself.
+`REMIX=quantizer make cf` → `out/mainos_cf.bin`, **1,239 bytes changed**:
+the same unit, tables, detours and poke, with the chooser, the FX2 id and
+cursor tables and both DSP payloads byte-identical to stock (the build
+compares those spans against the stock image before writing; `make
+image-cf` packs it). The `tim` image (this module + DIRECT JUMP, 1,657
+bytes) booted under the panel shows the stock chooser — NONE, FILTER, EQ,
+DJ EQ, PHASER, FLANGER, CHORUS, SPATIALIZER, COMB, COMPRESSOR, LOFI, DELAY,
+PLATE, SPRING, DARK — and the SCALE row still turns OFF → PHRYGN
+(`out/_agents/cfbuild/`). Panel: `tools/panel/panel_server.py --image <remix> --project
 out/_projects/otlive/OTLIVE/PROJECT --set OTLIVE --name PROJECT --sound
 off --card out/_agents/quantizer/card.img` on port 8596, stock on 8597,
 driven through `/key`, `/tap`, `/knob`, `/peek`, `/screen.txt`

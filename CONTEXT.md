@@ -205,9 +205,13 @@ EMAC-fixed Unicorn (`scripts/build_unicorn.sh`), `vendor/dsp56300` pinned to
   tracks 5-20. FIRMWARE MODULES (source only, never flashed):
   modules/direct-jump (CHAIN AFTER = DIRECT), modules/quantizer (SCALE
   row, #SEQUENCER_SCALE=n), remixes/tim.py = both; build with
-  `PATH=.venv/bin:$PATH REMIX=tim make bus` -> out/mainos_bus.bin (the
+  `PATH=.venv/bin:$PATH REMIX=tim make cf` -> out/mainos_cf.bin (the
   build script needs Python >= 3.12); boot it in the app with File > Open
-  Firmware Image....
+  Firmware Image.... `make cf` (15 Sep 2026) is the ColdFire-only build:
+  the modules' caves/detours/pokes on the stock OS with both DSP payloads
+  and the FX2 chooser byte-identical to stock. `REMIX=tim make bus` also
+  builds but rebuilds the chooser around a remix with no rows, so the unit
+  offers NONE as the only EFFECT 2 effect (the owner's report).
 
 ## Repo / process rules that matter
 

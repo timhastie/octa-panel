@@ -455,6 +455,23 @@ list row 0 (which our rebuilt list otherwise drops) and, on the DSP side,
 the per-payload null stub the build already points silenced donor ids at.
 It costs one chooser row — four bytes of cave — and **not one word**.
 
+⚠️ **`NONE` is a fallback, not a way to keep the stock chooser.** `make bus`
+rebuilds the FX2 list from the remix's rows whatever the fallback says, so
+a remix with no rows at all — a ColdFire-only remix such as `tim` (DIRECT
+JUMP + SCALE QUANTIZER) — ships a chooser whose only entry is NONE: the
+fourteen stock effects keep their code and their dispatch (`KEPT STOCK` in
+the report; for `tim` both payloads are byte-identical to stock) but
+nothing on the panel can select them (found 15 Sep 2026 on the unit —
+"EFFECT 2 offers only NONE"). Build such a remix with **`make cf`**
+(`CFONLY=1`) instead: it applies only the modules' caves, linked units,
+detours, tables and pokes to the stock main OS and leaves the chooser, the
+id and cursor tables and BOTH DSP payloads byte-identical to stock — the
+build compares those spans against the stock image before it writes
+`out/mainos_cf.bin`, and it refuses a remix carrying anything with a
+chooser row or DSP code (that is a bus build). `make image-cf` packs it for
+the card. `make bus` itself is unchanged: every bus remix and every gate
+builds exactly what it did (refhash 26/26).
+
 That matters more than it sounds. Every insert-only remix used to carry
 SEND purely to satisfy the rule, at 215–250 words, for a bus client nothing
 in the image reads: with no server, nothing ever consumes the accumulators
@@ -518,6 +535,15 @@ MIDI, a bug in a stock routine — rather than adding an effect. There are
 two forms. **This one, linked units in DRAM, is the default**; the older
 ROM-cave form (`CavePatch`, next section) is for the few hundred bytes
 that must be ROM-resident.
+
+**A remix of ColdFire modules alone is built with `make cf`, not `make
+bus`.** It has no chooser rows and no DSP words, and the bus build would
+still rebuild the FX2 chooser around it — with NONE as its only entry.
+`make cf` (`CFONLY=1 tools/build/build_bus.py`) runs exactly the passes
+below (caves, runtimes, linked units, table grows, detours, pokes, the
+platform loader) on the stock main OS and proves the chooser, the id
+tables and both DSP payloads untouched before writing `out/mainos_cf.bin`.
+"What an unimplemented id falls back to" has the whole story.
 
 ```python
 from remix.schema import Detour, Kind, Linked, Module, Poke

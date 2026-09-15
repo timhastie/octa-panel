@@ -49,6 +49,13 @@ MIDI. Read §1 first.
       `<NNN>` is the `BUILD` number from the Makefile — bump it every flash:
       a unit whose version string you cannot map back to a commit is a unit
       you are guessing about.
+- [ ] **A ColdFire-only remix** (DIRECT JUMP, SCALE QUANTIZER, `tim`) is
+      packed with **`make image-cf`** instead —
+      `out/OCTATRACK_OCTABAM<NNN>_cf.bin` / `..._cf.syx` from `make cf`,
+      which leaves both DSP payloads and the FX2 chooser stock so every
+      stock effect stays selectable. `make image` of the same remix ships
+      an EFFECT 2 chooser whose only entry is NONE (15 Sep 2026;
+      `docs/remixer/MODULES.md`, "What an unimplemented id falls back to").
 - [ ] **The official rescue firmware** (essential!):
       `downloads/extracted/OCTATRACK_OS1.40C.syx` — you have it after
       `make os`.

@@ -216,6 +216,48 @@ ORDER = [k for k in CARRIED if k not in HIDDEN]
 # a chooser row, restored at position 0 where a stock unit has it.
 NO_FB = REMIX.fallback == NO_FALLBACK
 
+# ---- CFONLY=1: THE COLDFIRE-ONLY BUILD (`make cf`) --------------------------
+# A remix made of ColdFire modules alone (direct-jump, quantizer: caves,
+# linked units, detours, table grows, pokes) has no bus and no effect of its
+# own -- but `make bus` still REBUILDS THE FX2 CHOOSER from the remix's rows
+# (NONE alone when it has none), aliases every unlisted module id to the
+# fallback in the ColdFire id/cursor tables AND in both payloads' dispatch,
+# and points id 0 at the null stub. On the unit that reads as "EFFECT 2
+# offers only NONE": the stock effects' code and dispatch are intact (the
+# report says KEPT STOCK) but nothing can select them (remixes/tim.py,
+# 15 Sep 2026). CFONLY=1 applies ONLY sections 1b-1e -- the modules' caves,
+# runtimes, linked units, tables, detours and pokes -- to the stock main OS
+# and leaves the chooser, the id tables and BOTH DSP payloads byte-for-byte
+# stock, which the end of the build proves against the stock image rather
+# than assumes. It writes out/mainos_cf.bin, never the bus artifact, and it
+# refuses a remix that carries anything with a chooser row or DSP code:
+# those need the bus build, because that is where their rows and words go.
+CFONLY = os.environ.get("CFONLY") == "1"
+if CFONLY:
+    _need_bus = [k for k in REMIX.modules
+                 if remix_modules()[k].menu is not None
+                 or remix_modules()[k].dsp is not None]
+    if _need_bus:
+        sys.exit(f"CFONLY=1: remix {REMIX.name!r} carries "
+                 f"{', '.join(_need_bus)}, which take a chooser row or DSP "
+                 f"code. A ColdFire-only build leaves the chooser and both "
+                 f"payloads stock, so it has nowhere to put them -- build "
+                 f"this remix with `make bus`")
+    if not NO_FB:
+        sys.exit(f"CFONLY=1: remix {REMIX.name!r} declares "
+                 f"fallback={REMIX.fallback!r}; a ColdFire-only remix has no "
+                 f"bus and no module to fall back to -- declare "
+                 f"fallback={NO_FALLBACK!r}")
+    if REMIX.fx1:
+        sys.exit(f"CFONLY=1: remix {REMIX.name!r} names FX1 rows "
+                 f"({', '.join(REMIX.fx1)}); the FX1 chooser is left stock "
+                 f"by a ColdFire-only build -- drop `fx1` or use `make bus`")
+    _clash = [v for v in ("DEV", "DELAYPROBE") if os.environ.get(v)]
+    if _clash:
+        sys.exit(f"CFONLY=1 cannot be combined with {'/'.join(_clash)} -- "
+                 f"those change the output path or the chooser, and a "
+                 f"ColdFire-only build touches neither")
+
 # BUILD TAG, stamped into the effect's displayed name. Three rounds were lost
 # to not being able to tell WHICH build was running on the unit: a symptom
 # ("knobs unchanged") is ambiguous between "the change did not work" and "the
@@ -1146,19 +1188,24 @@ def main():
         if cave_end > LONG_LIST:
             sys.exit(f"{len(CLONED_ORDER)} descriptor clones run into the "
                      f"long chooser list at 0x{LONG_LIST:08x}")
-    for i, v in enumerate(entries):
-        wr32(list_addr + i * 4, v)
-    # and size the viewport: shrink it to a short list so there are no rows
-    # left to pad, never grow it past the seven the screen has -- a longer
-    # list scrolls, as stock's fifteen-entry list does.
-    if rd32(ROWCOUNT_INSN) != 0x48780007:
-        sys.exit(f"row-count site 0x{ROWCOUNT_INSN:08x} is not `pea (0x7).w` -- refusing")
+    # CFONLY: the stock chooser stays -- its fifteen rows, its viewport and
+    # the three `lea` sites that find it. The list cave at NEW_LIST is left
+    # zero; the caves below still start past the (empty) clone window, so a
+    # module lands at the same address in both builds.
     rows = min(CHOOSER_ROWS, len(real))
-    img[ROWCOUNT_AT - BASE:ROWCOUNT_AT - BASE + 2] = rows.to_bytes(2, "big")
-    for r in LIST_REFS:
-        if rd32(r) != FX2_LIST:
-            sys.exit(f"list ref at 0x{r:08x} not stock FX2_LIST -- refusing")
-        wr32(r, list_addr)
+    if not CFONLY:
+        for i, v in enumerate(entries):
+            wr32(list_addr + i * 4, v)
+        # and size the viewport: shrink it to a short list so there are no
+        # rows left to pad, never grow it past the seven the screen has -- a
+        # longer list scrolls, as stock's fifteen-entry list does.
+        if rd32(ROWCOUNT_INSN) != 0x48780007:
+            sys.exit(f"row-count site 0x{ROWCOUNT_INSN:08x} is not `pea (0x7).w` -- refusing")
+        img[ROWCOUNT_AT - BASE:ROWCOUNT_AT - BASE + 2] = rows.to_bytes(2, "big")
+        for r in LIST_REFS:
+            if rd32(r) != FX2_LIST:
+                sys.exit(f"list ref at 0x{r:08x} not stock FX2_LIST -- refusing")
+            wr32(r, list_addr)
     # The fallback's cursor position. A HIDDEN fallback has no row of its
     # own, so there is no position to point at: park the cursor at 0. A
     # fresh track then dispatches to the fallback's code and its chooser
@@ -1864,79 +1911,100 @@ def main():
     print(f"  cave: 0x{_lbl_top:08x}..0x{cave_limit:08x}, "
           f"{cave_limit - _lbl_top} B of cave left")
 
-    # A fresh part's FX2 id is 0. Rather than hunt down the part-init template,
-    # alias id 0 to SEND: its descriptor, its cursor position, and (below) its
-    # DSP dispatch. Every unassigned track is then a SEND automatically.
-    fb_desc = FX1_NONE if NO_FB else clone_addr[REMIX.fallback]
-    wr32(FX2_IDS + NONE_ID * 4, fb_desc)
-    wr32(ID2POS + NONE_ID * 4, fb_pos)
-    # A module this remix leaves out still owns an id, and a saved project can
-    # carry it. Alias it to the fallback for exactly the reason id 0 is
-    # aliased: the alternative is a chooser entry dispatching into whatever
-    # code now occupies that address. Empty whenever the remix carries every
-    # module the registry knows.
-    # A STOCK effect the remix leaves out is NOT aliased: its descriptor,
-    # id entry and dispatch stay stock, so an old project that selects it
-    # still runs it -- it simply has no chooser row. That is what every
-    # remix did to all fourteen before 2 Sep 2026, and it is what keeps
-    # FX1 (which shares the dispatch tables) whole.
-    _omitted = [m for m in remix_modules().values()
-                if m.menu is not None and m.key not in REMIX.modules
-                and not m.is_stock]
-    # ⚠️ A REPLACEMENT THAT IS NOT IN THIS REMIX LEAVES STOCK ALONE. Aliasing
-    # its id to the fallback would take the stock effect away from BOTH menus
-    # -- which is exactly what happened for four days when Rungs sat on
-    # EQUALIZER's 0x0c: the remixes without Rungs aliased 0x0c to SEND, so
-    # the shipping image had no EQUALIZER on FX1 either. The id belongs to a
-    # stock effect; absent our replacement, it goes back to being one.
-    _restored = [m for m in _omitted if m.menu.replaces]
-    _omitted = [m for m in _omitted if not m.menu.replaces]
-    for _m in _omitted:
-        wr32(FX2_IDS + _m.menu.fx2_id * 4, fb_desc)
-        wr32(ID2POS + _m.menu.fx2_id * 4, fb_pos)
-    if _restored:
-        print(f"  not in this remix, LEFT STOCK: "
-              f"{', '.join(sorted(m.key for m in _restored))} -- each replaces "
-              f"a stock effect, so its id keeps that effect's descriptor and "
-              f"dispatch on both menus")
-    if _omitted:
-        print(f"  not in this remix: "
-              f"{', '.join(sorted(m.key for m in _omitted))} -- their ids "
-              f"alias to {REMIX.fallback}")
-    if delayprobe:
-        wr32(ID2POS + STOCK_DELAY_ID * 4, len(real) - 1)
-        if rd32(FX2_IDS + STOCK_DELAY_ID * 4) != STOCK_DELAY_P:
-            sys.exit("DELAY's FX2_IDS entry is not stock -- refusing to probe")
-        print(f"  *** DELAY PROBE: stock DELAY restored to the menu at "
-              f"position {len(real) - 1} ***")
-    _none = "with NONE at row 0" if NO_FB else "no NONE"
-    print(f"  chooser list = {len(real)} entries, {_none}, viewport shrunk to "
-          f"{len(real)} rows (no padding)" if len(real) <= CHOOSER_ROWS else
-          f"  chooser list = {len(real)} entries at 0x{list_addr:08x} (the "
-          f"long list cave), {_none}, viewport {rows} rows -- it scrolls")
-    if HIDDEN:
-        _b = [k for k in HIDDEN if k in BLANKED]
-        _f = [k for k in HIDDEN if k not in BLANKED and k in REMIX.fx1]
-        _n = [k for k in HIDDEN if k not in BLANKED and k not in REMIX.fx1]
-        print(f"  placed but NOT LISTED on FX2: {', '.join(HIDDEN)} -- code, "
-              f"id and clone present, no chooser row"
-              + (f"; names blanked (page draws nothing): {', '.join(_b)}" if _b
-                 else "")
-              + (f"; names KEPT (on the FX1 chooser): {', '.join(_f)}" if _f
-                 else "")
-              + (f"; names KEPT (NAMED: the host page draws all twelve): "
-                 f"{', '.join(_n)}" if _n else ""))
-    if STOCK_ROWS:
-        print(f"  stock rows kept: {', '.join(STOCK_ROWS)} -- descriptors, "
-              f"code and dispatch untouched on both cores")
-    # ⚠️ WORDING FROZEN for the SEND arm: the build report is API (refhash
-    # hashes it verbatim). Only the NONE arm is new.
-    print(f"  id 0x00 aliased to NONE: a fresh/unassigned track is off, as "
-          f"on a stock unit\n" if NO_FB else
-          f"  id 0x00 aliased to SEND: a fresh/unassigned track is a send\n")
+    if CFONLY:
+        # Nothing is aliased and nothing is listed: the fifteen stock rows,
+        # the id table and the cursor table are the firmware's own, so a
+        # project that names any stock effect -- or any of our ids -- gets
+        # exactly what a stock unit gives it.
+        _omitted = []
+        print("  CFONLY=1: FX2 chooser (NONE + the fourteen stock effects), "
+              "id table and cursor table left STOCK -- nothing cloned, no id "
+              "aliased\n")
+    else:
+        # A fresh part's FX2 id is 0. Rather than hunt down the part-init
+        # template, alias id 0 to SEND: its descriptor, its cursor position,
+        # and (below) its DSP dispatch. Every unassigned track is then a
+        # SEND automatically.
+        fb_desc = FX1_NONE if NO_FB else clone_addr[REMIX.fallback]
+        wr32(FX2_IDS + NONE_ID * 4, fb_desc)
+        wr32(ID2POS + NONE_ID * 4, fb_pos)
+        # A module this remix leaves out still owns an id, and a saved
+        # project can carry it. Alias it to the fallback for exactly the
+        # reason id 0 is aliased: the alternative is a chooser entry
+        # dispatching into whatever code now occupies that address. Empty
+        # whenever the remix carries every module the registry knows.
+        # A STOCK effect the remix leaves out is NOT aliased: its descriptor,
+        # id entry and dispatch stay stock, so an old project that selects it
+        # still runs it -- it simply has no chooser row. That is what every
+        # remix did to all fourteen before 2 Sep 2026, and it is what keeps
+        # FX1 (which shares the dispatch tables) whole.
+        _omitted = [m for m in remix_modules().values()
+                    if m.menu is not None and m.key not in REMIX.modules
+                    and not m.is_stock]
+        # ⚠️ A REPLACEMENT THAT IS NOT IN THIS REMIX LEAVES STOCK ALONE.
+        # Aliasing its id to the fallback would take the stock effect away
+        # from BOTH menus -- which is exactly what happened for four days
+        # when Rungs sat on EQUALIZER's 0x0c: the remixes without Rungs
+        # aliased 0x0c to SEND, so the shipping image had no EQUALIZER on
+        # FX1 either. The id belongs to a stock effect; absent our
+        # replacement, it goes back to being one.
+        _restored = [m for m in _omitted if m.menu.replaces]
+        _omitted = [m for m in _omitted if not m.menu.replaces]
+        for _m in _omitted:
+            wr32(FX2_IDS + _m.menu.fx2_id * 4, fb_desc)
+            wr32(ID2POS + _m.menu.fx2_id * 4, fb_pos)
+        if _restored:
+            print(f"  not in this remix, LEFT STOCK: "
+                  f"{', '.join(sorted(m.key for m in _restored))} -- each replaces "
+                  f"a stock effect, so its id keeps that effect's descriptor and "
+                  f"dispatch on both menus")
+        if _omitted:
+            print(f"  not in this remix: "
+                  f"{', '.join(sorted(m.key for m in _omitted))} -- their ids "
+                  f"alias to {REMIX.fallback}")
+        if delayprobe:
+            wr32(ID2POS + STOCK_DELAY_ID * 4, len(real) - 1)
+            if rd32(FX2_IDS + STOCK_DELAY_ID * 4) != STOCK_DELAY_P:
+                sys.exit("DELAY's FX2_IDS entry is not stock -- refusing to probe")
+            print(f"  *** DELAY PROBE: stock DELAY restored to the menu at "
+                  f"position {len(real) - 1} ***")
+        _none = "with NONE at row 0" if NO_FB else "no NONE"
+        print(f"  chooser list = {len(real)} entries, {_none}, viewport shrunk to "
+              f"{len(real)} rows (no padding)" if len(real) <= CHOOSER_ROWS else
+              f"  chooser list = {len(real)} entries at 0x{list_addr:08x} (the "
+              f"long list cave), {_none}, viewport {rows} rows -- it scrolls")
+        if HIDDEN:
+            _b = [k for k in HIDDEN if k in BLANKED]
+            _f = [k for k in HIDDEN if k not in BLANKED and k in REMIX.fx1]
+            _n = [k for k in HIDDEN if k not in BLANKED and k not in REMIX.fx1]
+            print(f"  placed but NOT LISTED on FX2: {', '.join(HIDDEN)} -- code, "
+                  f"id and clone present, no chooser row"
+                  + (f"; names blanked (page draws nothing): {', '.join(_b)}" if _b
+                     else "")
+                  + (f"; names KEPT (on the FX1 chooser): {', '.join(_f)}" if _f
+                     else "")
+                  + (f"; names KEPT (NAMED: the host page draws all twelve): "
+                     f"{', '.join(_n)}" if _n else ""))
+        if STOCK_ROWS:
+            print(f"  stock rows kept: {', '.join(STOCK_ROWS)} -- descriptors, "
+                  f"code and dispatch untouched on both cores")
+        # ⚠️ WORDING FROZEN for the SEND arm: the build report is API (refhash
+        # hashes it verbatim). Only the NONE arm is new.
+        print(f"  id 0x00 aliased to NONE: a fresh/unassigned track is off, as "
+              f"on a stock unit\n" if NO_FB else
+              f"  id 0x00 aliased to SEND: a fresh/unassigned track is a send\n")
 
     # ==== 2. DSP code placement + dispatch (task 13) ========================
-    print("=== DSP: code placed, dispatch wired, both payloads ===")
+    # CFONLY skips the whole pass: the payload loop below runs over nothing,
+    # so no word is placed, no dispatch entry written, no donor id nulled.
+    # (The source-reading preamble between here and the loop is inert for a
+    # remix without DSP modules -- every source is None -- and stays in place
+    # so the default build's report is byte-identical: refhash.)
+    if CFONLY:
+        print("=== DSP: NOT TOUCHED (CFONLY=1) -- both payloads and their "
+              "dispatch stay stock ===")
+    else:
+        print("=== DSP: code placed, dispatch wired, both payloads ===")
     delay_src = (pathlib.Path(ASM_SRC["DELAY SERVER"]).read_text()
                  if "DELAY SERVER" in ASM_SRC else None)
     if delay_src is None:
@@ -2410,7 +2478,7 @@ mkgo:""",
         sys.exit(f"expected exactly {_want} $30000 literal(s) in the DELAY source")
 
     dev_delay = None            # (words) for the .mem dump append, DEV only
-    for tag, va, ln in PAYLOADS:
+    for tag, va, ln in ([] if CFONLY else PAYLOADS):
         pp = PP[tag]
         mods, _ = modules(bytes(img), va, ln)
 
@@ -3222,6 +3290,31 @@ hostquit:
         # only; letting it land on the flashable path is the one way this
         # hatch could do harm.
         out = pathlib.Path("out/mainos_bus_dev.bin")
+    if CFONLY:
+        # Its own path: the bus artifact is what every verify_* gate and
+        # refhash read, and this image is not a bus build. PROVE the promise
+        # before writing: both DSP payloads (one contiguous span, bootstraps
+        # excluded because nothing ever writes them) and the FX2 chooser's
+        # list, viewport, `lea` sites, id table and cursor table are the
+        # stock image's bytes. A module whose pokes reached into any of them
+        # would be a module this mode cannot carry, and it must fail here
+        # rather than ship "stock" payloads that are not.
+        out = pathlib.Path("out/mainos_cf.bin")
+        _stock = IMG.read_bytes()
+        _spans = [(f"payload {t}", va, ln) for t, va, ln in PAYLOADS] + [
+            ("FX2 chooser list", FX2_LIST, 16 * 4),
+            ("FX2 viewport", ROWCOUNT_INSN, 4),
+            ("FX2 id table", FX2_IDS, 32 * 4),
+            ("FX2 cursor table", ID2POS, 32 * 4),
+        ] + [(f"FX2 list ref 0x{r:08x}", r, 4) for r in LIST_REFS]
+        for _what, _a, _n in _spans:
+            if bytes(img[_a - BASE:_a - BASE + _n]) != _stock[_a - BASE:_a - BASE + _n]:
+                sys.exit(f"CFONLY: {_what} (0x{_a:08x}, {_n} B) is not stock -- "
+                         f"a module wrote into it; this remix is not ColdFire-only")
+        print("  CFONLY: byte-identical to stock: "
+              + ", ".join(f"{w} 0x{a:08x}..0x{a + n:08x}" for w, a, n in _spans[:2])
+              + " (the DSP code and dispatch), FX2 chooser list, viewport, "
+              "3 list refs, id table, cursor table")
     # A loader-appended runtime grows the image here, last of all: every
     # pass above worked on the stock-length image. The combined OS must
     # match the identity the recipe pins for exactly this (single-runtime)
@@ -3248,6 +3341,9 @@ hostquit:
     elif DEV:
         note = ("   *** DEV BUILD -- local render only, DO NOT FLASH "
                 "(CHORUS is overwritten). ***")
+    elif CFONLY:
+        note = ("   COLDFIRE-ONLY BUILD (make cf): DSP payloads, dispatch and "
+                "FX2 chooser are stock; every stock effect stays selectable")
     print(f"\n{out}: {len(img):,} bytes, {d} changed" + note)
 
     if DEV:

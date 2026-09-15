@@ -57,6 +57,18 @@ bus: ## THE build: one server per core, cross-core bus -> out/mainos_bus.bin
 bus-plain: ## Build without specialization (both servers on both cores)
 	REMIX=$(REMIX) python3 tools/build/build_bus.py
 
+# A remix of ColdFire modules alone (direct-jump, quantizer, tim) has no
+# rows and no words, and `make bus` then ships an FX2 chooser with NONE as
+# its only entry: the stock effects' code stays in the payloads but nothing
+# can select them (15 Sep 2026). `cf` applies only the modules' caves,
+# linked units, detours, tables and pokes to the stock main OS and leaves
+# both DSP payloads, their dispatch and the chooser byte-identical to stock
+# -- the build proves that before it writes. It refuses a remix with any
+# chooser row or DSP code: that is a bus build.
+.PHONY: cf
+cf: ## ColdFire-only build: the remix's caves/detours/pokes on the stock OS; DSP payloads + FX2 chooser stay stock -> out/mainos_cf.bin
+	REMIX=$(REMIX) BUILD=$(BUILD) CFONLY=1 python3 tools/build/build_bus.py
+
 .PHONY: image
 image: bus ## Repack the build into a card-flashable .bin (see docs/remixer/FLASHING.md)
 	@test -f $(SYX) || { echo "missing $(SYX) — run 'make os'"; exit 1; }
@@ -69,6 +81,24 @@ image: bus ## Repack the build into a card-flashable .bin (see docs/remixer/FLAS
 	@echo
 	@echo "  card image: out/OCTATRACK_$(VERSION).bin"
 	@echo "  MIDI image: out/OCTATRACK_OS1.40C_$(VERSION).syx"
+	@echo "  -> docs/remixer/FLASHING.md before you write either to hardware."
+
+.PHONY: image-cf
+image-cf: cf ## Repack the ColdFire-only build (make cf) into a card-flashable .bin
+	@test -f $(SYX) || { echo "missing $(SYX) — run 'make os'"; exit 1; }
+	@test -x $(EFT) || { echo "missing $(EFT) — run 'make setup'"; exit 1; }
+	@# --emit-container, not EFT_EMIT_CONTAINER=: the vendored tool is at
+	@# upstream HEAD (7928b73 "main: add --emit-container"), where the env var
+	@# of tools/patches/elektron-firmware-tool.patch no longer exists -- set,
+	@# it is ignored and the container is never written (15 Sep 2026).
+	$(EFT) --emit-container out/elek_cf_$(BUILD).bin \
+	  -i $(SYX) -c 3 out/mainos_cf.bin \
+	  -V $(VERSION) -o out/OCTATRACK_OS1.40C_$(VERSION)_cf.syx
+	python3 tools/build/make_bin.py out/elek_cf_$(BUILD).bin \
+	  -o out/OCTATRACK_$(VERSION)_cf.bin
+	@echo
+	@echo "  card image: out/OCTATRACK_$(VERSION)_cf.bin   (ColdFire-only: stock DSP, stock chooser)"
+	@echo "  MIDI image: out/OCTATRACK_OS1.40C_$(VERSION)_cf.syx"
 	@echo "  -> docs/remixer/FLASHING.md before you write either to hardware."
 
 # ------------------------------------------------- audition without flashing --
@@ -265,7 +295,7 @@ disasm: ## Open radare2 on the decompressed ColdFire MAIN OS
 
 .PHONY: clean
 clean: ## Remove build products (keeps downloads/ and vendor/)
-	rm -rf out/dsp out/mainos_bus*.bin out/elek_*.bin out/OCTATRACK_*
+	rm -rf out/dsp out/mainos_bus*.bin out/mainos_cf.bin out/elek_*.bin out/OCTATRACK_*
 
 .PHONY: help
 help: ## Show this help
