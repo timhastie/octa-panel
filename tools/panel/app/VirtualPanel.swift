@@ -538,26 +538,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     /// runs -- as in every Cocoa app; the app's own routes end the sheet
     /// first, see quit()).
     /// "Are you sure you want to quit?" (15 Sep 2026, the owner's ask): every
-    /// user-driven quit (cmd-Q, the Dock, the window's close box, the Quit
-    /// menu item) asks first; a quit driven by a signal (a script's SIGTERM,
-    /// ctrl-C in the launching shell) does not, so scripts keep working.
+    /// user-driven quit asks first -- the window's close box BEFORE the window
+    /// closes (windowShouldClose: closing it first and then declining left the
+    /// app alive without a window, and it crashed on the next update), and
+    /// cmd-Q / the Dock / the Quit item in applicationShouldTerminate. A quit
+    /// driven by a signal (a script's SIGTERM, ctrl-C) never asks.
     var quitFromSignal = false
+    var quitConfirmed = false
     var quitDeclined = false
+    func askQuit() -> Bool {
+        let a = NSAlert()
+        a.messageText = "Are you sure you want to quit?"
+        a.informativeText = "The unit stops; the card and its project stay as they are."
+        a.alertStyle = .warning
+        a.addButton(withTitle: "Yes")
+        a.addButton(withTitle: "No")
+        if let sheet = window?.attachedSheet { window.endSheet(sheet, returnCode: .cancel) }
+        return a.runModal() == .alertFirstButtonReturn
+    }
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if quitFromSignal || quitConfirmed { return true }
+        if askQuit() { quitConfirmed = true; return true }
+        Log.write("quit (close box): declined")
+        return false
+    }
     func applicationShouldTerminate(_ s: NSApplication) -> NSApplication.TerminateReply {
-        if !quitFromSignal {
-            let a = NSAlert()
-            a.messageText = "Are you sure you want to quit?"
-            a.informativeText = "The unit stops; the card and its project stay as they are."
-            a.alertStyle = .warning
-            a.addButton(withTitle: "Yes")
-            a.addButton(withTitle: "No")
-            if let sheet = window?.attachedSheet { window.endSheet(sheet, returnCode: .cancel) }
-            if a.runModal() != .alertFirstButtonReturn {
+        if !quitFromSignal && !quitConfirmed {
+            if !askQuit() {
                 quitDeclined = true
                 quitting = false
                 Log.write("quit: declined")
                 return .terminateCancel
             }
+            quitConfirmed = true
         }
         quitting = true
         return .terminateNow
