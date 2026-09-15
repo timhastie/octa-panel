@@ -537,7 +537,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     /// terminate: directly (with a sheet up those are refused before this
     /// runs -- as in every Cocoa app; the app's own routes end the sheet
     /// first, see quit()).
+    /// "Are you sure you want to quit?" (15 Sep 2026, the owner's ask): every
+    /// user-driven quit (cmd-Q, the Dock, the window's close box, the Quit
+    /// menu item) asks first; a quit driven by a signal (a script's SIGTERM,
+    /// ctrl-C in the launching shell) does not, so scripts keep working.
+    var quitFromSignal = false
+    var quitDeclined = false
     func applicationShouldTerminate(_ s: NSApplication) -> NSApplication.TerminateReply {
+        if !quitFromSignal {
+            let a = NSAlert()
+            a.messageText = "Are you sure you want to quit?"
+            a.informativeText = "The unit stops; the card and its project stay as they are."
+            a.alertStyle = .warning
+            a.addButton(withTitle: "Yes")
+            a.addButton(withTitle: "No")
+            if let sheet = window?.attachedSheet { window.endSheet(sheet, returnCode: .cancel) }
+            if a.runModal() != .alertFirstButtonReturn {
+                quitDeclined = true
+                quitting = false
+                Log.write("quit: declined")
+                return .terminateCancel
+            }
+        }
         quitting = true
         return .terminateNow
     }
@@ -564,11 +585,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     /// process exits directly, so a kill never has to be repeated.
     @objc func quit(_ sender: Any?) {
         quitting = true
+        quitDeclined = false
         if let s = window?.attachedSheet {
             Log.write("quit: ending the open sheet")
             window.endSheet(s, returnCode: .cancel)
         }
         NSApp.terminate(nil)
+        if quitDeclined { quitDeclined = false; return }   // the user said No
         Log.write("quit: terminate: returned (refused); stopping the server and exiting directly")
         shutdown()
         exit(0)
@@ -581,7 +604,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     /// Card Audio Folder, for scripts (menus cannot be driven without the
     /// Accessibility grant).
     func installSignalHandlers() {
-        let quit: () -> Void = { [weak self] in self?.quit(nil) }
+        let quit: () -> Void = { [weak self] in self?.quitFromSignal = true; self?.quit(nil) }
         let reload: () -> Void = { [weak self] in self?.reload(nil) }
         let showPool: () -> Void = { [weak self] in self?.showCardAudioFolder(nil) }
         for (sig, act) in [(SIGTERM, quit), (SIGINT, quit), (SIGHUP, quit), (SIGUSR1, reload), (SIGUSR2, showPool)] {
