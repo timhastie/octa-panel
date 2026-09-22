@@ -6719,3 +6719,177 @@ has a core for the child.
   layout beyond channel 2 is exercised by the width check, not by a
   device), the panel page's monitor with stems (it keeps the main pair
   by design), the batch `--audio-out` (the stems are the pipe's only).
+
+## Milestone O24 — the "voice-start burst" is the card's own trim data: the fixture trims slots 1/2 to 64 frames, the firmware plays the 64-frame stub it is asked for, and the silent sample renders silence in both modes ✅ diagnosed, ❌ not an emulator defect (22 Sep 2026, branch `panel-ui`)
+
+The brief: with a silent `SYNTH.wav` in a FLEX slot, the stock image "produces
+a ~30 ms burst up to full scale at every voice start, passing the track's
+mute" (modules/synth README, phase 2), the same thing as O23's "~96-sample
+onset transient carried identically by all eight forwarded slots"; a silent
+sample cannot burst on hardware, so find the emulation defect on the
+voice-start path (four hypotheses on the DSP / host-port side). **None of
+the four survives the first instrument.** Everything under
+`out/_agents/burst/` (`drive.py`, `probe.py`, `blocks.py`, `stems.py`,
+`repair_card.py`, the runs `ls1`/`ls2`/`ls3`/`rt1`/`p1..p6`/`w1`/`w2`, the
+gates' outputs). The emulator is untouched.
+
+### What the block dump says, before any DSP hypothesis (`--block-dump`, lockstep `--dsp`, the synth rig's card `out/_agents/synth/cards/synth8q.img`, stock image)
+
+`audio start tracks` at the first trig (capture sample 81):
+
+| stem | first non-zero | what |
+|---|---|---|
+| T8 (the SYNTH track, the silent file) | **never** — 0 non-zero words over the whole 1.6 s stream, lockstep and `--dsp-rt` alike | the silent sample plays digital silence from its first sample |
+| T1, T2, T5, T6 | 81 | one identical 64-sample waveform (`25 −78 −229 −147 239 509 …`, ~7 kHz, growing to 4,820), then the FX1 filter's ring-down |
+| T3, T4, T7 | 44,180 (the second trig) | the same 64-sample waveform |
+
+The burst is **not on the trigged track**, and it enters **before the DSP
+sees anything**: the 672-word push of frame 2 (the ColdFire's four 336-byte
+track records per core, `0x80001c90 + ping·0xa80 + 336·track`) already
+carries it — record T1/T2/T5/T6: header `(0, 0, 1.0, 0)` then
+`(0x1010, phase, 1.0, tag)` + 16 pairs `10350000 104a0000 08ec0000 …` =
+4149, 4170, 2284 … in 16-bit units, for frames 2–5 (64 samples), then the
+same header with zero pairs from frame 6 on. The read-backs (frame 4:
+positions 0/1 of BOTH cores, peak 1921) and the 512-word forward (slots
+0/1/4/5) follow one and two frames later with exactly that content, so H1
+(a stale ring half), H2 (a push off-by-one), H3 (uninitialised DSP memory)
+and H4 (a declick coefficient) are all refuted at once: the DSP renders
+what it is fed. The second trig's records carry the same longs again
+(`158b0000 158c0000 …`, `fa650000 fa570000 …`, `bdd80000 bdcd0000 …`),
+re-aligned to that trig's sub-frame position 4 — a fixed 64-sample block,
+not the previous note.
+
+### Where the 64 samples come from (PC watches on the ColdFire's renderer)
+
+- The words are written by the format-3 (16-bit stereo) copy loop at
+  `0x40008768..6e` (`movew (a0)+,(a3)+; clrw (a3)+` ×2), whose source `a0 =
+  d3` and count `d2` come from a fetch through the voice struct's function
+  pointer at `0x400086b6..c2` (`fetch(voice, position) → d0 = data pointer,
+  d1 = frames available`; 0 → the silence path `0x40008722`).
+- `watch 0x400086c0,0x400086c2` at the trig: T1/T2 (STATIC, `0x400932e8`)
+  fetch `0x46aaa980`/`0x46aad980` (the STATIC head cache, `0x46aaa980 +
+  0x3000·slot`) and T5/T6/T8 (FLEX, `0x40095bdc`) fetch `0x40ab1de0`/
+  `0x40ab4de0`/`0x40accde0` (the FLEX arena at `0x40a955e0`, 6144-byte
+  chunks via the tables at `0x80006914/18`), **every one with count 64 at
+  position 0, then 48, 32, 16** — a 64-frame window — and T8 (LOOP on)
+  starts over at 0 after it. A peek of those buffers: T1's and T5's hold
+  `4149 4170 2284 2261 −3450 −3423 …` = **the first frames of
+  `first-0.wav`**; T8's holds zeros (the silent file).
+- The voice struct `0x800049d8 + 0xa8·track`, region at +40: `start 0, end
+  0x40` on every one of these tracks (T8 included). Written at the voice
+  start by `0x4000f790/f794` from `0x4000f6e2..f78a`: the region is the
+  slot's **trim entry in its settings record** (`a4 + 300 + 20·(slice+1)`:
+  start, end), and **a trim shorter than 64 frames is padded to 64**
+  (`0x4000f758..f76c`). Poking the track's LEN to 127 changes nothing
+  (`p5`) — the 64 is not the PLAYBACK page.
+- The settings records (`0x100b14f0 + 0x448·slot` FLEX, `0x100d5b30 + …`
+  STATIC) after the load: **slot 1 `first-0.wav` trim `0..0x40`, slot 2
+  `second-0.wav` `0..0x40`, slot 5 `SYNTH.wav` `0..0x40`; slot 3
+  `third-0.wav` `0..0x254f` = its 9,551 frames** (`p6`). The slot STATE
+  records (`0x46c922c4 + 44·slot`) hold the right lengths for all of them
+  (0xa77, 0xa77, 0x254f, 0x254f, 0x2b110) — the length is known; the trim
+  is what the voice plays.
+- `--watch-mem` on the trim end from the boot (`w1` slot 5, `w2` slot 3):
+  written by the project load's **markers parser** at `0x40086396` (0 for
+  SYNTH, 0x254f for third-0), then by the sanitiser at `0x400994b4`: `end
+  = min(length, max(trim_end, start + 64))` (`0x40099448..94b8`) — 0 → 64.
+  The parser (`0x40086xxx`) reads `PROJECT/markers.work` field by field
+  through the card: a 22-byte `FORM … DPS1SAMP` header, 264 records of 784
+  bytes (FLEX slots 1..136 — 129..136 the recorder buffers — then STATIC
+  1..128: trim start, trim end, loop point, 64 slices × 3, a count), and a
+  trailing u16 = the byte sum of the sub-header and every record
+  (`0x460fab5c`; −54 on a mismatch). The layout is in
+  `tools/hw/ot_project.py` (`MARKERS_*`).
+
+### ✅ The finding: it is the card
+
+`markers.work` of the OTLIVE fixture (`out/_projects/otlive/OTLIVE/PROJECT`,
+and every card built from it: `out/_agents/port/otlive.img`,
+`out/_agents/audio/otlive2.img`, the synth rig's `synth8q.img`) says, in
+both halves: **slots 1 and 2 trim `0..64`, slots 3 and 4 `0..9551`**; the
+synth rig's slot 5 has an all-zero record (its `mktree.py` wrote the
+`[SAMPLE]` entry and no markers record). The firmware — the same code on
+the unit — plays `[trim start, trim end]`, pads anything under 64 frames
+to 64, and so plays a 64-frame stub of the file at every trig of T1/T2/T5/
+T6 (slots 1/2). T3/T4/T7 of the synth rig were "moved to empty slots"
+(static/flex slot 100, no `[SAMPLE]`, a zero record): they play a 64-frame
+stub of arena page 0 = `first-0.wav`'s head at their step-9 trigs. And
+**every WAV of the fixture starts with the same 2,048 frames**
+(`first-0`, `second-0`, `third-0`, `fourth-0`, `extra-N`: one generator,
+different lengths), which is the whole of O23's "identical transient on all
+eight forwarded slots": eight tracks starting the same waveform, four of
+them cut at their 64-frame trim (`ls3`, the clean fixture: T1/T2/T5/T6 ==
+T3 for the first 64 samples, 63/64, then 0/136 — T3/T4/T7/T8 go on).
+
+The "burst passes the mute" of the synth README: the mute was T8's and the
+burst was T1/T2/T5/T6's. "At 12 ms the T8 record already holds the cave's
+sine": T8 was right all along.
+
+### ✅ Proven by repair, with the emulator unchanged (`repair_card.py`, `ls2`)
+
+A copy of `synth8q.img` with the markers' slots 1/2 set to `0..2679` (the
+files' frame counts) and slot 5 to `0..176400`, both copies (`markers.work`
++ `markers.strd`), both halves, checksum recomputed (`0x02d4 → 0x055e`;
+the firmware accepted it):
+
+| | card as built (trim 64) | trims repaired |
+|---|---|---|
+| T1/T2/T5/T6, first note | 64 frames, then the filter's ring-down to sample 6,362 | **2,629 frames of the 2,679-frame file, last non-zero at 81 + 2,676**, the first 64 samples byte-identical to the "burst" (63/64: it was the sample's own onset) |
+| the T1 record, frames 6–9 | zero pairs | file data (max 16,648 / 12,289 / 23,713 / 29,601) |
+| T8 (the silent file) | 0 non-zero words | 0 non-zero words |
+| main out | the 64-frame stubs × 4 tracks, clipped | the four tracks' full notes |
+
+`tools/hw/ot_project.py trim` (below) on a copy of the tree writes
+`markers.work` **byte-identical** to that image patch (`tree_trim`).
+
+### The fix, and where it is not
+
+- **`tools/hw/ot_project.py`: `trims PROJECT_DIR` and `trim PROJECT_DIR
+  SLOT full|END [START] [--flex|--static]`** — the markers layout, checksum
+  and both copies (`.work` + `.strd`, as `_bank_write` treats banks). A
+  tool that assigns a slot (`track-slot`, the synth rig's `mktree.py`) must
+  write the record the unit's own browser load writes (`0x40095dd4`: end =
+  the file's length, read from the code, 🟡 not driven through the
+  browser): `trim PROJ 5 full`. Without it the slot plays 64-frame stubs.
+- **Nothing in `tools/emu/ot_emu` or the vendored DSP** — the strict oracle
+  on this tree's binary is 28/28 because nothing changed; "a real fix will
+  change the reference render's onsets" was the premise, and the premise is
+  wrong: the reference render's onsets ARE the fixture's trims.
+- **The fixtures are the orchestrator's decision, not this milestone's.**
+  Repairing OTLIVE's slots 1/2 (`trim PROJECT 1 full; trim PROJECT 2 full`
+  on `out/_projects/otlive/OTLIVE/PROJECT`, then rebuilding
+  `out/_agents/port/otlive.img` / `out/_agents/audio/otlive2.img`) makes
+  T1/T2/T5/T6 play the whole of `first-0`/`second-0` at GAIN 75/72 — which
+  changes every audio check of the oracle and, on the CLEAN fixture, the
+  −33.0 dB fit itself: that fit is against `third-0.wav` alone and is clean
+  precisely because the slot-1/2 tracks are 64-frame stubs. The synth rig's
+  card wants `trim PROJ 5 full` (T8 then loops its 4 s of silence instead of
+  64 frames of it — inaudible either way — and T1/T2/T5/T6 keep the
+  fixture's stubs unless repaired too).
+
+### The gates (this tree's `out/_agents/burst/build/ot_emu`, LTO, built from HEAD; the owner's app child `out/emu/ot_emu --dsp-rt` at 235 % of a core throughout, load average 4.8)
+
+| gate | result |
+|---|---|
+| strict oracle vs `out/emu/ot_emu.ref-73c2815` | **28 PASS, 0 FAIL** (`out/_oracle/reports/20260922-133630.txt`) |
+| ctest | 7/7 |
+| `rtdrive.py --rt` on the clean fixture `otlive2.img` + `fit.py` (`rtfit2`; the script's default card is `otlive.img`, on which the fit reads −0.2 dB — the slot-1/2 loops at GAIN 75/72 are in the mix) | **onset 82, gain 0.7032, residual −33.0 dB** |
+| the silent card under `--dsp-rt` vs lockstep (`rt1` vs `ls1`) | main and every stem **bit-identical over 44,000 frames**; T8 0 non-zero words in both; 1,111 emulated ms per wall s while capturing 24 words a frame |
+| `bench.py --dsp --dsp-rt`, flat out, two runs | 974 and 945 emulated ms per wall s — under the owner's live child (2.35 cores) and the load above; O23's band for this binary class under load was 954–1,016, an earlier agent's idle-ish run 1,046 (`out/_agents/speed/verify_fix.log`). Not a code change: the binary is HEAD's |
+
+### What it does not do
+
+- Not driven through the unit's browser: that a browser load writes the
+  full-length trim is read from `0x40095d90..5dd8` (`end = min(len,
+  max(start + 64, a4))` with the slot state's length written from the same
+  `a4`), not measured on a panel session. The synth README's panel load of
+  `SYNTH.wav` was on a card whose slot-5 record the tool had already zeroed.
+- Whether a real unit plays a 64-frame stub for a trim of 64 or 0 is the
+  firmware's own arithmetic (`0x40099484`, `0x4000f758`: compares and adds,
+  no EMAC), executed here instruction for instruction; 🟡 no unit to hand.
+- The main pair's R lags L by one sample in the `main` capture on this card
+  (R[i] == L[i−1] over the burst, `stock_silent`) while the stems' L and R
+  agree — the ESAI sink's pair placement or the firmware's; noticed, not
+  this milestone's.
+- The fixture's own quirks stay as they are: OTLIVE's slots 1/2 at trim 64,
+  the synth rig's T3/T4/T7 on empty slot 100 playing arena page 0.

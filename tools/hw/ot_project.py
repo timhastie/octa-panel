@@ -30,6 +30,12 @@ image R58; anchors verified against values we wrote over MIDI and Sam's own
     python3 tools/hw/ot_project.py stamp-defaults PROJECT_DIR REMIX  # station ids only
     python3 tools/hw/ot_project.py stamp-slot PROJECT_DIR MODULE SLOT [VALUE] [--track N[,N]]
     python3 tools/hw/ot_project.py set-fx PROJECT_DIR fx1|fx2 TRACK MODULE [--page V,V,V,V,V,V] [--page2 V,...]
+    python3 tools/hw/ot_project.py trims PROJECT_DIR                    # every markers record: trim/loop/slices
+    python3 tools/hw/ot_project.py trim PROJECT_DIR SLOT full|END [START] [--flex|--static]
+        # the slot's trim in markers.work AND markers.strd (both halves by
+        # default), checksum recomputed. A slot a tool assigns without a
+        # record plays a 64-frame stub at every trig (O24) -- `full` writes
+        # the WAV's frame count, what the unit's own browser load writes.
     python3 tools/hw/ot_project.py thru-track PROJECT_DIR TRACK [--page HEX14]
         # a THRU machine that STARTS: machine type 2 in every part of every
         # bank (+ mirrors), the THRU playback page (default 00017f00000000 =
@@ -219,6 +225,101 @@ def set_track_slot(pdir, banknum, part, track, slot_1based, kind="flex"):
         data[off] = slot_1based - 1
     _bank_write(pdir, banknum, mut)
     print(f"bank{banknum:02d} part{part} T{track} {kind} slot -> {slot_1based}")
+
+# ---------------------------------------------------------------------------
+# SAMPLE TRIMS: markers.work / markers.strd (FORM/DPS1SAMP)
+#
+# Measured 22 Sep 2026 (COLDFIRE_PORT.md O24) from the firmware's own parser
+# (0x40086xxx: three u32 fields, 64 x 12-byte slices and a count per record,
+# summed byte by byte into 0x460fab5c and checked against the file's last
+# u16, -54 on a mismatch) and the OTLIVE fixture: a 22-byte header ("FORM"
+# u32 "DPS1SAMP" 00 00 00 00 00 04), then 264 records of 784 bytes -- FLEX
+# slots 1..136 (129..136 = the recorder buffers R1..R8) then STATIC slots
+# 1..128 -- each `trim start, trim end, loop point` (u32 BE, sample frames),
+# 64 slices of (start, end, loop) and a slice count; then the big-endian u16
+# checksum = the byte sum of the 6 sub-header bytes and every record byte
+# (mod 65536). A voice plays [trim start, trim end]; the firmware PADS a trim
+# shorter than 64 frames to 64 (0x40099484 at load, 0x4000f758 at the voice
+# start), so a slot a TOOL assigns without writing its record (end 0), or
+# with the OTLIVE fixture's own end=64 on slots 1/2, plays a 64-frame stub of
+# the file at every trig -- the "onset burst" of O21/O23 and the synth rig.
+# The unit's own browser load writes end = the file's length (0x40095dd4);
+# a tool that assigns a slot must do the same: `trim PROJ SLOT full`.
+import struct
+MARKERS_KEY = b"FORM\0\0\0\0DPS1SAMP"
+MARKERS_HDR, MARKERS_REC, MARKERS_NREC, MARKERS_STATIC0 = 22, 784, 264, 136
+MARKERS_SIZE = MARKERS_HDR + MARKERS_REC * MARKERS_NREC + 2
+
+def _markers_checksum(data):
+    return sum(data[16:MARKERS_HDR + MARKERS_REC * MARKERS_NREC]) & 0xffff
+
+def _markers_load(path):
+    data = bytearray(path.read_bytes())
+    if len(data) != MARKERS_SIZE or not data.startswith(MARKERS_KEY):
+        sys.exit(f"{path}: not a DPS1SAMP markers file of {MARKERS_SIZE} bytes")
+    stored = struct.unpack_from(">H", data, MARKERS_SIZE - 2)[0]
+    if stored != _markers_checksum(data):
+        sys.exit(f"{path}: checksum {stored:#06x} != computed {_markers_checksum(data):#06x} -- layout drift, not touching it")
+    return data
+
+def _markers_record(kind, slot_1based):
+    if kind not in ("flex", "static") or slot_1based < 1:
+        sys.exit(f"trim: kind {kind} / slot {slot_1based} (1-based; flex 1..136, static 1..128)")
+    k = (0 if kind == "flex" else MARKERS_STATIC0) + slot_1based - 1
+    if k >= MARKERS_NREC or (kind == "static" and slot_1based > 128):
+        sys.exit(f"trim: no {kind} record for slot {slot_1based}")
+    return MARKERS_HDR + MARKERS_REC * k
+
+def read_trims(pdir, suffix="work"):
+    """[(kind, slot, start, end, loop, slices)] for every record that is not all zero."""
+    data = _markers_load(pathlib.Path(pdir) / f"markers.{suffix}")
+    out = []
+    for kind, n in (("flex", 136), ("static", 128)):
+        for slot in range(1, n + 1):
+            o = _markers_record(kind, slot)
+            rec = data[o:o + MARKERS_REC]
+            if any(rec):
+                s, e, lp = struct.unpack_from(">III", rec, 0)
+                out.append((kind, slot, s, e, lp, struct.unpack_from(">I", rec, MARKERS_REC - 4)[0]))
+    return out
+
+def sample_frames(pdir, slot_1based, kind="flex"):
+    """The frame count of the WAV the project's [SAMPLE] entry names for that slot."""
+    import wave
+    _, slots = read_project(pathlib.Path(pdir))
+    for s in slots:
+        if s["slot"] == slot_1based and (s["type"] or "").lower() == kind and s["path"]:
+            p = s["path"]
+            f = (pathlib.Path(pdir) / p) if p.startswith("..") else (pathlib.Path(pdir) / ".." / "AUDIO" / p)
+            with wave.open(str(f.resolve())) as w:
+                return w.getnframes()
+    sys.exit(f"trim: no {kind} [SAMPLE] entry with a PATH for slot {slot_1based} in project.work")
+
+def set_trim(pdir, slot_1based, end, start=0, loop=None, kinds=("flex", "static")):
+    """Set the trim of a slot's markers record(s) in BOTH markers.work and markers.strd
+    (the working and the saved state, as _bank_write does for banks), fixing the checksum.
+    `end` may be "full" = the WAV's frame count from the project's [SAMPLE] entry."""
+    pdir = pathlib.Path(pdir)
+    if end == "full":
+        end = sample_frames(pdir, slot_1based, kinds[0])
+    for suffix in ("work", "strd"):
+        path = pdir / f"markers.{suffix}"
+        if not path.is_file():
+            continue
+        data = _markers_load(path)
+        for kind in kinds:
+            o = _markers_record(kind, slot_1based)
+            s0, e0, l0 = struct.unpack_from(">III", data, o)
+            l1 = l0 if loop is None else int(loop)
+            struct.pack_into(">III", data, o, int(start), int(end), l1)
+            print(f"markers.{suffix} {kind} slot {slot_1based}: trim {s0}..{e0} loop {l0} -> {int(start)}..{int(end)} loop {l1}")
+        struct.pack_into(">H", data, MARKERS_SIZE - 2, _markers_checksum(data))
+        path.write_bytes(data)
+
+def cmd_trims(pdir):
+    for kind, slot, s, e, lp, n in read_trims(pdir):
+        short = "   (< 64 frames: the firmware plays a 64-frame stub)" if e - s < 64 else ""
+        print(f"  {kind:6s} slot {slot:3d}: trim {s}..{e} loop {lp} slices {n}{short}")
 
 # The machine-type byte, one per track per part. RAM offset (EMU.md /
 # EXTERNAL.md §6) is `PART_PTR + part*0x18b2 + 0x8eda2 + track`; the file
@@ -922,6 +1023,14 @@ if __name__ == "__main__":
         # a REAL set, before its first load on a flashed image: only the ids
         # a station replaced are touched; BusVerb/BusDelay keep Sam's knobs
         stamp_defaults(pdir, sys.argv[3], replaced_only=True)
+    elif cmd == "trims": cmd_trims(pdir)
+    elif cmd == "trim":
+        # <project> <slot 1-based> full|<end frames> [<start frames>] [--flex|--static]
+        args = sys.argv[3:]
+        kinds = ("flex",) if "--flex" in args else ("static",) if "--static" in args else ("flex", "static")
+        pos = [a for a in args if not a.startswith("--")]
+        set_trim(pdir, int(pos[0]), pos[1] if pos[1] == "full" else int(pos[1]),
+                 int(pos[2]) if len(pos) > 2 else 0, kinds=kinds)
     elif cmd == "thru-track":
         args = sys.argv[4:]
         page = args[args.index("--page") + 1] if "--page" in args else "00017f00000000"
