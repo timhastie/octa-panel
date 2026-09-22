@@ -3,7 +3,7 @@
 All three are ColdFire caves that touch only the main-OS section: the pattern
 change option (CHAIN AFTER = DIRECT), the SCALE row next to it in
 PROJECT > CONTROL > SEQUENCER, and the SYNTH machine (a FLEX track whose
-sample is named SYNTH*.wav plays a generated sine, modules/synth). Build with `REMIX=tim make cf` ->
+sample is named SYNTH*.wav plays a two-operator FM voice, modules/synth). Build with `REMIX=tim make cf` ->
 out/mainos_cf.bin (`make image-cf` for the card): the ColdFire-only build
 leaves both DSP payloads and the FX2 chooser stock, so every stock effect
 stays selectable. `REMIX=tim make bus` also builds, but rebuilds the
