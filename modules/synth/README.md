@@ -1,10 +1,257 @@
-# Synth machine (phase 2: the FM voice; phase 1: the hollow voice)
+# Synth machine (phase 3: the page; phase 2: the FM voice; phase 1: the hollow voice)
 
-Phase 2 (22 Sep 2026) replaces phase 1's sine with a two-operator FM voice
+Phase 3 (22 Sep 2026) makes the PLAYBACK page present the synth -- **"Phase 3:
+the page"** below. Phase 2 (22 Sep 2026) replaces phase 1's sine with a two-operator FM voice
 whose parameters are the FLEX PLAYBACK page's other slots -- **"Phase 2: the
 FM voice"** below has the design, the parameter map and the numbers. Phase
 1's text follows it as written (its record-layout guess is corrected in the
 phase-2 section and marked in place).
+
+---
+
+## Phase 3: the page
+
+**When the current track's FLEX slot holds a SYNTH\*-named sample, the
+PLAYBACK page presents the FM voice** instead of a sample player. The slot
+names read **PTCH RATO INDX RATE FDBK DEC** (four characters: the boxes are
+19 px wide and a five-character name fills them edge to edge, measured
+below); the four synth slots show their value all the time, Digitone style,
+formatted as the voice understands them -- RATO the ratio table's entry
+(`0.25 … 1 1.41 … 3.5 … 16`), INDX and FDBK `0..127`, DEC `HOLD` / `32ms` /
+`286ms` / `2.0s`; and each draws an icon where the sample dial was: the two
+operators **M→C** (RATO), a **sideband spectrum** whose bars grow with the
+index (INDX), the modulator **with its feedback loop** when FDBK > 0, and the
+**index envelope**, a falling curve whose length follows the value (DEC; a
+flat top for HOLD). The footer reads **FM SYNTH▸FLEX**. Non-synth tracks and
+every other page draw byte for byte as stock. One pinned cave (1,948 bytes,
+`page.s`) and one 6-byte poke; **UNFLASHED**, everything below measured under
+`ot_emu` through the virtual panel and the oracle, 22 Sep 2026; logs,
+screens, takes: `out/_agents/synth3/`.
+
+![the page](page_montage.png)
+
+Left to right, top to bottom (T8 = SYNTH slot 5, part 1 defaults PTCH 64
+STRT 0 LEN 0 RATE 127 RTRG 0 RTIM 79): the defaults (RATO 0.25, INDX 0,
+FDBK 0, DEC 774ms); RATO raw 36 = `2`; raw 127 = `16`; INDX 127 (the full
+spectrum); FDBK 64 (the loop); DEC 16 = `32ms` (a short curve); DEC 127 =
+`2.0s`; DEC 0 = `HOLD` (flat); and T7, a FLEX track with a sample, unchanged
+(`shots/remix/`, `shots/stock/`).
+
+### Where the page comes from, and the hook
+
+Every routine that draws or edits a parameter page finds its **descriptor**
+(`docs/firmware/PARAM_PAGES.md`: `P = E + 0x38`, names at `P+0x16` six bytes
+a slot, formatters `P+0xca`, widgets `P+0xfa`, enable nibbles `P+0x18e` /
+`P+0x18a`) through `0x40031ee0(track, kind)` — `−1, −1` = the current track
+and page kind — which tail-calls the resolver `0x40031da4`: for an audio
+track and page kind 0 (PLAYBACK) it returns `0x400d5f38[machine]` at
+`0x40031ece`. Callers: the generic parameter-page renderer `0x4004e0xx`
+(`lea 0x40031ee0` at `0x4004e1da`; names `P+22` at `0x4004e4ea`, formatters
+`P+202` at `0x4004e4f6`, the widget from `+48` past the formatter = `P+0xfa`,
+the enable nibble through `0x400a6994(P+0x18a, P+0x18e, slot)`), the footer
+(`0x4003d64e`: `sprintf("%s%s%s", P+9, "\x07", 0x400a78c8[machine])` =
+`PLAYBACK▸FLEX`), the knob handler (`0x40054cfe`) and the p-lock/CC paths.
+So **one detour** presents the whole page:
+
+| site | stock bytes (displaced) | written | stub |
+|---|---|---|---|
+| `0x40031ece` in the resolver `0x40031da4` | `2030 0c00 6002` — `movel %a0@(0,%d0:l:4),%d0; bras 0x40031ed6` | `4ef9 400d 24d0` — `jmp pg_resolve` | replays the load; if it produced the FLEX descriptor `0x400d31ae` and the track's assigned FLEX slot is a SYNTH, `d0 := pg_desc`; `jmp 0x40031ed6` (the resolver's epilogue restores d2–d5; d1/a0/a1 are C scratch, d6/d7/a2–a6 untouched) |
+
+The marker test is phase 1's, on the **Part's assignment** rather than the
+playing voice: slot = `blob + part·6322 + 0x8f04a + track·5 + 1` (0-based;
+`0xff` none, `≥ 128` the recorder buffers → no), its settings record
+`0x100b14f0 + 0x448·slot` with the loaded flag `+0x129 ≠ −1`, the path at
+`+0` scanned (≤ 255 bytes) for the basename after the last `/`, compared
+with `SYNTH`. A sample lock on a step changes the voice, not the page.
+
+**`pg_desc` is the stock FLEX record, `P..P+0x192`, with twelve spans
+changed** (`gen_page.py` generates it from the image and asserts the rest
+is byte-identical): the full name `P+9` = `FM SYNTH` (the footer), the
+names of slots 1/2/4/5, the four A formatters, the four B widgets, and the
+enable nibbles `0x55311311 → 0x55715751` — slots 1/4 `1 → 5`, 2/5 `3 → 7`:
+**bit 2 of the nibble makes the renderer pass `flags = 8`**, the "value
+always shown" layout (LOOP on the SETUP page uses it), and bit 1 (LEN's and
+RTIM's marker glyph left of the box) is kept. Ranges, defaults, minimums
+and the six knob handlers (`P+0x12a..`) are the stock's, so storage, locks,
+scenes, LFOs, the crossfader and MIDI CC behave exactly as in phase 2 — the
+clone only changes what is printed and drawn. The SETUP screen (double-tap
+PLAYBACK; `0x4003c8ca`), the p-lock editor (`0x400585ea`) and the LFO
+destination names (`0x4003bff2`) index `0x400d5f38` inline and stay stock.
+
+### How a box is drawn (the renderer, read from `0x4004e4c6..`)
+
+The LCD's y axis points **up** (`screen row = 63 − y`; the pixel routine
+`0x40011830` maps y to bit `31 − (y & 31)` of long `y >> 5` of a
+column-major framebuffer). A box's origin is `x = 60 / 80 / 100`, `y = 36`
+(top row) or `8` (bottom); the name is centred on `x+9` at `y+20` through
+`0x40013904(ctx, win, x, y, 1, 0, "XXXX", "%s", name)` (a four-character
+erase field); then `widget(x, y, slot, value, flags, fmt, window)` with the
+descriptor's B entry, or the stock dial `0x400479b4` when it is 0. With
+`flags` bit 3 the stock dial clears the box, blits its **circle bitmap
+`0x400bd15a`** (11×13, the bipolar tick in row 12) at `(x+4, y+7)`, the
+**pointer `0x400bdb6e[value]`** (7×7) at `(x+6, y+9)`, and prints
+`fmt(buf, value)` centred at `y+1`; a locked parameter (bit 0) then inverts
+`x+1..x+17, y+1..y+18`. The blit `0x400128a8(bitmap, window, x, y)` takes a
+record `{width, height, longs per column, columns*, mask*}` — **one long
+per column, bit 31 the bottom row, bit 31−k row k above it** — and does
+`dst = (dst & ~mask) | (data & mask)`, so a full mask replaces the area.
+(Calibrated against phase 2's screen: the circle's offset-0 pixel of column
+0 sits at (64, 23) and its offset-12 tick at (69, 11) for box 1 at rest,
+i.e. the dial at `(x+4, y+4)`; while a value is shown it moves to `y+7`
+with the text below — exactly the STRT-36 frame.)
+
+**Each widget here calls the stock dial first** — the box clear, the value
+text, the lock highlight and the marker glyphs stay stock's — then composes
+a **17×13 icon** in a RAM scratch (`pg_data`, 17 longs; the main OS runs
+from DRAM) and blits it over the dial at `(x+1, y+7)` with a full 13-row
+mask (`0xfff80000`), inverting rows 0–11 when the parameter is locked
+(`flags` bit 0; row 12 = `y+19` lies outside the stock highlight and stays
+empty in every icon). The icons (`page.s`, row 12 at the top; `#` = lit):
+
+```
+RATO: M -> C              FDBK: the modulator      + its loop (value > 0)
+.................         .................        .................
+.................         .................        ..#############..
+######.....######         .....#######.....        ..#...........#..
+#....#.....#....#         .....#.....#.....        ..#...........#..
+#.#.##.....#.##.#         .....#.#.#.#.....        ..#...........#..
+#.####...#.#.#..#         .....#.###.#.....        ...#..........#..
+#.#.#######.#...#         .....#.#.#.#.....        ..###.......###..
+#.#.##...#.#.#..#         .....#.#.#.#.....        ...#.............
+#.#.##.....#.##.#         .....#.#.#.#.....        .................
+#....#.....#....#         .....#.....#.....        .................
+######.....######         .....#######.....        .................
+.................         .................        .................
+.................         .................        .................
+```
+
+INDX: a baseline (row 0) and seven bars at columns 2 4 6 8 10 12 14 from
+row 1: the carrier (column 8) `11 − 3·v/127` tall, the ±1 sidebands
+`10·v/127`, ±2 `8·(v−20)/107` for v > 20, ±3 `6·(v−56)/71` for v > 56 — a
+Bessel-shaped cartoon (0: one bar; 32: carrier and ±1; 127: all seven).
+DEC: the baseline, an instant rise at column 0 (rows 1–11), then
+`pg_env[i]` = `11·e^(−i/5)` (11 9 7 6 5 4 3 3 2 2 1 …, the floor row 1 =
+I/16) stretched over `L = 2 + 14·v/127` columns (`i = 16·c/L`, clipped to
+16), drawn as the vertical runs between consecutive heights (an outline);
+v = 0 keeps `i = 0`, a flat top at row 11 — the index holds.
+
+**Formatters** (`fmt(buf, value)`, C convention, `sprintf` `0x40013a08`):
+`pg_fmt_plain` `"%d"` (INDX, FDBK); `pg_fmt_ratio` looks the raw value up in
+a copy of `sy_ratio` (`raw >> 2`, Q8) and prints `"%d"` when the fraction
+is 0, `"%d.5"` when it is .50, else `"%d.%02d"` (`0.25 0.5 0.75 1 1.01 1.25
+1.41 1.5 1.75 2 2.01 … 16`); `pg_fmt_decay` prints `HOLD` for 0, else
+`ms = (2000·raw² + 8064) / 16129` (τ = 2 s·(raw/127)², rounded) as `"%dms"`
+below 1000 and `"%d.%ds"` above (raw 8 → `8ms`, 16 → `32ms`, 48 → `286ms`,
+79 → `774ms`, 96 → `1.1s`, 127 → `2.0s`). Names are drawn by the renderer
+from the clone; the values are the Part's raw bytes, so locks, scenes and
+LFOs print what they hold.
+
+### Space, builds
+
+`page.s` links to **1,948 bytes** (code `+0x000..0x3ea`, strings, `pg_env`,
+the ratio table, the bitmap record, the mask, the scratch, the descriptor
+clone at `+0x4f8`, the four column images), **pinned at `0x400d24d0`** — the
+second zero run (2,064 B; 116 B left after it) — because the clone holds
+absolute pointers to the formatters and widgets; `PINNED_PAGE` in
+`manifest.py` is the ratified form (linked with `m68k-elf-as -mcpu=5475`,
+`ld -Ttext=0x400d24d0`, `objcopy -j .text`; `out/_agents/synth3/asm/`), the
+build re-links the source there and refuses on a difference, `emit()`
+returns `b""` plus the one poke. The phase-2 voice cave is untouched and
+still floats. `REMIX=synth make cf`: **2,353 bytes changed** (was 1,153),
+the voice at `0x400d6b80`, **2,600 B of the third run left** as before
+(`build_synth.log`); `REMIX=tim make cf`: **4,010 bytes changed** (was
+2,810), the voice at `0x400d6e00`, the quantizer at `0x400d7500..`, **172 B
+of the third run left** as before (`build_tim.log`); `out/mainos_cf.bin`
+ends as the `tim` build. Both keep the DSP payloads, dispatch and the FX2
+chooser byte-identical to stock (the CFONLY check).
+
+### Measurements (all `out/_agents/synth3/`; the panel on 8593/8594,
+`--image mainos_synth_v2.bin` / the stock section, `--card` a fresh copy of
+phase 1's `synth8q.img`; `session3.py`, `remix.log`, `stock.log`, `shots/`)
+
+**1. The page.** Booted, [T8], [PLAYBACK]: the frames in the montage and
+`shots/remix/01..16`; the Part bytes after each turn confirm the encoders
+map 1:1 (`remix.log`: RATO +12 +24 +16 +75 → STRT `0c 24 34 7f`, INDX +32
++32 +63 → LEN `20 40 7f`, FDBK +1 +63 → RTRG `01 40`, DEC −63 +32 +79 −127
+→ RTIM `10 30 7f 00`; `/knob/reset` restores the defaults). The value
+strings read `0.25 1 2 3.5 16`, `0 32 64 127`, `0 1 64`, `774ms 32ms 286ms
+2.0s HOLD` (`value_rows.txt`, the glyph rows of the four boxes per
+frame); the icons change as designed (INDX 0 → one bar, 32 → three, 64
+→ five, 127 → seven; FDBK 0 → the box alone, 1 and 64 → the loop; DEC 16 →
+a 4-column drop, 48 → 7, 127 → the full width, 0 → flat). Names: the first
+build carried `RATIO INDEX DECAY` — five characters are 19 px at the 3×5
+font's 4-px pitch, exactly the box interior, so `RATIO` and `INDEX` touched
+across the dotted separator (`shots/remix_v1/`, `remix_v1.log`); the
+four-character forms have the stock's 2-px margins.
+
+**2. Everything else is stock.** The same key script on the stock image
+(port 8594, `shots/stock/`): `00_main`, T7's PLAYBACK page and its STRT
+turn, T7's AMP / LFO / FX1 / FX2 / MIXER, T8's AMP / LFO / FX1 / FX2 /
+MIXER, the FLEX slot list (double-tap [T8]: `« MACHINE:FLEX`, `5▸SYNTH.wav
+0.33`) and the file browser (`LOAD FILE TO FLEX 6`) — **16 frames
+byte-identical** to the remix's (`/screen.txt`); the only frames that differ
+are T8's PLAYBACK page, by design. Locks: REC and [TRIG 9] held on T8
+(`17_trig9_held`) drew no highlight on either image — the fixture's step 9
+carries no PLAYBACK lock — so the highlight path (the stock invert plus the
+icon's own inversion) is by construction, not measured.
+
+**3. Boot A/B** (`ab/`; `tools/emu/ot_emu/oracle/drive.py --emu
+out/emu/ot_emu --image <stock | mainos_synth_v2.bin>`, the `inter` battery
+on the OTLIVE card): `peeks.txt` and `stderr.txt` byte-identical; `tx.bin`
+**18,297 vs 18,293 bytes** — with every LED-level pair (`0x3n <id>`)
+removed the streams are identical (**16,873 bytes: every LCD block and every
+LED row**), the final LCD frame and LED bitmaps are identical, and the
+difference is one fewer `3d 24` and `3d 25` each (65 → 64), the breathing
+pair whose phase against the battery's fixed windows shifted because the
+resolver now runs four more instructions per lookup (`ready` 277688.167 →
+.171 samples; `boot.log` 65,410 → 65,404 vectors acknowledged) — the same
+effect and the same size as the quantizer's loader detours
+(`modules/quantizer/README.md` §5). No text, no state peek differs.
+
+**4. The sound is phase 2's.** PLAYBACK page, RATO +36 (ratio 2), INDX +64,
+PLAY 4.2 s, STOP → `takes/remix_fm_r2_i64.wav` (`fm.py --ratio 2`, 0.15–0.95
+s): **261.626 Hz (+0.0 cents)**, the lines at 262 ± k·523 Hz: 262 0, 1308
+−2.2, 785 −12.4, 1831 −16.0, 2355 −21.1, 2878 −37.3 dB, worst spur off the
+lines −51.3 dB (a Hann sidelobe); the sidebands sit lower than phase 2's
+held-index table because DEC stayed at its default 774 ms and the index
+decays through the window. The `tim` image (`tim_check.py`, `shots/tim/`,
+`takes/tim_fm_r2_i64.wav`) draws the identical page (`/screen.txt` equal to
+the `synth` remix's, T7 equal to stock) and measures the identical lines.
+
+**5. Gates** (`gates.log`, `gates.sh`, `REMIX=synth`): `make bus`,
+`cycle_count`, `verify_slots`, `label_fmt`, `verify_octakit`,
+`verify_midiscenes` (SKIP: submodule), `verify_dram_boot`, `verify_labels`
+(SKIP: no selects), `verify_menushortcut`, `verify_cfprobe`,
+`verify_busscreen`, `verify_ccpage2`, `verify_hidden`, `verify_grains`,
+`verify_menu`, `verify_burn` (its usual SKIP), `verify_twocore`,
+`verify_onebus`, `make cf` exit 0; `verify_modenames` "no module declares
+mode_views" (the Makefile's SKIP); `verify_replaces` fails only on the eight
+MIDI SCENES remixes without the submodule (pre-existing).
+
+### What does not work, and what is left
+
+- **Four-character names**: `RATO`, `INDX`, `DEC` (Elektron's own for
+  decay), `FDBK`; `RATIO`/`INDEX` fill the box edge to edge (measured).
+- **The value text `774ms` / `286ms` is five characters** and, like a
+  five-character name, spans the box interior exactly; it is legible but
+  touches the separators.
+- **The machine letter stays F** and the sample-name box says what the file
+  is called (`~SYNTH`): the presentation lives in the footer (`FM
+  SYNTH▸FLEX`, the clone's own name field, no hook) and the boxes.
+- **The LFO page's PMTR destination names** still print `STRT LEN RTRG
+  RTIM` (`0x4003bff2` indexes the table inline), and the SETUP page (page 2)
+  is the stock LOOP/SLIC/… page.
+- **The lock highlight with an icon** is unmeasured (no lock in the
+  fixture); the icon inverts rows 0–11 to match the stock's rectangle.
+- The boot A/B differs by the phase of one breathing LED pair (above).
+- The marker test runs on every descriptor resolve of a FLEX track (a path
+  scan, ≤ 255 bytes) — UI-thread only.
+- **Emulation only**; not flashed.
+
+Tooling for the record (`out/_agents/synth3/`): `gen_page.py` (the clone
+and the column bitmaps from ASCII art), `dis.py` (listing slices by
+address), `montage.py`, `session3.py`, `slotlist_check.py`, `tim_check.py`,
+`gates.sh`; the disassembly slices read for this phase are `dis_*.txt`.
 
 ---
 
@@ -15,7 +262,8 @@ voice**: `out = sin(φc + I·sin(φm + fb·m_prev))`, the carrier at the
 track's pitch, the modulator at RATIO × that pitch, the index I falling
 from INDEX toward INDEX/16 at the DECAY rate from every trig, FEEDBACK the
 modulator's own previous sample folded into its phase. The four parameters
-are the PLAYBACK page's remaining slots (phase 3 draws their labels):
+are the PLAYBACK page's remaining slots (phase 3 draws them as RATO / INDX /
+FDBK / DEC, with icons -- "Phase 3: the page" below):
 
 | slot (encoder) | meaning | DSP param record halfword `fp[i]` (`raw << 8`) | map |
 |---|---|---|---|
@@ -262,7 +510,7 @@ subtle; the useful range is the lower half.
   encoder is turned.
 - **The index floor is fixed at I/16** and the decay law is τ = 2 s ·
   (raw/127)²; both are constants in `synth.s` (`ENV_FLOOR`, `K_NUM`).
-- **Labels and icons are phase 3**: the page still reads STRT/LEN/RTRG/RTIM.
+- ~~**Labels and icons are phase 3**: the page still reads STRT/LEN/RTRG/RTIM.~~ Done: "Phase 3: the page".
 - Space in `tim` is down to 172 B; the next cave there goes to the second
   zero run or DRAM.
 - **Emulation only**; not flashed.

@@ -1,4 +1,4 @@
-"""SYNTH MACHINE -- phase 2: a FLEX track whose sample is named SYNTH* plays a
+"""SYNTH MACHINE -- phases 2+3: a FLEX track whose sample is named SYNTH* plays a
 two-operator FM voice instead of the sample. The ColdFire generates the
 track's SOURCE sample data every frame, at the track's final pitch, and the
 DSP does the rest exactly as for a sample -- RATE, the AMP envelope, filter,
@@ -33,6 +33,17 @@ event byte) the file name after the last '/' is compared with "SYNTH" and
 the result cached per track. Any WAV named SYNTH*.wav in any FLEX slot is
 the machine; sample locks choose it per step. A stock unit plays the file
 itself (the shipped SYNTH.wav is silence).
+
+THE PAGE (phase 3). The page-descriptor resolver 0x40031da4 is detoured at
+its PLAYBACK-page table load (0x40031ece): for a track whose assigned FLEX
+slot's sample is named SYNTH* it returns a cloned FLEX descriptor (in the
+pinned page cave, modules/synth/page.s) whose slots read PTCH RATO INDX RATE
+FDBK DEC, whose title makes the footer read FM SYNTH>FLEX, whose formatters
+print the ratio table's value, 0..127 and HOLD/ms/s, and whose widgets draw
+the M->C operator diagram, a sideband spectrum, the modulator with its
+feedback loop and the index envelope over the stock dial. Ranges, defaults
+and knob handlers are the stock record's; every other page and every
+non-synth track draws as stock.
 
 Verified in ot_emu through the virtual panel and the pipe (README).
 UNFLASHED.
@@ -117,13 +128,104 @@ def emit(addr: int):
     return b"", ((KIND_TABLE_FLEX, STOCK_RENDERER, addr.to_bytes(4, "big")),)
 
 
+# ---- phase 3: the page (modules/synth/page.s) ----------------------------------
+# The PLAYBACK page presents the synth: a detour in the page-descriptor
+# resolver (0x40031da4, the kind-0 `tbl[machine]` load at 0x40031ece) returns a
+# cloned FLEX descriptor -- names PTCH RATO INDX RATE FDBK DEC, the title
+# "FM SYNTH" (the footer reads FM SYNTH>FLEX), formatters (the ratio table's
+# value, 0..127, HOLD/ms/s), widgets that draw the operator diagram, the
+# sideband spectrum, the feedback loop and the index envelope over the stock
+# dial -- when the current track's assigned FLEX sample is named SYNTH*.
+# Pinned at the second zero run: the clone holds absolute pointers into the
+# cave. One 6-byte poke (`movel %a0@(0,%d0:l:4),%d0; bras` -> `jmp pg_resolve`).
+PAGE_AT = 0x400d24d0
+PAGE_LEN = 1948
+RESOLVER_HOOK = 0x40031ece
+RESOLVER_STOCK = bytes.fromhex("20300c00" "6002")
+# Ratified bytes: page.s with m68k-elf-as -mcpu=5475, linked at PAGE_AT (22 Sep 2026).
+PINNED_PAGE = bytes.fromhex(
+    "20300c000c80400d31ae66000082243c000018b24c012800d4892803e58cd883"
+    "d4842042d1fc0008f04b75900c820000007f6200005a283c000004484c024800"
+    "0684100b14f020447928012952846700003e2248283c000000ff7b9867000014"
+    "0c850000002f66000004224853846600ffea41fa002078057b987599ba826600"
+    "000e53846600fff241fa046e20084ef940031ed653594e5448002f2f00084879"
+    "400b465d2f2f000c4eb940013a084fef000c4e752f02202f000ce48802800000"
+    "001f41fa035673f00a002001e0880281000000ff74644c021000e0896700003e"
+    "0c81000000326700001c2f012f00487a02fa2f2f00144eb940013a084fef0010"
+    "600000302f00487a02ea2f2f00104eb940013a084fef000c600000182f004879"
+    "400b465d2f2f00104eb940013a084fef000c241f4e752f02202f000c6700007a"
+    "22004c001000203c000007d04c010000068000001f80223c00003f014c410000"
+    "0c80000003e86400001a2f00487a02892f2f00104eb940013a084fef000c6000"
+    "0048223c000003e824004c41200272644c4100002202e789d282d28290812f00"
+    "2f02487a02582f2f00144eb940013a084fef001060000012487a02492f2f000c"
+    "4eb940013a08508f241f4e7570006000001470016000000e7002600000087003"
+    "600000024fefffd448d77cfc2e002f2f00482f2f00482f2f00482f2f00482f2f"
+    "00482f2f00482f2f00484eb9400479b44fef001c2c2f003c4a87670000125387"
+    "670000185387670000b2600000c841fa045a610001766000012441fa051a6100"
+    "016a220670034c001000707f4c401001740b948170087201610001722406700a"
+    "4c002000707f4c402002670000127006720161000158700a7201610001502406"
+    "0482000000146f00002270084c002000706b4c40200267000012700472016100"
+    "012c700c72016100012424060482000000386f0000a870064c00200070474c40"
+    "2002670000987002720161000100700e7201610000f86000008441fa03f26100"
+    "00ca4a866700007641fa0428610000cc6000006a41fa0460610000b070007201"
+    "740b610000c82a3c00007fff4a86670000122a06700e4c005000707f4c405005"
+    "5485780b7e012407e98a4c4520020c82000000106f000004741041fa00cc75b0"
+    "2800264220072202240461000080280b52870c87000000106f00ffcc202f0040"
+    "080000006700001841fa014a701022100a81fff0000020c153806c00fff2202f"
+    "00345e802f00202f003452802f002f2f0050487a00c84eb9400128a84fef0010"
+    "4cd77cfc4fef002c4e7543fa0108701022d853806c00fffa4e7543fa00f87010"
+    "2218839953806c00fff84e7541fa00e641f00c00263c80000000e2ab8790e28b"
+    "5281b4816c00fff64e7525642e253032640025642e350025646d730025642e25"
+    "647300484f4c44000b09070605040303020201010101010101000040008000c0"
+    "010001030140016a018001c00200020302800300038004000403048005000580"
+    "0600068007000780080009000a000b000c000d000e000f001000000000000011"
+    "0000000d00000001400d2984400d2940fff80000fff80000fff80000fff80000"
+    "fff80000fff80000fff80000fff80000fff80000fff80000fff80000fff80000"
+    "fff80000fff80000fff80000fff80000fff80000000000000000000000000000"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+    "0000000000000000000000000000000000000000000000000000000050420000"
+    "00464d2053594e544800000000005054434800005241544f0000494e44580000"
+    "5241544500004644424b00004445430000004c4f4f500000534c494300004c45"
+    "4e00000052415445000054535452000054534e5300004000007f004f01000000"
+    "0140000000040000000000000000000000000000000000000000000000000000"
+    "0000000000000000000000000000000000000000007900000080000000800000"
+    "0080000000800000008000000004000000020000000200000002000000040000"
+    "00804003b4b0400d2584400d256a4003c7a0400d256a400d26064003b64c4003"
+    "c14c4003b2ec4003b6044003b6a400000000400479b4400d269c400d26a24004"
+    "79b4400d26a8400d26ae40046c2840046f1040046f1040046f1040046c280000"
+    "000040032d080000000000000000400328e40000000040032f28000000000000"
+    "00000000000000000000000000000000000040038d9440038d9440038d944003"
+    "8ddc40038d9440038d9400000000000000000000000000000000000000000000"
+    "000000001751557157513fe00000202000002fa00000212000002fa000003fe0"
+    "000002000000020000000200000007000000020000003de00000222000002da0"
+    "000028a00000202000003fe00000000000000000000000000000000000000000"
+    "00003fe00000202000002fa00000212000002fa00000202000003fe000000000"
+    "000000000000000000000000000000000000000000000000000002f000000710"
+    "0000021000000010000000100000001000000010000000100000001000000010"
+    "0000021000000210000003f00000000000000000000080000000800000008000"
+    "0000800000008000000080000000800000008000000080000000800000008000"
+    "00008000000080000000800000008000000080000000800000000000"
+)
+assert len(PINNED_PAGE) == PAGE_LEN, len(PINNED_PAGE)
+assert PINNED_PAGE[:4] == bytes.fromhex("20300c00")     # pg_resolve replays the table load
+
+
+def emit_page(addr: int):
+    """The source is the only truth for the bytes (b""); the resolver's kind-0
+    table load becomes a jmp to pg_resolve (+0)."""
+    assert addr == PAGE_AT, "the page cave is pinned"
+    return b"", ((RESOLVER_HOOK, RESOLVER_STOCK,
+                  bytes.fromhex("4ef9") + addr.to_bytes(4, "big")),)
+
+
 MODULE = Module(
     name="synth",
     key="SYNTH MACHINE",
     kind=Kind.CF_PATCH,
     doc="A FLEX track whose sample is named SYNTH* plays a two-operator FM "
         "voice (STRT/LEN/RTRG/RTIM = ratio/index/feedback/decay); the DSP "
-        "shapes and effects it as a sample.",
+        "shapes and effects it as a sample. Its PLAYBACK page reads RATO/INDX/"
+        "FDBK/DEC with icons and the title FM SYNTH.",
     cf_patches=(
         CavePatch(
             label="synth cave",
@@ -134,6 +236,17 @@ MODULE = Module(
             reference=lambda addr: PINNED,    # the same bytes at any address
             report_note=" (FLEX renderer kind-table entry 0x400d6438 -> sy_render; "
                         "SYNTH*-named samples become a 2-op FM voice)",
+        ),
+        CavePatch(
+            label="synth page",
+            cave_addr=PAGE_AT,                # pinned: the descriptor clone's pointers
+            pinned=PINNED_PAGE,
+            source="modules/synth/page.s",
+            emit=emit_page,
+            reference=lambda addr: PINNED_PAGE,
+            report_note=" (page-descriptor resolver 0x40031ece -> pg_resolve: the "
+                        "PLAYBACK page of a SYNTH track reads RATIO/INDEX/FDBK/DECAY "
+                        "with icons; title FM SYNTH)",
         ),
     ),
 )
