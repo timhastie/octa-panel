@@ -213,6 +213,21 @@ EMAC-fixed Unicorn (`scripts/build_unicorn.sh`), `vendor/dsp56300` pinned to
   builds but rebuilds the chooser around a remix with no rows, so the unit
   offers NONE as the only EFFECT 2 effect (the owner's report).
 
+- **SYNTH machine (22-23 Sep 2026, modules/synth, commits 588799d/dc9d2f4/
+  5866a90):** a FLEX track whose loaded sample is named SYNTH*.wav is a
+  two-operator FM synth (a ColdFire cave generates the source samples the
+  packer 0x4000d3fc ships each frame: the kind-table FLEX entry 0x400d6438
+  is poked to it); PLAYBACK page = PTCH, RATO (STRT), INDX (LEN), RATE,
+  FDBK (RTRG), DEC (RTIM), with icons and FM SYNTH in the footer via a
+  detour at the page resolver 0x40031ece; the DSP envelope/FX/locks/scenes
+  apply as to a sample. Param record fp = 0x80000510+384*ping+48*t
+  ([0] PTCH [1] STRT [2] LEN [3] RATE [4] RTRG [5] RTIM). Build with the
+  tim remix (`REMIX=tim make cf`, 4,010 bytes changed, 172 B of cave left).
+  O24: the voice-start "burst" was the OTLIVE fixture's markers trims
+  (slots 1/2 = 0..64 frames), not the emulator (tools/hw/ot_project.py
+  trims/trim). A SYNTH.wav marker file (2 s of silence) lives in the rig
+  at out/_agents/synth/audio/.
+
 ## Repo / process rules that matter
 
 - **No Elektron bytes in git**: `out/`, `downloads/`, `vendor/`, `.venv/` are
