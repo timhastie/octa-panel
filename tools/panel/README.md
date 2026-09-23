@@ -380,7 +380,7 @@ The server drains the child's ring after every pump (25 ms of firmware)
 and every action into a ring of its own — the last **180 s**, addressed
 by absolute frame number since the capture began (the count keeps rising
 across respawns, re-inserts and sound switches; the child's own ring
-restarts each time) — and, while frame mode is on, into a **take**:
+restarts each time) — and, from PLAY to STOP, into a **take**:
 **PLAY opens `out/_panel_takes_<port>/take-NNN.wav`, STOP closes it.**
 That is the hardware feeling: press PLAY, the unit plays, press STOP, you
 have what it played. The file is 16-bit stereo 44.1 kHz with its RIFF
@@ -388,6 +388,20 @@ sizes re-patched after every append, so it is a valid WAV at every
 moment (a reader mid-take gets what is there so far); a take open at a
 reboot or at exit is closed as it stands. Takes are numbered on from what
 the folder already holds and never wiped.
+
+**Manual trigs (23 Sep 2026).** With the cores the child runs in frame
+mode from the boot, not only from PLAY to STOP (`/status frame_always`;
+`playing` is PLAY..STOP). The DSP frame interrupt runs the firmware's
+frame builder, the only thing that turns the mailbox a [TRIG] key posts
+into a voice -- with frame mode off the press sat there until the
+release overwrote it and the key was silent while the sequencer was
+stopped (measured through `/peek`: mailbox `0x46c80354[track]` = `0x40`,
+the voice struct idle). And the keys are the unit's: in the TRACKS trig
+mode **[TRIG 9-16] play tracks 1-8's samples** and [TRIG 1-8] are the
+recorder trigs (the firmware's split at `0x40044584`), so [TRIG 15]
+plays T7 and [TRIG 7] does not; FUNC+DOWN held about half a second
+steps the trig mode (CHROMATIC next: [TRIG 13] is the root, the others
+semitones).
 
 | route | does |
 |---|---|

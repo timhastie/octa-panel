@@ -1728,6 +1728,23 @@ class Panel:
         # current child runs.
         self.rt_wanted = True
         self.sound_rt = False
+        # 23 Sep 2026: manual [TRIG] trigs were silent while the sequencer
+        # was stopped because frame mode only ran from PLAY to STOP. The
+        # DSP frame interrupt runs the firmware's frame builder
+        # (0x4000b2ee..), the ONLY consumer of the trig mailbox 0x46c80354
+        # that a [TRIG] key posts (0x40005030 -> 0x4000515c); with frame
+        # mode off the press's 0x1d sat in the mailbox until the release
+        # overwrote it with the note-off 0x40, and no voice ever started
+        # (measured through /peek: mailbox[4] = 0x40, voice struct idle,
+        # exact digital silence; the same key with `frame on` from boot:
+        # -11.9 dBFS). On the unit the interrupt is never off (main unmasks
+        # INTC0 source 1 at boot), so with the cores (sound on) the port
+        # keeps it on from boot: frame_always. `playing` is what PLAY..STOP
+        # now means for the pump rate and the take. Without the cores
+        # nothing is audible and frame mode stays the PLAY..STOP affair it
+        # was (route A: ~100x wall time).
+        self.frame_always = False
+        self.playing = False
         if backend != "port":
             self.sound_note = "no sound under route A (the DSP cores are the port's)" if sound else SOUND_OFF_NOTE
         else:
@@ -2006,6 +2023,15 @@ class Panel:
             self._snapshot(rt.uc)
             self._dismiss_clock(rt)
             rt.run(ms=300)
+            # A fresh child is stopped. With the cores, frame mode from here
+            # on (see frame_always in __init__): the unit's frame interrupt
+            # is always live, and it is what turns a manual [TRIG] into a
+            # voice while the sequencer is stopped.
+            self.playing = False
+            self.frame_always = bool(self.sound_wanted)
+            if self.frame_always and not rt.frame:
+                rt.frame = True
+                rt.next_frame = rt.sample + er.FRAME_PERIOD
             self._poll(rt)
             self._snapshot(rt.uc)
         except BaseException:
@@ -2489,7 +2515,9 @@ class Panel:
                 # double-click is then ~170 emulated ms press to press.
                 # Nothing else changes -- the firmware still runs, just less
                 # of it per wall second, and only for that moment.
-                if rt.frame:
+                # (frame_always: the frame interrupt runs while stopped too,
+                # so PLAY..STOP is `playing`, not `rt.frame`.)
+                if self.playing or (rt.frame and not self.frame_always):
                     pump = min(self.pump_ms, self.play_pump_ms)
                 elif t < self.slow_until:
                     pump = min(self.pump_ms, self.SLOW_PUMP_MS)
@@ -2636,7 +2664,9 @@ class Panel:
         # of firmware = 5.5 s, measured 11 Sep 2026) -- every click took 11 s
         # and the panel looked hung. Frame mode goes on with PLAY, off with
         # STOP (_before_play / _after_stop, shared by the matrix path key()
-        # and the handler path transport()); the exact clock is never
+        # and the handler path transport()) -- under the port with the
+        # cores it stays on from boot instead (frame_always, 23 Sep 2026:
+        # manual [TRIG] trigs need it while stopped); the exact clock is never
         # needed for the UI.
         self.loaded = {"mounted": mounted, "posted": posted, "saved_bank": saved_bank,
                        "final_bank": final_bank, "elapsed_ms": elapsed}
@@ -2873,10 +2903,11 @@ class Panel:
         """What every PLAY needs BEFORE the key lands, whichever path
         delivers it (the matrix report in key(), the jump-table handler in
         transport()). The DSP frame interrupt is what steps the sequencer,
-        so frame mode goes on (~17x wall time while it is on; off again in
-        _after_stop). Without this the matrix PLAY only flipped the
-        transport word and lit the PLAY LED: the position bar never moved
-        (12 Sep 2026).
+        so frame mode goes on (~17x wall time while it is on under route
+        A; off again in _after_stop -- unless frame_always, the port with
+        the cores, where it has been on since the boot). Without this the
+        matrix PLAY only flipped the transport word and lit the PLAY LED:
+        the position bar never moved (12 Sep 2026).
 
         Nothing is written into the pattern any more: the per-track byte
         activate_tracks used to set is PLAYS FREE, and FW_TRANSPORT(0)
@@ -2887,11 +2918,15 @@ class Panel:
         if not rt.frame:
             rt.frame = True
             rt.next_frame = rt.sample + er.FRAME_PERIOD
+        if not self.playing:
+            self.playing = True
             self._open_take(rt)         # sound on: a take file from this PLAY to the next STOP
         return [rt.uc.mem_read(rt.pattern_base() + 84 + 2330 * t, 1)[0] for t in range(8)]
 
     def _after_stop(self, rt):
-        rt.frame = False
+        if not self.frame_always:
+            rt.frame = False
+        self.playing = False
         self._close_take(rt)
 
     # -- sound: the child's audio ring, the server's ring, the takes ----------
@@ -3802,6 +3837,8 @@ class Handler(BaseHTTPRequestHandler):
                             "sound": p.sound,               # the child runs the DSP cores and its main out is captured
                             "sound_rt": p.sound_rt,         # O17: ... under --dsp-rt (real time); False = the lockstep --dsp (~0.2x) or no cores
                             "sound_note": p.sound_note,
+                            "frame_always": p.frame_always, # 23 Sep 2026: frame mode on from boot (manual [TRIG] trigs sound while stopped)
+                            "playing": p.playing,           # PLAY pressed, STOP not yet
                             # O19: the card
                             "card": str(p.card_file) if p.card_file else None,
                             "card_mode": "persistent" if p.card_persistent else "fresh",

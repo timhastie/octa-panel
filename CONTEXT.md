@@ -227,7 +227,27 @@ EMAC-fixed Unicorn (`scripts/build_unicorn.sh`), `vendor/dsp56300` pinned to
   (slots 1/2 = 0..64 frames), not the emulator (tools/hw/ot_project.py
   trims/trim). A SYNTH.wav marker file (2 s of silence) lives in the rig
   at out/_agents/synth/audio/.
-  23 Sep 2026: plain icons (no letters, two columns clear of the dividers), DEC prints the ms alone (`598`, `1.1s`, `HOLD`), the always-show nibble moved from RATE to FDBK, the STRT-LEN / RTRG-RTIM arches (nibble bit 1) cleared, no icon in the compact CHROMATIC/SLOTS layout (widget flags bit 1); `out/mainos_cf.bin` rebuilt (4,000 B changed). OPEN: manual trigs from the [TRIG] keys are silent in the emulator (stock too; PLAY sounds) -- under investigation.
+  23 Sep 2026: plain icons (no letters, two columns clear of the dividers), DEC prints the ms alone (`598`, `1.1s`, `HOLD`), the always-show nibble moved from RATE to FDBK, the STRT-LEN / RTRG-RTIM arches (nibble bit 1) cleared, no icon in the compact CHROMATIC/SLOTS layout (widget flags bit 1); `out/mainos_cf.bin` rebuilt (4,000 B changed).
+  **Manual [TRIG] trigs (23 Sep 2026, resolved):** two things at once. (1) The
+  panel server ran frame mode only from PLAY to STOP, and the DSP frame
+  interrupt runs the firmware's frame builder (0x4000b2ee..), the only
+  consumer of the trig mailbox 0x46c80354 that a [TRIG] key posts through
+  0x40005030 -> 0x4000515c; with it off the press's 0x1d sat in the mailbox
+  until the release overwrote it with the note-off 0x40 and no voice started
+  (mailbox[4] = 0x40 through /peek, voice struct idle, exact digital
+  silence). Fix in panel_server.py: `frame_always` -- with the cores the port
+  keeps frame mode on from boot (the unit never masks it); `playing` is
+  PLAY..STOP for the pump rate and the take; /status reports both. (2) The
+  key map of TRACKS mode: the firmware's key split at 0x40044584 sends
+  [TRIG 1-8] to the recorder state machine (recorder trigs, as the manual
+  says) and [TRIG 9-16] to the sample trig of tracks 1-8 (0x4004476a, gated
+  on 0x8000004c bit 0 and 0x80000012 == 0), so [TRIG 7] never plays T7;
+  [TRIG 15] does (-38 dBFS, third-0), and [TRIG 13] plays T5's clipping loop
+  for ever (-11.9 dBFS, the "constant tone" of the earlier direct-drive runs).
+  CHROMATIC (FUNC+DOWN held ~0.5 s) pitches correctly: -4 st = 0.794x,
+  -12 st = 0.5x; T2's FM synth (tim image) -22.7 dBFS at every key.
+  QUANTIZED TRIG (+0x129) plays no part while stopped: 0x800065b8 == 0 posts
+  the mailbox directly.
 
 ## Repo / process rules that matter
 
