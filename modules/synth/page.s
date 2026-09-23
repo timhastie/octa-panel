@@ -7,13 +7,17 @@
 | PLAYBACK page presents the FM voice instead of a sample player -- the slot
 | names read PTCH RATO INDX RATE FDBK DEC (four characters: the boxes are 19 px), the values format as the voice
 | understands them (RATIO from the ratio table "0.25".."16", INDEX and FDBK
-| 0..127, DECAY as "HOLD" / ms / s), the four synth slots show their value all
-| the time (Digitone style) and draw an icon where the sample dial was: the
-| two-operator diagram M->C (RATIO), a sideband spectrum whose bars grow with
-| the index (INDEX), the modulator with its feedback loop, drawn when FDBK > 0
-| (FDBK), and the index envelope, a falling curve whose length follows the
-| value (DECAY). The footer reads FM SYNTH>FLEX. Non-synth tracks and every
-| other page draw exactly as stock.
+| 0..127, DECAY as "HOLD" / the milliseconds alone / "1.1s" -- four characters
+| at most, the width of the value field), the four synth slots show their
+| value all the time (Digitone style) and draw an icon where the sample dial
+| was: two operator boxes, the modulator feeding the carrier (RATIO), a
+| sideband spectrum whose bars grow with the index (INDEX), the modulator's
+| box with its feedback loop, drawn when FDBK > 0 (FDBK), and the index
+| envelope, a falling curve whose length follows the value (DECAY). Every
+| icon keeps two pixels clear of the box's dividers (23 Sep 2026: the first
+| icons carried M and C letters, ran to the edges and crowded the boxes). The
+| footer reads FM SYNTH>FLEX. Non-synth tracks and every other page draw
+| exactly as stock.
 |
 | HOW: the page descriptor resolver 0x40031da4(track, page kind) returns
 | tbl[machine] for the PLAYBACK page at 0x40031ece (`movel %a0@(0,%d0:l:4),%d0;
@@ -164,7 +168,7 @@ pg_fr_out:
         movel   %sp@+,%d2
         rts
 
-pg_fmt_decay:                            | tau = 2 s * (raw/127)^2: "HOLD", "32ms", "286ms", "1.1s", "2.0s"
+pg_fmt_decay:                            | tau = 2 s * (raw/127)^2: "HOLD", "32", "286", "1.1s", "2.0s"
         movel   %d2,%sp@-
         movel   %sp@(12),%d0             | raw
         beq     pg_fd_hold
@@ -178,8 +182,8 @@ pg_fmt_decay:                            | tau = 2 s * (raw/127)^2: "HOLD", "32m
         cmpil   #1000,%d0
         bcc     pg_fd_sec
         movel   %d0,%sp@-
-        pea     pg_f_ms(%pc)             | "%dms"
-        movel   %sp@(16),%sp@-
+        pea     FMT_D                    | "%d": the milliseconds alone -- the value field
+        movel   %sp@(16),%sp@-           | fits four characters and "598ms" ran into the divider
         jsr     SPRINTF
         lea     %sp@(12),%sp
         bra     pg_fd_out
@@ -320,13 +324,13 @@ pg_ic_fdbk:
         bsr     pg_or
         bra     pg_blit
 
-| DECAY: the index envelope -- an instant rise at column 0, then pg_env's
-| exponential fall stretched over L = 2 + value * 14 / 127 columns to the
-| floor (row 1 = I/16); value 0 holds, a flat top
+| DECAY: the index envelope -- an instant rise at column 1, then pg_env's
+| exponential fall stretched over L = 2 + value * 13 / 127 columns to the
+| floor (row 1 = I/16), columns 2..15; value 0 holds, a flat top
 pg_ic_decay:
         lea     pg_img_base(%pc),%a0
         bsr     pg_copy
-        moveq   #0,%d0
+        moveq   #1,%d0
         moveq   #1,%d1
         moveq   #11,%d2
         bsr     pg_vline                 | the attack edge
@@ -334,18 +338,19 @@ pg_ic_decay:
         tstl    %d6
         beq     pg_dc_go
         movel   %d6,%d5
-        moveq   #14,%d0
+        moveq   #13,%d0
         mulul   %d0,%d5
         moveq   #127,%d0
         divul   %d0,%d5
-        addql   #2,%d5                   | L, 2 .. 16 columns
+        addql   #2,%d5                   | L, 2 .. 15 columns
 pg_dc_go:
         moveq   #11,%d4                  | the previous height
-        moveq   #1,%d7                   | column
+        moveq   #2,%d7                   | column, 2 .. 15
 pg_dc_loop:
         movel   %d7,%d2
+        subql   #1,%d2
         lsll    #4,%d2
-        divul   %d5,%d2                  | i = c * 16 / L
+        divul   %d5,%d2                  | i = (c - 1) * 16 / L
         cmpil   #16,%d2
         ble     pg_dc1
         moveq   #16,%d2
@@ -359,7 +364,7 @@ pg_dc1:
         bsr     pg_vline                 | rows h .. previous: the outline
         movel   %a3,%d4
         addql   #1,%d7
-        cmpil   #16,%d7
+        cmpil   #15,%d7
         ble     pg_dc_loop
 
 | the blit: over the stock dial, at (x+1, y+7); inverted with the box when
@@ -427,8 +432,6 @@ pg_f_dd:
         .asciz  "%d.%02d"
 pg_f_d5:
         .asciz  "%d.5"
-pg_f_ms:
-        .asciz  "%dms"
 pg_f_s:
         .asciz  "%d.%ds"
 pg_f_hold:
@@ -493,69 +496,76 @@ pg_desc:
         .byte   0x40, 0x03, 0x8d, 0x94, 0x40, 0x03, 0x8d, 0xdc, 0x40, 0x03, 0x8d, 0x94, 0x40, 0x03, 0x8d, 0x94    | P+0x162
         .byte   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00    | P+0x172
         .byte   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x17, 0x51    | P+0x182
-        .long   0x55715751                      | P+0x18e
+        .long   0x55751751                      | P+0x18e: nibble s (from the LOW end, as 0x400a6994 shifts
+                                                | it) = slot s; stock 0x55311311 | 4 on 1 2 4 5 -- the first
+                                                | build set 0x55715751, RATE (s3) instead of FDBK (s4)
 pg_desc_end:
 
+| RATO: the two operators, a box each, the modulator feeding the carrier
 pg_img_ratio:
 |   .................
 |   .................
-|   ######.....######
-|   #....#.....#....#
-|   #.#.##.....#.##.#
-|   #.####...#.#.#..#
-|   #.#.#######.#...#
-|   #.#.##...#.#.#..#
-|   #.#.##.....#.##.#
-|   #....#.....#....#
-|   ######.....######
 |   .................
 |   .................
-        .long   0x3fe00000, 0x20200000, 0x2fa00000, 0x21200000
-        .long   0x2fa00000, 0x3fe00000, 0x02000000, 0x02000000
-        .long   0x02000000, 0x07000000, 0x02000000, 0x3de00000
-        .long   0x22200000, 0x2da00000, 0x28a00000, 0x20200000
-        .long   0x3fe00000
+|   ..####.....####..
+|   ..#..#..#..#..#..
+|   ..#..#...#.#..#..
+|   ..#..#######..#..
+|   ..#..#...#.#..#..
+|   ..#..#..#..#..#..
+|   ..####.....####..
+|   .................
+|   .................
+        .long   0x00000000, 0x00000000, 0x3f800000, 0x20800000
+        .long   0x20800000, 0x3f800000, 0x04000000, 0x04000000
+        .long   0x15000000, 0x0e000000, 0x04000000, 0x3f800000
+        .long   0x20800000, 0x20800000, 0x3f800000, 0x00000000
+        .long   0x00000000
 
+| FDBK: the modulator's box; pg_img_loop is OR'd over it when FDBK > 0
 pg_img_fdbk:
 |   .................
 |   .................
+|   .................
+|   .................
 |   .....#######.....
 |   .....#.....#.....
-|   .....#.#.#.#.....
-|   .....#.###.#.....
-|   .....#.#.#.#.....
-|   .....#.#.#.#.....
-|   .....#.#.#.#.....
+|   .....#.....#.....
+|   .....#.....#.....
+|   .....#.....#.....
 |   .....#.....#.....
 |   .....#######.....
 |   .................
 |   .................
         .long   0x00000000, 0x00000000, 0x00000000, 0x00000000
-        .long   0x00000000, 0x3fe00000, 0x20200000, 0x2fa00000
-        .long   0x21200000, 0x2fa00000, 0x20200000, 0x3fe00000
+        .long   0x00000000, 0x3f800000, 0x20800000, 0x20800000
+        .long   0x20800000, 0x20800000, 0x20800000, 0x3f800000
         .long   0x00000000, 0x00000000, 0x00000000, 0x00000000
         .long   0x00000000
 
+| the feedback loop: out of the box's right side, over the top, back into
+| its left side with an arrowhead
 pg_img_loop:
 |   .................
-|   ..#############..
-|   ..#...........#..
-|   ..#...........#..
-|   ..#...........#..
-|   ...#..........#..
-|   ..###.......###..
+|   ..############...
+|   ..#..........#...
+|   ..#..........#...
+|   ..#..........#...
+|   ..#..........#...
+|   ..##.........#...
+|   ..###.......##...
 |   ...#.............
 |   .................
 |   .................
 |   .................
 |   .................
-|   .................
-        .long   0x00000000, 0x00000000, 0x02f00000, 0x07100000
-        .long   0x02100000, 0x00100000, 0x00100000, 0x00100000
+        .long   0x00000000, 0x00000000, 0x07f00000, 0x0e100000
+        .long   0x04100000, 0x00100000, 0x00100000, 0x00100000
         .long   0x00100000, 0x00100000, 0x00100000, 0x00100000
-        .long   0x02100000, 0x02100000, 0x03f00000, 0x00000000
+        .long   0x04100000, 0x07f00000, 0x00000000, 0x00000000
         .long   0x00000000
 
+| the baseline of INDX and DEC: columns 1..15, a pixel clear of the box edges
 pg_img_base:
 |   .................
 |   .................
@@ -569,12 +579,12 @@ pg_img_base:
 |   .................
 |   .................
 |   .................
-|   #################
+|   .###############.
+        .long   0x00000000, 0x80000000, 0x80000000, 0x80000000
         .long   0x80000000, 0x80000000, 0x80000000, 0x80000000
         .long   0x80000000, 0x80000000, 0x80000000, 0x80000000
         .long   0x80000000, 0x80000000, 0x80000000, 0x80000000
-        .long   0x80000000, 0x80000000, 0x80000000, 0x80000000
-        .long   0x80000000
+        .long   0x00000000
 
         .align  4
 pg_end:

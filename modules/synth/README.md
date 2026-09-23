@@ -118,33 +118,37 @@ a **17×13 icon** in a RAM scratch (`pg_data`, 17 longs; the main OS runs
 from DRAM) and blits it over the dial at `(x+1, y+7)` with a full 13-row
 mask (`0xfff80000`), inverting rows 0–11 when the parameter is locked
 (`flags` bit 0; row 12 = `y+19` lies outside the stock highlight and stays
-empty in every icon). The icons (`page.s`, row 12 at the top; `#` = lit):
+empty in every icon). The icons (`page.s`, row 12 at the top; `#` = lit;
+redrawn 23 Sep 2026 -- the first set carried M and C letters, ran to the box
+edges and crowded the cells; every icon now keeps two columns clear of the
+dividers):
 
 ```
-RATO: M -> C              FDBK: the modulator      + its loop (value > 0)
-.................         .................        .................
-.................         .................        ..#############..
-######.....######         .....#######.....        ..#...........#..
-#....#.....#....#         .....#.....#.....        ..#...........#..
-#.#.##.....#.##.#         .....#.#.#.#.....        ..#...........#..
-#.####...#.#.#..#         .....#.###.#.....        ...#..........#..
-#.#.#######.#...#         .....#.#.#.#.....        ..###.......###..
-#.#.##...#.#.#..#         .....#.#.#.#.....        ...#.............
-#.#.##.....#.##.#         .....#.#.#.#.....        .................
-#....#.....#....#         .....#.....#.....        .................
-######.....######         .....#######.....        .................
-.................         .................        .................
-.................         .................        .................
+RATO: modulator -> carrier   FDBK: the modulator      + its loop (value > 0)
+.................            .................        .................
+.................            .................        ..############...
+.................            .................        ..#..........#...
+.................            .................        ..#..........#...
+..####.....####..            .....#######.....        ..#..........#...
+..#..#..#..#..#..            .....#.....#.....        ..#..........#...
+..#..#...#.#..#..            .....#.....#.....        ..##.........#...
+..#..#######..#..            .....#.....#.....        ..###.......##...
+..#..#...#.#..#..            .....#.....#.....        ...#.............
+..#..#..#..#..#..            .....#.....#.....        .................
+..####.....####..            .....#######.....        .................
+.................            .................        .................
+.................            .................        .................
 ```
 
-INDX: a baseline (row 0) and seven bars at columns 2 4 6 8 10 12 14 from
+INDX: a baseline (row 0, columns 1-15) and seven bars at columns 2 4 6 8 10 12 14 from
 row 1: the carrier (column 8) `11 − 3·v/127` tall, the ±1 sidebands
 `10·v/127`, ±2 `8·(v−20)/107` for v > 20, ±3 `6·(v−56)/71` for v > 56 — a
 Bessel-shaped cartoon (0: one bar; 32: carrier and ±1; 127: all seven).
-DEC: the baseline, an instant rise at column 0 (rows 1–11), then
+DEC: the baseline, an instant rise at column 1 (rows 1–11), then
 `pg_env[i]` = `11·e^(−i/5)` (11 9 7 6 5 4 3 3 2 2 1 …, the floor row 1 =
-I/16) stretched over `L = 2 + 14·v/127` columns (`i = 16·c/L`, clipped to
-16), drawn as the vertical runs between consecutive heights (an outline);
+I/16) stretched over `L = 2 + 13·v/127` columns 2–15 (`i = 16·(c−1)/L`,
+clipped to 16), drawn as the vertical runs between consecutive heights (an
+outline);
 v = 0 keeps `i = 0`, a flat top at row 11 — the index holds.
 
 **Formatters** (`fmt(buf, value)`, C convention, `sprintf` `0x40013a08`):
@@ -152,9 +156,11 @@ v = 0 keeps `i = 0`, a flat top at row 11 — the index holds.
 a copy of `sy_ratio` (`raw >> 2`, Q8) and prints `"%d"` when the fraction
 is 0, `"%d.5"` when it is .50, else `"%d.%02d"` (`0.25 0.5 0.75 1 1.01 1.25
 1.41 1.5 1.75 2 2.01 … 16`); `pg_fmt_decay` prints `HOLD` for 0, else
-`ms = (2000·raw² + 8064) / 16129` (τ = 2 s·(raw/127)², rounded) as `"%dms"`
-below 1000 and `"%d.%ds"` above (raw 8 → `8ms`, 16 → `32ms`, 48 → `286ms`,
-79 → `774ms`, 96 → `1.1s`, 127 → `2.0s`). Names are drawn by the renderer
+`ms = (2000·raw² + 8064) / 16129` (τ = 2 s·(raw/127)², rounded) as the
+milliseconds alone (`"%d"`) below 1000 and `"%d.%ds"` above (raw 8 → `8`,
+16 → `32`, 48 → `286`, 79 → `774`, 96 → `1.1s`, 127 → `2.0s`) -- the value
+field is four characters wide and the first build's `598ms` ran into the
+divider. Names are drawn by the renderer
 from the clone; the values are the Part's raw bytes, so locks, scenes and
 LFOs print what they hold.
 
@@ -171,7 +177,7 @@ build re-links the source there and refuses on a difference, `emit()`
 returns `b""` plus the one poke. The phase-2 voice cave is untouched and
 still floats. `REMIX=synth make cf`: **2,345 bytes changed** (was 1,153),
 the voice at `0x400d6b80`, **2,600 B of the third run left** as before
-(`build_synth_v3.log`); `REMIX=tim make cf`: **4,002 bytes changed** (was
+(`build_synth_v3.log`); `REMIX=tim make cf`: **3,992 bytes changed** (was
 2,810), the voice at `0x400d6e00`, the quantizer at `0x400d7500..`, **172 B
 of the third run left** as before (`build_tim_v3.log`); `out/mainos_cf.bin`
 ends as the `tim` build. Both keep the DSP payloads, dispatch and the FX2
