@@ -22,8 +22,8 @@
 | 0x4003d5xx, the knob handler 0x40055008 -- reaches the descriptor through it
 | (0x40031ee0 / 0x40031f28 tail-call it). The stub replays the lookup and, for
 | the FLEX descriptor of a track whose assigned FLEX slot (Part + 0x8f04a +
-| track*5 + 1) has a loaded settings record (0x100b14f0 + 0x448*slot, loaded
-| flag at +0x129 != -1) whose path's basename starts with "SYNTH", returns
+| track*5 + 1) has a settings record (0x100b14f0 + 0x448*slot) whose path's
+| basename starts with "SYNTH" -- loaded into flex RAM or not -- returns
 | pg_desc: the stock FLEX record (P..P+0x192) with only the names, the title,
 | the four A formatters (P+0xca), the four B widgets (P+0xfa) and the enable
 | nibbles (P+0x18e: 5/7 = bit 2 "always show the value") changed -- ranges,
@@ -51,7 +51,6 @@
         .set    SLOT_OFF, 0x8f04b        | Part: 0x8f04a + track*5 + machine (1 = FLEX)
         .set    SETTINGS_BASE, 0x100b14f0
         .set    SETTINGS_STRIDE, 0x448
-        .set    LOADED_OFF, 0x129
         .set    STOCK_WIDGET, 0x400479b4
         .set    BLIT, 0x400128a8
         .set    SPRINTF, 0x40013a08
@@ -82,9 +81,11 @@ pg_resolve:
         mulsl   %d2,%d4
         addil   #SETTINGS_BASE,%d4
         moveal  %d4,%a0                  | the slot's settings record; its path at +0
-        mvsb    %a0@(LOADED_OFF),%d4
-        addql   #1,%d4
-        beq     pg_r_done                | -1: nothing loaded
+        | (nothing else is tested: the byte at +0x129 the first build gated on as
+        | a "loaded" flag is the sample's QUANTIZED TRIG attribute, -1 = OFF for
+        | a sample loaded through the file browser -- the trig routine 0x40005102
+        | only chooses between an immediate and a quantized manual trig on it; an
+        | empty slot has an empty path and fails the name compare below)
         moveal  %a0,%a1                  | a1 = the file name (after the last '/')
         movel   #255,%d4
 pg_scan:

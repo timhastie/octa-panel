@@ -23,7 +23,7 @@ operators **M→C** (RATO), a **sideband spectrum** whose bars grow with the
 index (INDX), the modulator **with its feedback loop** when FDBK > 0, and the
 **index envelope**, a falling curve whose length follows the value (DEC; a
 flat top for HOLD). The footer reads **FM SYNTH▸FLEX**. Non-synth tracks and
-every other page draw byte for byte as stock. One pinned cave (1,948 bytes,
+every other page draw byte for byte as stock. One pinned cave (1,936 bytes,
 `page.s`) and one 6-byte poke; **UNFLASHED**, everything below measured under
 `ot_emu` through the virtual panel and the oracle, 22 Sep 2026; logs,
 screens, takes: `out/_agents/synth3/`.
@@ -60,9 +60,21 @@ So **one detour** presents the whole page:
 The marker test is phase 1's, on the **Part's assignment** rather than the
 playing voice: slot = `blob + part·6322 + 0x8f04a + track·5 + 1` (0-based;
 `0xff` none, `≥ 128` the recorder buffers → no), its settings record
-`0x100b14f0 + 0x448·slot` with the loaded flag `+0x129 ≠ −1`, the path at
-`+0` scanned (≤ 255 bytes) for the basename after the last `/`, compared
-with `SYNTH`. A sample lock on a step changes the voice, not the page.
+`0x100b14f0 + 0x448·slot`, the path at `+0` scanned (≤ 255 bytes) for the
+basename after the last `/`, compared with `SYNTH`; an empty slot has an
+empty path. **Nothing else is tested** — in particular not the byte at
+`+0x129`, which the first build of this phase gated on as a "loaded" flag
+(the phase-1 text's reading of the trig routine) and which is in fact the
+sample's **QUANTIZED TRIG attribute** (`−1` = OFF … 16 = 256; the editor
+`0x4006ed9e..edb2` steps it and clamps to −1..16, the trig routine
+`0x40005102` posts `0x400d8120[value]` for a quantized manual trig and
+trigs at once for −1). A sample loaded through the file browser has it OFF
+(0xff), a project-file slot carries whatever the project saved (the
+fixture's SYNTH slot: 0 = PLEN, which is why every phase-3 run passed), so
+the owner's browser-loaded SYNTH.wav drew the stock page while the voice
+played: **the page follows the assignment now, loaded into flex RAM or
+not, as the stock page shows the sample's name** (measured below, §6). A
+sample lock on a step changes the voice, not the page.
 
 **`pg_desc` is the stock FLEX record, `P..P+0x192`, with twelve spans
 changed** (`gen_page.py` generates it from the image and asserts the rest
@@ -148,25 +160,26 @@ LFOs print what they hold.
 
 ### Space, builds
 
-`page.s` links to **1,948 bytes** (code `+0x000..0x3ea`, strings, `pg_env`,
+`page.s` links to **1,936 bytes** (code `+0x000..0x3de`, strings, `pg_env`,
 the ratio table, the bitmap record, the mask, the scratch, the descriptor
 clone at `+0x4f8`, the four column images), **pinned at `0x400d24d0`** — the
-second zero run (2,064 B; 116 B left after it) — because the clone holds
+second zero run (2,064 B; 128 B left after it) — because the clone holds
 absolute pointers to the formatters and widgets; `PINNED_PAGE` in
 `manifest.py` is the ratified form (linked with `m68k-elf-as -mcpu=5475`,
 `ld -Ttext=0x400d24d0`, `objcopy -j .text`; `out/_agents/synth3/asm/`), the
 build re-links the source there and refuses on a difference, `emit()`
 returns `b""` plus the one poke. The phase-2 voice cave is untouched and
-still floats. `REMIX=synth make cf`: **2,353 bytes changed** (was 1,153),
+still floats. `REMIX=synth make cf`: **2,345 bytes changed** (was 1,153),
 the voice at `0x400d6b80`, **2,600 B of the third run left** as before
-(`build_synth.log`); `REMIX=tim make cf`: **4,010 bytes changed** (was
+(`build_synth_v3.log`); `REMIX=tim make cf`: **4,002 bytes changed** (was
 2,810), the voice at `0x400d6e00`, the quantizer at `0x400d7500..`, **172 B
-of the third run left** as before (`build_tim.log`); `out/mainos_cf.bin`
+of the third run left** as before (`build_tim_v3.log`); `out/mainos_cf.bin`
 ends as the `tim` build. Both keep the DSP payloads, dispatch and the FX2
 chooser byte-identical to stock (the CFONLY check).
 
 ### Measurements (all `out/_agents/synth3/`; the panel on 8593/8594,
-`--image mainos_synth_v2.bin` / the stock section, `--card` a fresh copy of
+`--image mainos_synth_v2.bin` (the first build; the shipped form differs
+only by the marker gate, §6) / the stock section, `--card` a fresh copy of
 phase 1's `synth8q.img`; `session3.py`, `remix.log`, `stock.log`, `shots/`)
 
 **1. The page.** Booted, [T8], [PLAYBACK]: the frames in the montage and
@@ -196,16 +209,18 @@ carries no PLAYBACK lock — so the highlight path (the stock invert plus the
 icon's own inversion) is by construction, not measured.
 
 **3. Boot A/B** (`ab/`; `tools/emu/ot_emu/oracle/drive.py --emu
-out/emu/ot_emu --image <stock | mainos_synth_v2.bin>`, the `inter` battery
-on the OTLIVE card): `peeks.txt` and `stderr.txt` byte-identical; `tx.bin`
-**18,297 vs 18,293 bytes** — with every LED-level pair (`0x3n <id>`)
+out/emu/ot_emu --image <stock | mainos_tim_v3.bin>`, the `inter` battery
+on the OTLIVE card; `ab/remix` is the first build, `ab/remix_v3` the
+shipped one): `peeks.txt` and `stderr.txt` byte-identical; `tx.bin`
+**18,297 vs 18,289 bytes** — with every LED-level pair (`0x3n <id>`)
 removed the streams are identical (**16,873 bytes: every LCD block and every
 LED row**), the final LCD frame and LED bitmaps are identical, and the
-difference is one fewer `3d 24` and `3d 25` each (65 → 64), the breathing
-pair whose phase against the battery's fixed windows shifted because the
-resolver now runs four more instructions per lookup (`ready` 277688.167 →
-.171 samples; `boot.log` 65,410 → 65,404 vectors acknowledged) — the same
-effect and the same size as the quantizer's loader detours
+difference is one fewer `3d 24`, `3d 25`, `3f 24`, `3f 25` each (65 → 64,
+66 → 65), the breathing pair whose phase against the battery's fixed
+windows shifted because the resolver now runs a few more instructions per
+lookup (the first build: 18,293 bytes, `3d 24`/`3d 25` alone; `ready`
+277688.167 → .171 samples, `boot.log` 65,410 → 65,404 vectors acknowledged)
+— the same effect and the same size as the quantizer's loader detours
 (`modules/quantizer/README.md` §5). No text, no state peek differs.
 
 **4. The sound is phase 2's.** PLAYBACK page, RATO +36 (ratio 2), INDX +64,
@@ -228,6 +243,23 @@ the `synth` remix's, T7 equal to stock) and measures the identical lines.
 mode_views" (the Makefile's SKIP); `verify_replaces` fails only on the eight
 MIDI SCENES remixes without the submodule (pre-existing).
 
+**6. A sample loaded through the file browser** (`browser_load.py`,
+`repro_v2.log` / `repro_v3.log`, `shots/repro_v2/`, `shots/repro_v3/`,
+`takes/repro_*`): the fixture booted, T8's PLAYBACK page and a take on the
+project-file slot 5; then double-tap [T8] → the FLEX slot list, DOWN ×2 →
+slot 7, RIGHT → `LOAD FILE TO FLEX 7`, DOWN ×36 → `SYNTH.wav`, YES (load),
+YES (assign: T8's slot byte `04 → 06`), NO NO, [PLAYBACK], a take. The new
+record reads `../AUDIO/SYNTH.wav`, `+0x128/9 = 01 ff`, `+0x134 = 0`, state
+record `00000002 00010100 …` — byte for byte what the owner's unit shows
+for its browser-loaded slot — and the fixture's project-file slot reads
+`+0x129 = 00`. With the first build (`repro_v2`) the pre-assigned page read
+`PTCH RATO INDX` and the browser-loaded page `PTCH STRT LEN` with the
+footer `PLAYBACK▸FLEX` (the owner's symptom, reproduced), while **both
+takes carried the voice** (261.626 Hz, spur −54 dB: the voice-side marker
+in `synth.s` never looked at `+0x129`). With the fix (`repro_v3`) both
+pages read the synth and both takes carry the voice (§6 numbers in
+`repro_v3.log`).
+
 ### What does not work, and what is left
 
 - **Four-character names**: `RATO`, `INDX`, `DEC` (Elektron's own for
@@ -243,6 +275,10 @@ MIDI SCENES remixes without the submodule (pre-existing).
   is the stock LOOP/SLIC/… page.
 - **The lock highlight with an icon** is unmeasured (no lock in the
   fixture); the icon inverts rows 0–11 to match the stock's rectangle.
+- **Correction to phase 1's table** ("refuses an unloaded slot (`+0x129 ==
+  −1`)"): that byte is QUANTIZED TRIG, and the branch trigs at once; a
+  sample's presence in flex RAM is not tested there. Phase 1's text below
+  is kept as written.
 - The boot A/B differs by the phase of one breathing LED pair (above).
 - The marker test runs on every descriptor resolve of a FLEX track (a path
   scan, ≤ 255 bytes) — UI-thread only.
