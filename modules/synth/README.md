@@ -53,6 +53,14 @@ the enable nibble through `0x400a6994(P+0x18a, P+0x18e, slot)`), the footer
 `PLAYBACK▸FLEX`), the knob handler (`0x40054cfe`) and the p-lock/CC paths.
 So **one detour** presents the whole page:
 
+The enable nibble of slot s (P+0x18e, nibble s from the LOW end): bit 0 =
+the encoder is live, bit 1 = the renderer's small arch bridging the slot to
+the one before it across the divider (stock 0x55311311 sets it on LEN and
+RTIM: STRT-LEN, RTRG-RTIM), bit 2 = always show the value. The clone uses
+0x55551551: always-show on RATO INDX FDBK DEC, no arches (the synth's slots
+are not pairs). The first build's 0x55715751 had RATE's always-show bit
+instead of FDBK's and kept the arches; both fixed 23 Sep 2026.
+
 | site | stock bytes (displaced) | written | stub |
 |---|---|---|---|
 | `0x40031ece` in the resolver `0x40031da4` | `2030 0c00 6002` — `movel %a0@(0,%d0:l:4),%d0; bras 0x40031ed6` | `4ef9 400d 24d0` — `jmp pg_resolve` | replays the load; if it produced the FLEX descriptor `0x400d31ae` and the track's assigned FLEX slot is a SYNTH, `d0 := pg_desc`; `jmp 0x40031ed6` (the resolver's epilogue restores d2–d5; d1/a0/a1 are C scratch, d6/d7/a2–a6 untouched) |
