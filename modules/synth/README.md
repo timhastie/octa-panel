@@ -53,6 +53,13 @@ the enable nibble through `0x400a6994(P+0x18a, P+0x18e, slot)`), the footer
 `PLAYBACK▸FLEX`), the knob handler (`0x40054cfe`) and the p-lock/CC paths.
 So **one detour** presents the whole page:
 
+In the compact layout (CHROMATIC / SLOTS / SLICES trig modes: the page's
+six boxes share the top half of the main screen with the keyboard or the
+slot grid) the renderer passes the widget flags bit 1 and the stock dial
+prints the value alone (0x40047a42); the widgets test that bit after the
+stock call and skip the icon -- the first build blitted it anyway and
+garbled the half-height boxes (23 Sep 2026).
+
 The enable nibble of slot s (P+0x18e, nibble s from the LOW end): bit 0 =
 the encoder is live, bit 1 = the renderer's small arch bridging the slot to
 the one before it across the divider (stock 0x55311311 sets it on LEN and
@@ -174,7 +181,7 @@ LFOs print what they hold.
 
 ### Space, builds
 
-`page.s` links to **1,936 bytes** (code `+0x000..0x3de`, strings, `pg_env`,
+`page.s` links to **1,948 bytes** (code `+0x000..0x3de`, strings, `pg_env`,
 the ratio table, the bitmap record, the mask, the scratch, the descriptor
 clone at `+0x4f8`, the four column images), **pinned at `0x400d24d0`** — the
 second zero run (2,064 B; 128 B left after it) — because the clone holds

@@ -227,7 +227,7 @@ EMAC-fixed Unicorn (`scripts/build_unicorn.sh`), `vendor/dsp56300` pinned to
   (slots 1/2 = 0..64 frames), not the emulator (tools/hw/ot_project.py
   trims/trim). A SYNTH.wav marker file (2 s of silence) lives in the rig
   at out/_agents/synth/audio/.
-  23 Sep 2026: plain icons (no letters, two columns clear of the dividers), DEC prints the ms alone (`598`, `1.1s`, `HOLD`), the always-show nibble moved from RATE to FDBK, the STRT-LEN / RTRG-RTIM arches (nibble bit 1) cleared; `out/mainos_cf.bin` rebuilt (3,992 B changed).
+  23 Sep 2026: plain icons (no letters, two columns clear of the dividers), DEC prints the ms alone (`598`, `1.1s`, `HOLD`), the always-show nibble moved from RATE to FDBK, the STRT-LEN / RTRG-RTIM arches (nibble bit 1) cleared, no icon in the compact CHROMATIC/SLOTS layout (widget flags bit 1); `out/mainos_cf.bin` rebuilt (4,000 B changed). OPEN: manual trigs from the [TRIG] keys are silent in the emulator (stock too; PLAY sounds) -- under investigation.
 
 ## Repo / process rules that matter
 

@@ -240,6 +240,9 @@ pg_wid:
         movel   %sp@(72),%sp@-
         jsr     STOCK_WIDGET
         lea     %sp@(28),%sp
+        movel   %sp@(64),%d0             | flags bit 1 = the compact layout (CHROMATIC trig mode's
+        btst    #1,%d0                   | half-height page: the stock prints the value alone at
+        bne     pg_wid_out               | 0x40047a42) -- no room for an icon, leave the box as drawn
         movel   %sp@(60),%d6             | value
         tstl    %d7
         beq     pg_ic_ratio
@@ -392,6 +395,7 @@ pg_blit1:
         pea     pg_bmp(%pc)
         jsr     BLIT
         lea     %sp@(16),%sp
+pg_wid_out:
         moveml  %sp@,%d2-%d7/%a2-%a6
         lea     %sp@(44),%sp
         rts
