@@ -569,15 +569,15 @@ tooltip (the readout under the bed went 13 Sep 2026). Nothing is remembered acro
 where the fader is on load and every few seconds while idle.
 
 **The flow, as on the unit** (manual 10.3; every step through the matrix,
-the Shift-click latches the FIRST key so one mouse can hold a chord; further clicks with Shift are plain presses on top of it, and Shift + A + click latches one more key for three-key holds; a click on a latched key lets it go):
+Shift HOLDS FUNCTION for as long as it is down, so Shift + click = a FUNC combination; Option-click (or A + click) latches any other key, green, until it is clicked again, Escape or Shift up):
 
-1. Shift-click **SCENE A**, click **TRIG 2**, click SCENE A again to let go:
+1. Option-click **SCENE A**, click **TRIG 2**, click SCENE A again to let go:
    scene 2 is in slot A (the Part byte `blob+0x8ed90` 0 -> 1, the page's
    fader's tooltip says `scenes 2 / 9`). While SCENE A is held the
    trig LEDs show the slots: red = the scene in this slot, green = the
    other slot's (1 and 9 after a load: rows `01 00 02`).
 2. The same with **SCENE B** + **TRIG 3**: `blob+0x8ed91` -> 2.
-3. **A scene lock**: hold SCENE A (Shift-click), turn a page encoder --
+3. **A scene lock**: hold SCENE A (Option-click), turn a page encoder --
    AMP page, knob D (VOL) down 64 detents -- and let go. The box draws
    inverted with the locked value while the key is held (manual 10.3.1),
    the Part's own VOL byte does not move (a lock, not an edit), and the
@@ -627,7 +627,7 @@ evidence is the last section of `KEYMAP.md`).
 key of a placed trig and turn a DATA ENTRY knob -- the box inverts with
 the locked value and the trig LED flashes (here: a green blink on the red
 LED twice a second, on the LED stream). **Remove a single lock by holding
-[TRIG] and pressing that knob.** In the page: Shift-click the trig key
+[TRIG] and pressing that knob.** In the page: Option-click the trig key
 (it latches, green), turn the encoder, then **double-click the encoder
 while the trig is latched** -- that is the encoder's push, sent as
 `/knob/press` (the panel's own report for the push switch: key-matrix row
@@ -644,7 +644,7 @@ push is bit 6. Measured: PTCH lock byte `0xff -> 0x45` on the turn,
 `-> 0xff` on the push, the step's trig mask unchanged; the lock bytes are
 `track record + 0x59 + slot` on the PLAYBACK page. TRIG LOCK CLEAR (trig
 held + PLAY, manual 12.9.10) clears all of a trig's locks and is a plain
-chord here (Shift-click the trig, click PLAY).
+chord here (Option-click the trig, click PLAY -- or hold Shift, which holds FUNCTION, and click the trig then PLAY).
 
 ## Limits
 

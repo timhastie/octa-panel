@@ -564,7 +564,23 @@ async function sendKnob(row, delta, note = "") {
 // then up on mouseup); the server keeps per-row state so the firmware sees a
 // real chord. Clicking a latched key again releases just that key; Shift
 // keyup, window blur or Escape release everything.
-let shiftHeld = false, aHeld = false;      // A (with Shift) = latch one more key
+// Modifiers (23 Sep 2026, per the owner): SHIFT HOLDS FUNCTION -- the moment
+// Shift goes down the FUNCTION key is held at the firmware (green), every
+// click meanwhile is a plain press on top of it (FUNC + PLAY = clear pattern,
+// FUNC + track = mute ...), and releasing Shift lets everything go. To HOLD
+// any other key (a trig for parameter locks, SCENE A for scene locks),
+// OPTION-click it (or hold A and click): it latches, green, until it is
+// clicked again, Escape, Shift up or the window loses focus.
+let shiftHeld = false, aHeld = false;
+const FUNC_KEY = [0x25, 5];
+function funcEl() {
+  return [...document.querySelectorAll(".k[data-id]")].find(el => { const k = keyOf(el); return k && k[0] === FUNC_KEY[0] && k[1] === FUNC_KEY[1]; });
+}
+function holdFunc() {
+  const el = funcEl();
+  if (!el || el.classList.contains("held") || el.classList.contains("down")) return;
+  el.classList.add("held"); sendKey(FUNC_KEY[0], FUNC_KEY[1], true);
+}
 document.addEventListener("mousedown", e => {
   const el = e.target.closest(".k[data-id]");
   if (!el) return;
@@ -583,12 +599,8 @@ document.addEventListener("mousedown", e => {
   if (el.classList.contains("held")) {         // already down at the firmware: this click lets go
     el.classList.remove("held"); sendKey(k[0], k[1], false); return;
   }
-  const shift = shiftHeld || e.shiftKey;     // e.shiftKey: Shift went down before the page had focus
-  // Shift-click latches the FIRST key (FUNC, say); further Shift-clicks are
-  // plain presses on top of it -- unless A is held as well, which latches
-  // that key too (FUNC + BANK held, then a plain click on a trig). A click on
-  // a latched key lets it go (handled above). 14 Sep 2026, per the owner.
-  if (shift && (!document.querySelector(".k.held") || aHeld)) {
+  if (shiftHeld || e.shiftKey) holdFunc();     // e.shiftKey: Shift went down before the page had focus
+  if (e.altKey || aHeld) {                     // Option-click (or A + click): latch this key
     el.classList.add("held"); sendKey(k[0], k[1], true); return;
   }
   el.classList.add("down");
@@ -611,7 +623,7 @@ function releaseHeld() {
 // "keydown"/"keyup" with e.key (WKWebView and Chrome agree on "Shift");
 // a held Shift may auto-repeat keydown on some systems, hence e.repeat.
 document.addEventListener("keydown", e => {
-  if (e.key === "Shift") { if (!e.repeat) shiftHeld = true; return; }
+  if (e.key === "Shift") { if (!e.repeat) { shiftHeld = true; holdFunc(); } return; }
   if (e.key === "a" || e.key === "A") { aHeld = true; return; }
   if (e.key === "Escape" && !e.repeat) releaseHeld();
 });
