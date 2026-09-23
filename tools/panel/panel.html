@@ -628,9 +628,11 @@ function releaseHeld(sel = ".k.held") {
 // a held Shift may auto-repeat keydown on some systems, hence e.repeat.
 document.addEventListener("keydown", e => {
   if (e.key === "Shift") { if (!e.repeat) { shiftHeld = true; holdFunc(); } return; }
-  if (e.key === "a" || e.key === "A") { aHeld = true; return; }
-  if (e.key === "z" || e.key === "Z") { zHeld = true; return; }
-  if (e.key === "Escape" && !e.repeat) releaseHeld();
+  // preventDefault: an unhandled keydown falls through WKWebView to the
+  // window's responder chain and macOS beeps on every auto-repeat.
+  if (e.key === "a" || e.key === "A") { e.preventDefault(); aHeld = true; return; }
+  if (e.key === "z" || e.key === "Z") { e.preventDefault(); zHeld = true; return; }
+  if (e.key === "Escape") { e.preventDefault(); if (!e.repeat) releaseHeld(); return; }
 });
 document.addEventListener("keyup", e => {
   if (e.key === "Shift") { shiftHeld = false; releaseHeld(); }

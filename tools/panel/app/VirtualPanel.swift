@@ -351,6 +351,17 @@ final class PanelServer {
 /// them. Every other drag -- text into the key-map drawer's fields -- goes
 /// to super, i.e. the page, as before.
 final class PanelWebView: WKWebView {
+    /// Keys the page does not consume would reach the window and beep
+    /// (the "unknown key" alert sound on every auto-repeat of a held Z);
+    /// the panel has no text fields, so swallow them here (23 Sep 2026).
+    override func keyDown(with event: NSEvent) {
+        super.keyDown(with: event)
+        // super forwards unhandled keys up the chain; nothing more to do --
+        // noResponder(for:) below is what turns the beep off.
+    }
+    override func noResponder(for eventSelector: Selector) {
+        if eventSelector != #selector(NSResponder.keyDown(with:)) { super.noResponder(for: eventSelector) }
+    }
     var onDropFiles: (([URL]) -> Void)?
 
     override init(frame: CGRect, configuration: WKWebViewConfiguration) {
