@@ -496,9 +496,13 @@ pg_desc:
         .byte   0x40, 0x03, 0x8d, 0x94, 0x40, 0x03, 0x8d, 0xdc, 0x40, 0x03, 0x8d, 0x94, 0x40, 0x03, 0x8d, 0x94    | P+0x162
         .byte   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00    | P+0x172
         .byte   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x17, 0x51    | P+0x182
-        .long   0x55751751                      | P+0x18e: nibble s (from the LOW end, as 0x400a6994 shifts
-                                                | it) = slot s; stock 0x55311311 | 4 on 1 2 4 5 -- the first
-                                                | build set 0x55715751, RATE (s3) instead of FDBK (s4)
+        .long   0x55551551                      | P+0x18e: nibble s (from the LOW end, as 0x400a6994 shifts
+                                                | it) = slot s; stock 0x55311311: bit 0 = the encoder is live,
+                                                | bit 1 (LEN, RTIM) = the arch the renderer draws bridging the
+                                                | slot to the one before it (STRT-LEN, RTRG-RTIM: cleared here,
+                                                | the pairs mean nothing to the voice), bit 2 = always show the
+                                                | value (set on 1 2 4 5). The first build set 0x55715751: RATE
+                                                | (s3) always shown instead of FDBK (s4)
 pg_desc_end:
 
 | RATO: the two operators, a box each, the modulator feeding the carrier
