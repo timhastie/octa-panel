@@ -96,6 +96,10 @@ import urllib.parse
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+# 23 Sep 2026: the app compares this with the file (an orphaned server from an
+# earlier session kept every later server-side fix out of the app for a week)
+SCRIPT_MTIME = os.path.getmtime(os.path.abspath(__file__))
+
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools")); import toolpath  # noqa: E402,F401
 
@@ -3838,6 +3842,8 @@ class Handler(BaseHTTPRequestHandler):
                             "sound_rt": p.sound_rt,         # O17: ... under --dsp-rt (real time); False = the lockstep --dsp (~0.2x) or no cores
                             "sound_note": p.sound_note,
                             "frame_always": p.frame_always, # 23 Sep 2026: frame mode on from boot (manual [TRIG] trigs sound while stopped)
+                            "pid": os.getpid(),             # 23 Sep 2026: so the app can retire a stale server it finds on the port
+                            "script_mtime": SCRIPT_MTIME,   # this file's mtime when the server started: older than the file = stale
                             "playing": p.playing,           # PLAY pressed, STOP not yet
                             # O19: the card
                             "card": str(p.card_file) if p.card_file else None,

@@ -246,6 +246,42 @@ final class PanelServer {
         Log.write("server pid \(p.processIdentifier) stopped (\(Self.ending(of: p)))")
     }
 
+    /// A server that already answers but runs older code than the repo's
+    /// tools/panel/panel_server.py: an orphan from an earlier session (the
+    /// 22 Sep 2026 quit crash left one from 15 Sep on the port, and every
+    /// launch since attached to it, so a week of server-side fixes never
+    /// reached the app). /status carries `script_mtime` since 23 Sep 2026;
+    /// no field = older still. Returns why it is stale, nil when current.
+    func staleReason(_ status: [String: Any]?) -> String? {
+        let path = repo.appendingPathComponent("tools/panel/panel_server.py").path
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let mod = attrs[.modificationDate] as? Date else { return nil }
+        guard let running = status?["script_mtime"] as? Double else {
+            return "it predates 23 Sep 2026 (no script_mtime in /status)"
+        }
+        if mod.timeIntervalSince1970 > running + 1 {
+            let f = DateFormatter(); f.dateFormat = "d MMM HH:mm"
+            return "its code is from \(f.string(from: Date(timeIntervalSince1970: running))), the file is from \(f.string(from: mod))"
+        }
+        return nil
+    }
+
+    /// SIGTERM a server this app did not spawn (its pid from /status; else
+    /// every panel_server.py on this port). The server flushes the card and
+    /// exits, as on quit.
+    func terminateForeign(pid: Int) {
+        if pid > 1 {
+            kill(pid_t(pid), SIGTERM)
+            Log.write("sent SIGTERM to the stale server pid \(pid)")
+            return
+        }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        p.arguments = ["-f", "panel_server.py --port \(port)"]
+        try? p.run(); p.waitUntilExit()
+        Log.write("pkill -f 'panel_server.py --port \(port)': status \(p.terminationStatus)")
+    }
+
     static let session: URLSession = {
         let c = URLSessionConfiguration.ephemeral
         c.requestCachePolicy = .reloadIgnoringLocalCacheData
@@ -808,6 +844,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         showPlaceholder("looking for a server on port \(server.port)")
         server.probe(timeout: 1.0) { [weak self] ok, status in
             guard let self = self, gen == self.probeGen else { return }   // superseded by a later Reload / Open Project
+            if ok, let why = self.server.staleReason(status) {
+                // an orphan running old code: retire it and start a fresh one
+                Log.write("the server on port \(self.server.port) is stale (\(why)): restarting it; status \(status ?? [:])")
+                self.showPlaceholder("restarting the panel server on port \(self.server.port): \(why)")
+                self.server.terminateForeign(pid: (status?["pid"] as? Int) ?? -1)
+                self.whenServerGone(gen: gen, tries: 60) { [weak self] in
+                    guard let self = self, gen == self.probeGen else { return }
+                    let card = self.cardPath()
+                    let project = card.map { FileManager.default.fileExists(atPath: $0.path) ? nil : self.projectDir() } ?? self.projectDir()
+                    self.launch(project: project, card: card)
+                }
+                return
+            }
             if ok {
                 self.server.attached = true
                 Log.write("a server already answers on port \(self.server.port): attaching (it stays up on quit); status \(status ?? [:])")
@@ -819,6 +868,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             // naming a new file) is created from the project the old default gives
             let project = card.map { FileManager.default.fileExists(atPath: $0.path) ? nil : self.projectDir() } ?? self.projectDir()
             self.launch(project: project, card: card)
+        }
+    }
+
+    /// Poll until nothing answers on the port (the retired server has exited),
+    /// then `then`; gives up after `tries` x 0.25 s and proceeds anyway (the
+    /// spawn's bind failure then says so in the log).
+    func whenServerGone(gen: Int, tries: Int, then: @escaping () -> Void) {
+        server.probe(timeout: 0.3) { [weak self] ok, _ in
+            guard let self = self, gen == self.probeGen else { return }
+            if !ok || tries <= 0 {
+                if ok { Log.write("the stale server on port \(self.server.port) is still answering; spawning anyway") }
+                then(); return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { self.whenServerGone(gen: gen, tries: tries - 1, then: then) }
         }
     }
 
