@@ -570,8 +570,9 @@ async function sendKnob(row, delta, note = "") {
 // FUNC + track = mute ...), and releasing Shift lets everything go. To HOLD
 // any other key (a trig for parameter locks, SCENE A for scene locks),
 // OPTION-click it (or hold A and click): it latches, green, until it is
-// clicked again, Escape, Shift up or the window loses focus.
-let shiftHeld = false, aHeld = false;
+// clicked again, Escape, Shift up or the window loses focus. Hold Z and
+// click: the key stays down only while Z is down (23 Sep 2026).
+let shiftHeld = false, aHeld = false, zHeld = false;   // Z: hold clicked keys until Z is released
 const FUNC_KEY = [0x25, 5];
 function funcEl() {
   return [...document.querySelectorAll(".k[data-id]")].find(el => { const k = keyOf(el); return k && k[0] === FUNC_KEY[0] && k[1] === FUNC_KEY[1]; });
@@ -600,6 +601,9 @@ document.addEventListener("mousedown", e => {
     el.classList.remove("held"); sendKey(k[0], k[1], false); return;
   }
   if (shiftHeld || e.shiftKey) holdFunc();     // e.shiftKey: Shift went down before the page had focus
+  if (zHeld) {                                 // Z held: this key stays down until Z is released
+    el.classList.add("held"); el.dataset.z = "1"; sendKey(k[0], k[1], true); return;
+  }
   if (e.altKey || aHeld) {                     // Option-click (or A + click): latch this key
     el.classList.add("held"); sendKey(k[0], k[1], true); return;
   }
@@ -613,9 +617,9 @@ document.addEventListener("mouseup", () => {
     if (k) sendKey(k[0], k[1], false);
   });
 });
-function releaseHeld() {
-  document.querySelectorAll(".k.held").forEach(el => {
-    el.classList.remove("held");
+function releaseHeld(sel = ".k.held") {
+  document.querySelectorAll(sel).forEach(el => {
+    el.classList.remove("held"); delete el.dataset.z;
     const k = keyOf(el);
     if (k) sendKey(k[0], k[1], false);
   });
@@ -625,13 +629,15 @@ function releaseHeld() {
 document.addEventListener("keydown", e => {
   if (e.key === "Shift") { if (!e.repeat) { shiftHeld = true; holdFunc(); } return; }
   if (e.key === "a" || e.key === "A") { aHeld = true; return; }
+  if (e.key === "z" || e.key === "Z") { zHeld = true; return; }
   if (e.key === "Escape" && !e.repeat) releaseHeld();
 });
 document.addEventListener("keyup", e => {
   if (e.key === "Shift") { shiftHeld = false; releaseHeld(); }
   if (e.key === "a" || e.key === "A") aHeld = false;
+  if (e.key === "z" || e.key === "Z") { zHeld = false; releaseHeld(".k.held[data-z]"); }   // let go of what Z held
 });
-window.addEventListener("blur", () => { shiftHeld = false; aHeld = false; releaseHeld(); });   // the keyup would never reach us
+window.addEventListener("blur", () => { shiftHeld = false; aHeld = false; zHeld = false; releaseHeld(); });   // the keyup would never reach us
 
 // encoders: wheel or vertical drag over a knob = detents on its matrix row.
 // Turns are coalesced (80 ms) since every /knob costs a 30 ms emulator run.

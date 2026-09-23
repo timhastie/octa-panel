@@ -569,7 +569,7 @@ tooltip (the readout under the bed went 13 Sep 2026). Nothing is remembered acro
 where the fader is on load and every few seconds while idle.
 
 **The flow, as on the unit** (manual 10.3; every step through the matrix,
-Shift HOLDS FUNCTION for as long as it is down, so Shift + click = a FUNC combination; Option-click (or A + click) latches any other key, green, until it is clicked again, Escape or Shift up):
+Shift HOLDS FUNCTION for as long as it is down, so Shift + click = a FUNC combination; Option-click (or A + click) latches any other key, green, until it is clicked again, Escape or Shift up; holding Z and clicking holds the key only while Z is down):
 
 1. Option-click **SCENE A**, click **TRIG 2**, click SCENE A again to let go:
    scene 2 is in slot A (the Part byte `blob+0x8ed90` 0 -> 1, the page's
