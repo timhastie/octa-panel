@@ -519,6 +519,8 @@ The cave's own work is 39 instructions a sample plus ~140 a frame, under
 the 1,500 target, and the same at +12 (phase 1: 361 at 0, 681 at +12). The
 stock renderer's part is what a playing FLEX track costs anyway.
 
+**7b. The settings-record bounds check (24 Sep 2026).** A start frame's name scan follows the voice struct's `+8` pointer; it is now scanned only when it lies inside the settings table (`0x100b14f0` + 136 x `0x448`), because on the unit RAM after power-on is garbage and a refused start leaves the previous value -- the emulator's zeroed RAM never showed it. Code +14 B, the tables moved to `+0x360` / `+0x564`, cave 1,700 B.
+
 **8. Stock behaviour untouched** (`ab/`): `tools/emu/ot_emu/oracle/drive.py
 --emu out/emu/ot_emu --image <stock | mainos_synth.bin>`: `ready.txt`,
 `steps.txt`, `stamps.txt`, `peeks.txt`, `txlen.txt`, **`tx.bin`** and

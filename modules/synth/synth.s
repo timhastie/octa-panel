@@ -56,8 +56,8 @@
 |
 | Position independent: OS absolutes and pc-relative references only.
 | Layout (fixed with .org): +0x000 sy_render (the kind-table entry) and the
-| ratio table (+0x30e), +0x350 sy_tab (257 x s16 sine, amplitude 0x4000 =
-| -6 dBFS), +0x554 the per-track state (8 x 40 bytes); 1,684 bytes.
+| ratio table (+0x31e), +0x360 sy_tab (257 x s16 sine, amplitude 0x4000 =
+| -6 dBFS), +0x564 the per-track state (8 x 40 bytes); 1,700 bytes.
 
         .text
         .set    VOICE_BASE, 0x800049d8
@@ -67,6 +67,8 @@
         .set    STOCK_RENDER, 0x40004008
         .set    FP_PTR, 0x800062a8       | the packer's per-track DSP parameter record
         .set    RS_PTR, 0x800062a4       | the packer's per-track render state
+        .set    SETTINGS_BASE, 0x100b14f0 | the sample settings records, 0x448 each, slots 0..135
+        .set    SETTINGS_SPAN, 0x24640    | 136 * 0x448
         .set    PITCH_TAB, 0x400aa294    | the stock 2^(x/12) curve, longs Q26 (index = PTCH word >> 5)
         .set    C4_INC, 25480119         | C4: 261.6256 / 44100 * 2^32
         .set    ENV_ONE, 0x01000000      | the index envelope's 1.0 (Q24)
@@ -113,6 +115,10 @@ sy_render:
         move.l  8(%a0,%d3.l),%a0         | the new voice's settings record
         move.l  %a0,%d3
         beq     sy_no
+        subi.l  #SETTINGS_BASE,%d3       | 24 Sep 2026: only a pointer INTO the settings table is
+        cmpi.l  #SETTINGS_SPAN,%d3       | scanned -- after power-on the unit's RAM holds garbage
+        bhs     sy_no                    | (the emulator's is zero) and a refused start leaves the
+                                         | old value: a wild read could fault the audio interrupt
         move.l  %a0,%a1                  | a1 = start of the file name
         move.l  #255,%d3
 sy_scan:
@@ -351,7 +357,7 @@ sy_ratio:
         .short  2304, 2560, 2816, 3072, 3328, 3584, 3840, 4096   | 9 10 11 12 13 14 15 16
 
 | ---- the sine table: 256 + 1 entries, s16, amplitude 0x4000 ---------------
-        .org    0x350
+        .org    0x360
 sy_tab:
         .short  0, 402, 804, 1205, 1606, 2006, 2404, 2801
         .short  3196, 3590, 3981, 4370, 4756, 5139, 5520, 5897
