@@ -2,7 +2,12 @@
 
 The first hardware candidate (23 Sep 2026): the two small ColdFire caves that
 touch only the main-OS section -- the pattern change option (CHAIN AFTER =
-DIRECT) and the SCALE row next to it in PROJECT > CONTROL > SEQUENCER. Build
+DIRECT; since 24 Sep 2026 the list's unused value 1, so a project saved by
+OCTATRICK1..3 with DIRECT (=17) loads as 256/16 and must be set again) and
+the SCALE row next to it in PROJECT > CONTROL > SEQUENCER (plus, since 24 Sep
+2026, the GLIDE row: without the synth module it only gives the CHROMATIC
+keys legato -- a second key while one is held changes the pitch without a
+restart -- there is no voice to glide). Build
 with `REMIX=jumpquant make cf` -> out/mainos_cf.bin, `BUILD=<n> VERSION=OCTATRICK<n>
 REMIX=jumpquant make image-cf` for the card / MIDI images (Tim calls the
 firmware OCTATRICK; the container's version field holds 10 characters, so

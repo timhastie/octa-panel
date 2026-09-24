@@ -1,11 +1,137 @@
-# Synth machine (phase 3: the page; phase 2: the FM voice; phase 1: the hollow voice)
+# Synth machine (phase 4: glide; phase 3: the page; phase 2: the FM voice; phase 1: the hollow voice)
 
+Phase 4 (24 Sep 2026) adds **GLIDE** -- the pitch slews toward a new PTCH
+instead of jumping, with the time set by the new PROJECT > CONTROL >
+SEQUENCER > GLIDE row (`modules/quantizer`, which also gives the CHROMATIC
+keys 303-style legato) -- **"Phase 4: glide"** below.
 Phase 3 (22 Sep 2026) makes the PLAYBACK page present the synth -- **"Phase 3:
 the page"** below. Phase 2 (22 Sep 2026) replaces phase 1's sine with a two-operator FM voice
 whose parameters are the FLEX PLAYBACK page's other slots -- **"Phase 2: the
 FM voice"** below has the design, the parameter map and the numbers. Phase
 1's text follows it as written (its record-layout guess is corrected in the
 phase-2 section and marked in place).
+
+---
+
+## Phase 4: glide
+
+**With GLIDE on, a synth voice's pitch does not jump to a new PTCH word,
+it slews there.** The setting is per project (PROJECT > CONTROL > SEQUENCER
+> GLIDE, OFF / 1..127, saved as `#SYNTH_GLIDE=n`; `modules/quantizer/
+README.md` "GLIDE and legato"), and what moves the target is anything that
+changes the track's PTCH without a voice start: a trigless trig or a slide
+trig with a PTCH lock, an LFO or a scene on PTCH, the PTCH knob on a
+sounding note, and -- with GLIDE on -- a CHROMATIC key pressed while
+another key of the track is held (the quantizer's legato hook takes the
+stock trigless-trig path, so the voice is not restarted and the AMP/filter
+envelopes are not retriggered). A voice START snaps to its own pitch: a
+fresh note never slides in from the previous one.
+
+**Where.** `sy_slew`, called once a frame on the second call right after
+the PTCH word is read (`mvz.w (%a4),%d6; bsr sy_slew`), returns the slewed
+word in d6, and everything after it -- the stock rate arithmetic
+(`0x4000409e..` copied), RATE, the carrier and modulator increments -- runs
+on the slewed word, so RATE and the locks keep working. The per-track state
+grew from 40 to 44 bytes: `S_CUR` (+40) is the current word in Q12. At a
+voice start (`sy_set`, the marker resolved) `S_CUR := PTCH << 12`. The
+setting is read through ONE accessor, `sy_glide` (d2 = track → d0), from
+the fixed address `GLIDE_AT = 0x400d2cdc` where the quantizer pins its
+byte (`glide.s`): this cave is position independent with ratified bytes
+and cannot know where the floating quantizer unit lands.
+
+**The lag.** `cur += (target − cur) · k` per frame (T = 16/44100 s =
+0.3628 ms), so τ = T/k. τ(g) = 10 ms · 100^((g−1)/126): **10 ms at 1, 31 ms
+at 32, 100 ms at 64, 320 ms at 96, 1.0 s at 127** (×10 every 63 steps). k
+in Q16 comes from the stock 2^x curve `PITCH_TAB` (`0x400aa294`, entry i =
+2·2^((i−512)/480), Q26): with e = 127 − g, x = e · log2(100)/126 = n + f
+(`3456` = the slope in Q16, n = the integer part, f the fraction),
+2^f = `PITCH_TAB[32 + 480 f]` and k = 23.78 · 2^n · 2^f =
+`((t >> 10) · 6087) >> (24 − n)` — 23 at 127 (τ 1.03 s), 218 at 64 (τ
+109 ms), 2378 at 1 (τ 10.0 ms). The step is `(|diff| >> 8) · k >> 8`
+(|diff| < 2^27, k < 2^12: no overflow; the sign handled outside), which
+settles within 0.7 word = 0.03 cent of the target at the slowest setting.
+GLIDE OFF: `S_CUR := target` every frame, so the rate is bit-identical to
+phase 3 and turning GLIDE on mid-note starts from where the note is. Cost:
+~40 instructions a frame per synth track, only with a voice on.
+
+**Space.** `synth.s` is now 1,892 bytes (was 1,700): `sy_glide` at +0x326,
+`sy_slew` +0x32e, the ratio table +0x3be, `sy_tab` +0x400 (`.balign`, the
+`.org 0x360` is gone), the state +0x604 (8 × 44). `PINNED` regenerated
+(linked at 0x400d7000 and 0x400d7300, identical). `REMIX=tim make cf`:
+4,301 bytes changed, the direct-jump cave at 0x400d6b80 (358 B, its
+index-1 form), this cave at 0x400d6d00, the page cave at 0x400d24d0
+(unchanged), the quantizer at 0x400d7480 (1,484 B), its tables at
+0x400d7a80/7b00/7b80, **168 B of the third run left** (was 172), the GLIDE
+byte at 0x400d2cdc (the second run: 112 B left between the page cave and it).
+
+### Measurements (24 Sep 2026, the panel on 8593, `--sound on`, T2 = SYNTH slot 5 of a copy of the OTLIVE card; the session scratchpad's `glide_audio2/3.py`, `glide_seq2.py`)
+
+The legato and glide numbers are in `modules/quantizer/README.md` ("GLIDE
+and legato", measurements 2-3): CHROMATIC [TRIG 13] held, [TRIG 16]
+pressed — GLIDE 1: the pitch reaches 95 % of the way in ~40 ms; GLIDE 64:
+63 % / 95 % at 126 / 326 ms (τ ≈ 100 ms); GLIDE 127: 947 / 2,387 ms (τ ≈
+1 s); OFF: a step; a single key starts at its own pitch (293.6 Hz in its
+first 10 ms bin); a sequenced trigless trig with a PTCH lock of +12 glides
+130.8 → 523.0 Hz with the same 120 / 320 ms; the AMP envelope (ATK 64) is
+not retriggered by the legato press.
+
+### AMP slot F (XVOL) -- looked at for a later parameter, not enabled
+
+Read from the stock disassembly for the question "could the AMP page's
+slot F hold a per-track parameter?" (24 Sep 2026; nothing here is changed
+by this build). The AMP descriptor is P = `0x400d3988` (E = `0x400d3950`,
+page kind 2 in the resolver `0x40031da4`; kind 1 is LFO): names `ATK HOLD
+REL VOL BAL XVOL` / `AMP SYNC ATCK FX1 FX2 TRIG`, defaults `0 127 127 64 64
+127`, counts 128 ×6, minimums 0, enable nibbles `P+0x18e = 0x11811111` and
+`P+0x18a = 0x111` — slot 5's nibble is **8** (bit 3 only: bit 0 "encoder
+live" clear, bit 2 "always show" clear), formatter A[5] = `0x4003b484`
+(prints `MIN` for 0, `MAX` otherwise), widget B[5] = `0x400475f8`, knob
+handler `P+0x12a+20` = `0x40032ba4` (a two-state switch through the
+detent accumulator `0x40032510`: turned down → 0, up → 127). So XVOL is
+the crossfader volume: **a scene-only MIN/MAX switch**, which is what the
+unit shows (editable while SCENE A/B is held, empty otherwise).
+
+- **Who reads the Part byte** (`base + 0x8ee9a + track·24 + 6 + 5`; the
+  4-page block is LFO +0, AMP +6, FX1 +12, FX2 +18): the frame builder's
+  packer copies every flat slot 6..31 of the block into the per-track
+  "current values" `0x80000810 + t·72` and the 32-slot staging halfwords
+  `0x80000a50 + t·64` (`0x4000c536..60`) when its "changed" bit is set,
+  so the byte does reach the DSP-bound AMP word 5 like any other AMP
+  slot. **The scene morph does not read it**: the frame builder keeps a
+  separate 10-entry A/B byte-pair array for XVOL at `0x800010d4` (filled
+  at apply-part `0x40009486` / `0x40009c68` and pattern change
+  `0x40002302`, written by the scene editor's XVOL cases `0x40053214`,
+  `0x400537f2`, `0x40053e5c`, `0x40054788`) and computes `0x80000c80[t] =
+  A·xf + B·(1−xf)` with **0x7f00 (127) standing in for an absent scene
+  lock** (`0x4000cd22..5e` one scene, `0x4000cefc..3e` both; both scenes
+  muted → all ten words forced to `0x7f00`, `0x4000cc84`); the voice code
+  `0x40004ddc` / `0x40004e56` then ships that word per track in the
+  mixer record (next to the mute bits). So with no scene lock the value is
+  127 regardless of the Part byte.
+- **A per-step lock on slot 5**: the frame builder's lock pass applies
+  the lock block `0x80001558 + t·32` to all 32 flat slots (`0x4000c5e0..`),
+  slot 17 included, into the staging record and `0x80000810` — the lock
+  reaches the DSP's AMP word 5 by the normal path. Whether the DSP's AMP
+  block reads that word is not traced (the crossfader volume it applies
+  comes from `0x80000c80`, above); and placing such a lock is not possible
+  from the panel: the knob handler `0x40055008` refuses a slot whose
+  nibble bit 0 is clear (`0x40055044`), and so does the parameter writer
+  `0x40054cd8` used by MIDI CC and the scene paths (`0x40054d20`, returns
+  −1) — only the scene editor's own XVOL cases write, into the A/B array.
+- **Enabling it as a 0..127 parameter** would take: nibble 8 → 5 (bits 0
+  and 2; 0xd keeps the scene bit 3, whose consumer was not found by
+  reference — `0x400323b8` returns the whole nibble to callers reached
+  through function pointers), the knob handler `0x40032ba4` → the plain
+  accumulator VOL/BAL use (`0x400328e4`), the formatter `0x4003b484` →
+  VOL's `0x4003c7a0` or 0 (plain number), the name at `E+0x4e+30` (already
+  `XVOL`, 4 characters + NUL), min/count/default (`E+0xa2+20` = 0,
+  `E+0xd2+20` = 128, `E+0x96+5` = 127: already a full range). The lock
+  editor and the packer then work as for VOL. What a CF-side consumer would
+  read: the Part byte (`0x80000810 + t·72 + 17` holds the current value
+  with locks applied) — the scene array is XVOL's and stays the crossfader
+  volume's, so a scene lock on the slot keeps its stock meaning (MIN/MAX
+  scene volume) rather than the new parameter's. The DSP's use of the AMP
+  word 5 remains the open question before repurposing the slot.
 
 ---
 

@@ -1,27 +1,26 @@
-| DIRECT JUMP -- ColdFire code cave (13 Sep 2026). GNU as, -mcpu=5475.
+| DIRECT JUMP -- ColdFire code cave (13 Sep 2026; 24 Sep 2026: index 1). GNU as,
+| -mcpu=5475.
 |
-| CHAIN AFTER gains an 18th value, DIRECT (index 17): a pattern selected
-| while the sequencer runs starts at the NEXT STEP, at the step count the
-| old pattern had reached, instead of at the old pattern's end. Everything
-| below rides the firmware's own arranger mechanism -- a queued pattern
-| carries a START STEP (0x80006630) and the tick handler carries an absolute
-| CHANGE-AT step (0x8000662c) -- so the switch itself (part, per-track
-| positions, LEDs, UI notices) is stock code.
+| CHAIN AFTER's value 1 -- the stock list's unused "1 step" (its setter skips it,
+| its loader bumps a saved 1 to 2) -- becomes DIRECT: a pattern selected while
+| the sequencer runs starts at the NEXT STEP, at the step count the old pattern
+| had reached, instead of at the old pattern's end. Everything below rides the
+| firmware's own arranger mechanism -- a queued pattern carries a START STEP
+| (0x80006630) and the tick handler carries an absolute CHANGE-AT step
+| (0x8000662c) -- so the switch itself (part, per-track positions, LEDs, UI
+| notices) is stock code. Every other reader of CHAIN AFTER sees DIRECT as
+| PAT.LEN because the manifest pokes the stock step table's entry 1 (0x400d80e0)
+| from 1 to -1; the label table's entry 1 (0x400b27ec) becomes stock's own
+| "DIRECT" string. No relocated tables, no widened clamps (the 13 Sep build put
+| DIRECT at an 18th index and carried both tables and six clamp pokes).
 |
-| Position independent: OS absolutes and pc-relative references only. The
-| two tables at +0x180 / +0x200 are read by stock code through `lea`
-| operands the manifest repoints (emit()); nothing in here names itself.
+| Position independent: OS absolutes and pc-relative references only.
 |
 | Layout (fixed with .org; the manifest's OFF_* constants are these):
 |   +0x000 dj_queue   hook target, jsr planted at 0x400a06d6 (the setter's
 |                     "transport running" branch), 12 bytes displaced
 |   +0x100 dj_apply   hook target, jsr planted at 0x400a44e2 (the tick
 |                     handler's boundary apply), 18 bytes displaced
-|   +0x180 dj_lens    CHAIN AFTER index -> steps, 18 longs (stock's 17 at
-|                     0x400d80dc, then -1 so every other reader treats
-|                     DIRECT as PAT.LEN)
-|   +0x200 dj_labels  CHAIN AFTER index -> label, 18 longs (stock's 17 at
-|                     0x400b27e8, then stock's own "DIRECT" at 0x400b6912)
 |
 | Sequencer state (docs/firmware/RTOS_FORK.md 8.3, and this module's README):
 |   0x800065bd/be  playing bank / pattern      0x800065bf/c0  queued bank / pattern
@@ -72,7 +71,7 @@ dj_q_change:
         bpl   dj_q_idx
         mvs.b   0x8000004e,%d0
 dj_q_idx:
-        cmpi.l  #17,%d0                 | DIRECT?
+        cmpi.l  #1,%d0                  | DIRECT? (index 1)
         bne   dj_q_rest
         mvz.w   0x800065b2,%d0          | steps the playing pattern has counted
         addq.l  #1,%d0                  | -> the next step boundary
@@ -154,17 +153,4 @@ dj_a_done:
         move.l  (%sp)+,%a0
         rts
 
-| ---- tables ------------------------------------------------------------------
-        .org    0x180
-dj_lens:                                | 0x400d80dc's seventeen, then DIRECT = PAT.LEN
-        .long   -1, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256
-        .long   -1
-
-        .org    0x200
-dj_labels:                              | 0x400b27e8's seventeen, then "DIRECT" (0x400b6912)
-        .long   0x400b5f62, 0x400b5771, 0x400b5f6b, 0x400b5780, 0x400b5f77
-        .long   0x400b5f71, 0x400b5f96, 0x400b5f6a, 0x400b5f70, 0x400b5f76
-        .long   0x400b5f7c, 0x400b5f82, 0x400b5f88, 0x400b5f8e, 0x400b5f94
-        .long   0x400b5f9b, 0x400b5fa2
-        .long   0x400b6912
 dj_end:

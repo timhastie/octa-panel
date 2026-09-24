@@ -15,6 +15,19 @@
 | With SCALE = OFF every detour replays what it displaced and does nothing
 | else; the setting byte lives in this unit (the main OS runs from DRAM).
 |
+| GLIDE (24 Sep 2026): a fifth SEQUENCER row, OFF / 1..127, the synth
+| machine's glide time (modules/synth: 10 ms at 1 .. 1 s at 127), saved as
+| "#SYNTH_GLIDE=n" after the SCALE line. The byte is qz_glide, pinned at a
+| fixed address in glide.s (the synth cave reads it as an OS absolute); this
+| unit reaches it by symbol, through qz_glide_of -- the ONE reader, so the
+| storage can move. With GLIDE on, a CHROMATIC key pressed while another key
+| of the track is held is a LEGATO note: the stock's trigless-trig path
+| (the FUNC + key path) is taken, so the voice is not restarted and only the
+| pitch changes (the synth glides to it), the old key's voice note-off is
+| suppressed, and the new key becomes the track's held key, so releasing the
+| first key does nothing and releasing the last one releases the note (the
+| 303 rule). Two more detours in the chromatic key handler, qz_leg1 / qz_leg2.
+|
 | Linked by the build at the address it lands on (modules/quantizer/
 | manifest.py names the sites); the only absolute references to itself are
 | the qz_names entries, which the linker resolves.
@@ -22,11 +35,24 @@
         .text
         .global qz_knob, qz_plock, qz_chrom, qz_draw, qz_ld_entry, qz_ld_line, qz_wr
         .global qz_get, qz_set, qz_lbl_scale, qz_scale
+        .global qz_get_glide, qz_set_glide, qz_lbl_glide, qz_leg1, qz_leg2
+        .set    HELD, 0x460d171d          | the chromatic key handler's held key per track (key + 1; 0 = none)
+        .set    FUNC_HELD, 0x46c7dd26
+        .set    MIDI_NOTE, 0x4003f3a8     | (track, note, velocity): the key's MIDI note out
+        .set    SPRINTF, 0x40013a08
+        .set    FMT_D, 0x400b465d         | "%d"
 
 | ---- the setting ---------------------------------------------------------------
 qz_scale:
         .byte   0                       | 0 = OFF, 1..24 = index into qz_masks / qz_names
         .balign 2
+
+| qz_glide_of: d0 := the GLIDE value, 0 = OFF, 1..127 (d2 = track, unused: the
+| setting is per project). The one place this unit reads the storage
+| (glide.s qz_glide, a fixed address; synth.s sy_glide is its twin).
+qz_glide_of:
+        mvz.b   qz_glide,%d0
+        rts
 
 | ---- the PTCH knob: jsr planted at 0x40055170 (the knob handler's store) -------
 | Registers there (read off 0x40055008): d2 = the clamped new value, d6 = the
@@ -37,18 +63,18 @@ qz_scale:
 qz_knob:
         lea     qz_scale(%pc),%a0
         mvz.b   (%a0),%d0
-        beq     qz_k_store              | OFF: stock
+        jbeq     qz_k_store              | OFF: stock
         tst.l   %d5                     | slot A only
-        bne     qz_k_store
+        jbne     qz_k_store
         tst.l   0x460d1684              | page kind 0 = PLAYBACK
-        bne     qz_k_store
+        jbne     qz_k_store
         move.l  0x16(%a3),%d1           | the slot's name: "PTCH" (not THRU / NEIGHBOR)
         cmpi.l  #0x50544348,%d1
-        bne     qz_k_store
+        jbne     qz_k_store
         move.l  %a4,%d1                 | delta: detents, signed
-        beq     qz_k_store
+        jbeq     qz_k_store
         mvz.b   %d6,%d2                 | start from the value the knob was turned from
-        bsr     qz_quant
+        jbsr     qz_quant
 qz_k_store:
         move.b  %d2,(%a2)               | displaced: the Part byte
         move.b  %d2,(%a5)               | displaced: its mirror
@@ -67,20 +93,20 @@ qz_plock:
         move.l  %a2,-(%sp)
         lea     qz_scale(%pc),%a2
         mvz.b   (%a2),%d0
-        beq     qz_p_done
+        jbeq     qz_p_done
         tst.l   %d5                     | slot A only
-        bne     qz_p_done
+        jbne     qz_p_done
         tst.l   0x460d1684              | PLAYBACK page only
-        bne     qz_p_done
+        jbne     qz_p_done
         move.l  0x16(%a3),%d1
         cmpi.l  #0x50544348,%d1         | "PTCH"
-        bne     qz_p_done
+        jbne     qz_p_done
         move.l  %fp,%d1                 | delta
-        beq     qz_p_done
+        jbeq     qz_p_done
         move.l  %d2,-(%sp)
         mvz.b   (0x59,%a0,%a1.l),%d2    | the step's lock before the store
         cmpi.l  #0xff,%d2
-        bne     qz_p_go                 | a lock: step from it
+        jbne     qz_p_go                 | a lock: step from it
         move.l  %d3,-(%sp)              | none: from the Part's PTCH
         move.l  %d4,-(%sp)
         movea.l 0x46c82456,%a2
@@ -105,7 +131,7 @@ qz_plock:
         move.l  (%sp)+,%d4
         move.l  (%sp)+,%d3
 qz_p_go:
-        bsr     qz_quant
+        jbsr     qz_quant
         move.l  %d2,%d4                 | the value the store and the mirror take
         move.l  (%sp)+,%d2
 qz_p_done:
@@ -139,18 +165,18 @@ qz_quant:
         subq.l  #1,%d5                  | d5 = its maximum (124)
         lea     qz_pcraw(%pc),%a0
         move.l  %d1,%d0                 | d0 = |delta| degrees to step
-        bpl     qz_k_loop
+        jbpl     qz_k_loop
         neg.l   %d0
 qz_k_loop:
         tst.l   %d1
-        bmi     qz_k_down
-        bsr     qz_k_up
-        bra     qz_k_next
+        jbmi     qz_k_down
+        jbsr     qz_k_up
+        jbra     qz_k_next
 qz_k_down:
-        bsr     qz_k_dn
+        jbsr     qz_k_dn
 qz_k_next:
         subq.l  #1,%d0
-        bne     qz_k_loop
+        jbne     qz_k_loop
         move.l  (%sp)+,%a1
         move.l  (%sp)+,%a0
         move.l  (%sp)+,%d7
@@ -170,14 +196,14 @@ qz_k_up:
 qz_k_up1:
         addq.l  #1,%d6
         cmp.l   %d5,%d6
-        bgt     qz_k_ret
+        jbgt     qz_k_ret
         move.l  %d6,%d7
         sub.l   %d4,%d7
         mvz.b   (%a0,%d7.l),%d7         | pitch class, 0xff between semitones
         cmpi.l  #12,%d7
-        bhs     qz_k_up1
+        jbcc     qz_k_up1
         btst    %d7,%d3
-        beq     qz_k_up1
+        jbeq     qz_k_up1
         move.l  %d6,%d2
 qz_k_ret:
         rts
@@ -186,14 +212,14 @@ qz_k_dn:
 qz_k_dn1:
         subq.l  #1,%d6
         cmp.l   %d4,%d6
-        blt     qz_k_ret
+        jblt     qz_k_ret
         move.l  %d6,%d7
         sub.l   %d4,%d7
         mvz.b   (%a0,%d7.l),%d7
         cmpi.l  #12,%d7
-        bhs     qz_k_dn1
+        jbcc     qz_k_dn1
         btst    %d7,%d3
-        beq     qz_k_dn1
+        jbeq     qz_k_dn1
         move.l  %d6,%d2
         rts
 
@@ -207,7 +233,7 @@ qz_k_dn1:
 qz_chrom:
         lea     qz_scale(%pc),%a0
         mvz.b   (%a0),%d0
-        beq     qz_c_replay
+        jbeq     qz_c_replay
         move.l  %d2,-(%sp)
         move.l  %d3,-(%sp)
         move.l  %d4,-(%sp)
@@ -220,22 +246,22 @@ qz_chrom:
 qz_c_loop:
         move.l  %d2,%d1
         sub.l   %d4,%d1
-        bmi     qz_c_hi
+        jbmi     qz_c_hi
         mvz.b   (%a0,%d1.l),%d0
         btst    %d0,%d3
-        bne     qz_c_found
+        jbne     qz_c_found
 qz_c_hi:
         move.l  %d2,%d1
         add.l   %d4,%d1
         cmpi.l  #24,%d1
-        bhi     qz_c_more
+        jbhi     qz_c_more
         mvz.b   (%a0,%d1.l),%d0
         btst    %d0,%d3
-        bne     qz_c_found
+        jbne     qz_c_found
 qz_c_more:
         addq.l  #1,%d4
         cmpi.l  #24,%d4
-        bls     qz_c_loop
+        jbls     qz_c_loop
         move.l  %d2,%d1                 | no degree at all: cannot happen (every mask has the root)
 qz_c_found:
         move.l  %d1,%a2
@@ -247,48 +273,138 @@ qz_c_replay:
         mvz.b   0x100b14cf,%d0          | displaced: the part
         rts
 
+| ---- GLIDE legato: two jmp detours in the same handler --------------------------
+| 0x4004fb94 keeps ONE held key per track (HELD + track = key + 1). Stock, a
+| press while a key is held first ends that key -- 0x4004fbfe..0x4004fc40: the
+| voice note-off (mailbox 0x46c80354[track] |= 0x40, which the frame builder
+| turns into the AMP release, 0x4000b4e4), the MIDI note-off (key + 71) and
+| held := 0 -- and then starts a new voice (0x4004fcb2: 0x40005030, cmd 0x1d,
+| bit 2 = start); a release of a key that is not the held one does nothing
+| (0x4004fbe6). With FUNC held (FUNC_HELD) stock skips the note-off and posts
+| a TRIGLESS trig instead (0x4004fc9c: mailbox |= 0x119, no bit 2: the staged
+| PTCH lock 0x46c7dfda + track*32 is applied at the next frame, 0x4000b75c,
+| and the voice is not restarted -- 0x4000b5a8 starts one only on bit 2).
+|
+| With GLIDE on, a press while a key is held takes that trigless path without
+| FUNC: the old key's MIDI note-off goes out as stock, the voice note-off does
+| not, and the NEW key becomes the held key (releasing the first key does
+| nothing, releasing the last one releases the note as stock). GLIDE off, FUNC
+| held, a release, or nothing held: stock, byte for byte.
+
+| 0x4004fbfe: `tstl 0x46c7dd26; bnes 0x4004fc44` (8 bytes) -> jmp qz_leg1.
+| d1 = the held key + 1 (nonzero here), d2 = track, d3 = the new key + 1
+| (0 on a release); d0/a0 are free (reloaded by the stock code that follows).
+qz_leg1:
+        tst.l   FUNC_HELD
+        jbne     qz_g1_skip              | FUNC held: stock skips the note-off block
+        tst.l   %d3
+        jbeq     qz_g1_stock             | a release: stock
+        mvs.b   0x8000004c,%d0
+        btst    #0,%d0
+        jbeq     qz_g1_stock             | audio-track trigs off: stock
+        jbsr     qz_glide_of
+        tst.l   %d0
+        jbeq     qz_g1_stock             | GLIDE OFF: stock (the note-off, then a fresh trig)
+        clr.l   -(%sp)                  | the old key's MIDI note-off, as stock's 0x4004fc24
+        move.l  %d1,%a0
+        pea     71(%a0)
+        move.l  %d2,-(%sp)
+        jsr     MIDI_NOTE
+        lea     12(%sp),%sp
+qz_g1_skip:
+        jmp     0x4004fc44              | no voice note-off; the held key stays for qz_leg2
+qz_g1_stock:
+        jmp     0x4004fc06
+
+| 0x4004fc94: `tstl 0x46c7dd26; beqs 0x4004fcb2` (8 bytes) -> jmp qz_leg2.
+| d2 = track, d3 = the new key + 1; the pitch is staged (0x4004fc84..fc90).
+| The legato press posts stock's own trigless word through 0x4004fc9c
+| (`mailbox |= 0x119`). Measured 24 Sep 2026: that word does not restart the
+| voice or the AMP envelope (a 64-step attack does not recur), but every
+| trig word -- this one, FUNC + key, a fresh note -- is followed by the same
+| 2.3 dB / 200 ms level step on the synth voice; posting 0x111 (mailbox bit
+| 3 dropped: frame flag 0x20, 0x4000b5fc, event-byte bit 3, 0x4000c662)
+| changed nothing about it, so the stock word is kept.
+qz_leg2:
+        tst.l   FUNC_HELD
+        jbne    qz_g2_trigless          | FUNC held: the stock trigless trig
+        jbsr    qz_glide_of
+        tst.l   %d0
+        jbeq    qz_g2_trig
+        lea     HELD,%a0
+        tst.b   (%a0,%d2.l)             | a key still held on this track (qz_leg1 kept it)?
+        jbeq    qz_g2_trig              | no: a fresh note, the stock trig
+        move.b  %d3,(%a0,%d2.l)         | legato: the new key is the held key
+qz_g2_trigless:
+        jmp     0x4004fc9c
+qz_g2_trig:
+        jmp     0x4004fcb2
+
 | ---- the SEQUENCER window ------------------------------------------------------
 | Its draw loop (0x40065b14) draws min(visible, count) rows but indexes the
 | label / getter tables from 0, so a fourth row could never scroll into
-| view: with the count grown to 4 (manifest poke) and 3 visible, start the
-| index at the list's scroll offset instead. jmp planted at 0x40065bca.
+| view: with the count grown to 5 (manifest poke; SCALE, GLIDE) and 3
+| visible, start the index at the list's scroll offset instead. jmp planted
+| at 0x40065bca.
 qz_draw:
         move.l  0x460e43d8,%d2          | the list state's scroll offset
         lsl.l   #2,%d2                  | -> byte index into the pointer tables
         lea     32(%sp),%sp             | displaced
         jmp     0x40065bd0
 
-| The fourth row's getter and setter, reached through the grown tables
-| (labels 0x400b27d0, getters 0x400b27dc, setters 0x400b282c). The setter is
-| jumped to with (delta, wrap) at 4(%sp) / 8(%sp) exactly like CHAIN AFTER's
-| 0x400659ec: the LEVEL knob passes its detents (x7 with FUNC) and wrap = 0,
-| [YES] passes (1, 1).
+| The fourth and fifth rows' getters and setters, reached through the grown
+| tables (labels 0x400b27d0, getters 0x400b27dc, setters 0x400b282c). A getter
+| returns the value's string (C scratch d0/d1/a0/a1). A setter is jumped to
+| with (delta, wrap) at 4(%sp) / 8(%sp) exactly like CHAIN AFTER's 0x400659ec:
+| the LEVEL knob passes its detents (x7 with FUNC) and wrap = 0, [YES] passes
+| (1, 1); qz_set_any takes the byte in a0 and its maximum in d1.
 qz_get:
         lea     qz_scale(%pc),%a0
         mvz.b   (%a0),%d0
         lea     qz_names(%pc),%a0
         move.l  (%a0,%d0.l*4),%d0
         rts
+qz_get_glide:                           | "OFF", or the number printed into qz_gbuf
+        jbsr     qz_glide_of             | (d2 is the draw loop's index, not a track: ignored)
+        tst.l   %d0
+        jbne     qz_gg_num
+        lea     qz_n0(%pc),%a0
+        move.l  %a0,%d0
+        rts
+qz_gg_num:
+        move.l  %d0,-(%sp)
+        pea     FMT_D
+        pea     qz_gbuf(%pc)
+        jsr     SPRINTF
+        lea     12(%sp),%sp
+        lea     qz_gbuf(%pc),%a0
+        move.l  %a0,%d0
+        rts
 qz_set:
         lea     qz_scale(%pc),%a0
+        moveq   #24,%d1
+        jbra     qz_set_any
+qz_set_glide:
+        lea     qz_glide,%a0
+        moveq   #127,%d1
+qz_set_any:
         mvz.b   (%a0),%d0
         add.l   4(%sp),%d0
-        moveq   #24,%d1
         tst.l   8(%sp)
-        beq     qz_s_clamp
-        cmp.l   %d1,%d0                 | wrap: past the last scale -> OFF, before OFF -> the last
-        bgt     qz_s_zero
+        jbeq     qz_s_clamp
+        cmp.l   %d1,%d0                 | wrap: past the maximum -> OFF, before OFF -> the maximum
+        jbgt     qz_s_zero
         tst.l   %d0
-        bge     qz_s_store
+        jbge     qz_s_store
         move.l  %d1,%d0
-        bra     qz_s_store
+        jbra     qz_s_store
 qz_s_clamp:
         cmp.l   %d1,%d0
-        ble     qz_s_low
+        jble     qz_s_low
         move.l  %d1,%d0
 qz_s_low:
         tst.l   %d0
-        bge     qz_s_store
+        jbge     qz_s_store
 qz_s_zero:
         moveq   #0,%d0
 qz_s_store:
@@ -298,15 +414,18 @@ qz_s_store:
 | ---- the project file ------------------------------------------------------------
 | The loader 0x400866c4 reads project.work line by line; a line starting
 | with '#' is skipped at 0x400867a2 before any key is compared, on stock
-| firmware too. Ours: "#SEQUENCER_SCALE=n". Entry (jmp at 0x400866cc): a
-| storing pass (second argument != 0) starts from OFF, so a project saved
-| without the line loads as OFF. Line (jmp at 0x400867a2): d3 = the line;
-| d0/d1 must hold its first character when stock continues at 0x400867aa.
+| firmware too. Ours: "#SEQUENCER_SCALE=n" and "#SYNTH_GLIDE=n". Entry (jmp at
+| 0x400866cc): a storing pass (second argument != 0) starts from OFF, so a
+| project saved without the lines loads as OFF. Line (jmp at 0x400867a2):
+| d3 = the line; d0/d1 must hold its first character when stock continues at
+| 0x400867aa.
 qz_ld_entry:
         move.l  1472(%sp),%d6           | displaced
         move.l  1476(%sp),%d0           | displaced
-        beq     qz_e_back               | parse-only pass: leave the setting
+        jbeq     qz_e_back               | parse-only pass: leave the settings
         lea     qz_scale(%pc),%a0
+        clr.b   (%a0)
+        lea     qz_glide,%a0
         clr.b   (%a0)
 qz_e_back:
         jmp     0x400866d4
@@ -316,52 +435,81 @@ qz_ld_line:
         mvs.b   %d1,%d0                 | displaced
         moveq   #35,%d5                 | displaced: '#'
         cmp.l   %d0,%d5
-        bne     qz_l_back
+        jbne     qz_l_back
         move.l  %d3,%a0
         lea     qz_key(%pc),%a1
-qz_l_cmp:
-        mvz.b   (%a1)+,%d0
-        beq     qz_l_ours
-        mvz.b   (%a0)+,%d5
-        cmp.l   %d0,%d5
-        beq     qz_l_cmp
+        jbsr     qz_l_cmp
+        jbeq     qz_l_scale
+        move.l  %d3,%a0
+        lea     qz_key2(%pc),%a1
+        jbsr     qz_l_cmp
+        jbeq     qz_l_glide
         moveq   #35,%d5                 | another comment: stock skips it
         mvs.b   %d1,%d0
 qz_l_back:
         jmp     0x400867aa
-qz_l_ours:
-        moveq   #0,%d0                  | decimal after the '='
+qz_l_cmp:                               | Z := the line at a0 starts with the key at a1 (a0 past it)
+        mvz.b   (%a1)+,%d0
+        jbeq     qz_l_c_ret
+        mvz.b   (%a0)+,%d5
+        cmp.l   %d0,%d5
+        jbeq     qz_l_cmp
+qz_l_c_ret:
+        rts
+qz_l_scale:
+        jbsr     qz_l_dec
+        cmpi.l  #24,%d0
+        jbls     qz_l_ok
+        moveq   #0,%d0                  | out of range: OFF
+qz_l_ok:
+        lea     qz_scale(%pc),%a0
+        jbra     qz_l_store
+qz_l_glide:
+        jbsr     qz_l_dec
+        cmpi.l  #127,%d0
+        jbls     qz_l_gok
+        moveq   #0,%d0
+qz_l_gok:
+        lea     qz_glide,%a0
+qz_l_store:
+        tst.l   58(%sp)                 | parse-only pass: nothing is stored
+        jbne     qz_l_next
+        move.b  %d0,(%a0)
+qz_l_next:
+        jmp     0x40088224              | the loop's next line
+qz_l_dec:                               | d0 := the decimal at a0 (after the '=')
+        moveq   #0,%d0
         moveq   #10,%d5
 qz_l_dig:
         mvz.b   (%a0)+,%d1
         subi.l  #48,%d1
         cmpi.l  #9,%d1
-        bhi     qz_l_num
+        jbhi     qz_l_d_ret
         mulu.l  %d5,%d0
         add.l   %d1,%d0
-        bra     qz_l_dig
-qz_l_num:
-        cmpi.l  #24,%d0
-        bls     qz_l_ok
-        moveq   #0,%d0                  | out of range: OFF
-qz_l_ok:
-        tst.l   58(%sp)                 | parse-only pass: nothing is stored
-        bne     qz_l_next
-        lea     qz_scale(%pc),%a0
-        move.b  %d0,(%a0)
-qz_l_next:
-        jmp     0x40088224              | the loop's next line
+        jbra     qz_l_dig
+qz_l_d_ret:
+        rts
 
 | The writer 0x40088882.. prints one "KEY=%d\r\n" per setting: a4 = sprintf
 | (buffer d2, format, value), a3 = strlen, a2 = write (file d3). jmp planted
 | at 0x400888aa, the start of PATTERN_CHANGE_AUTO_SILENCE_TRACKS's line, so
-| ours follows PATTERN_CHANGE_CHAIN_BEHAVIOR. A failed write is not checked
+| ours follow PATTERN_CHANGE_CHAIN_BEHAVIOR. A failed write is not checked
 | here; the stock line that follows checks its own.
 qz_wr:
         lea     qz_scale(%pc),%a0
         mvz.b   (%a0),%d0
+        lea     qz_fmt(%pc),%a0
+        jbsr     qz_wr_line
+        jbsr     qz_glide_of             | (d2 = the writer's buffer, not a track: the accessor ignores it)
+        lea     qz_fmt2(%pc),%a0
+        jbsr     qz_wr_line
+        mvs.b   0x8000004f,%d1          | displaced
+        move.l  %d1,-(%sp)              | displaced
+        jmp     0x400888b2
+qz_wr_line:                             | sprintf(buf, a0, d0); write(file, buf, strlen(buf))
         move.l  %d0,-(%sp)
-        pea     qz_fmt(%pc)
+        move.l  %a0,-(%sp)
         move.l  %d2,-(%sp)
         jsr     (%a4)
         move.l  %d2,-(%sp)
@@ -371,15 +519,17 @@ qz_wr:
         move.l  %d3,-(%sp)
         jsr     (%a2)
         lea     28(%sp),%sp
-        mvs.b   0x8000004f,%d1          | displaced
-        move.l  %d1,-(%sp)              | displaced
-        jmp     0x400888b2
+        rts
 
 | ---- data ------------------------------------------------------------------------
 qz_key:         .asciz  "#SEQUENCER_SCALE="
 qz_fmt:         .asciz  "#SEQUENCER_SCALE=%d\r\n"
+qz_key2:        .asciz  "#SYNTH_GLIDE="
+qz_fmt2:        .asciz  "#SYNTH_GLIDE=%d\r\n"
 qz_lbl_scale:   .asciz  "SCALE"
+qz_lbl_glide:   .asciz  "GLIDE"
         .balign 4
+qz_gbuf:        .fill   8, 1, 0          | the GLIDE row's number (RAM)
 qz_names:                               | index 0..24 -> label, 7 characters at most (the value column is 33 px wide)
         .long   qz_n0, qz_n1, qz_n2, qz_n3, qz_n4, qz_n5, qz_n6, qz_n7, qz_n8, qz_n9, qz_n10, qz_n11, qz_n12, qz_n13, qz_n14, qz_n15, qz_n16, qz_n17, qz_n18, qz_n19, qz_n20, qz_n21, qz_n22, qz_n23, qz_n24
 qz_n0:  .asciz  "OFF"

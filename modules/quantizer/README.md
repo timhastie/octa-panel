@@ -12,12 +12,24 @@ Digitakt / Digitone scale quantizer, on the Octatrack's own parameters.
 else. The setting is saved with the project and comes back after a cold
 boot. RATE is a playback rate, not a semitone quantity, and is left alone.
 
-One linked ColdFire unit (1,292 bytes, floating, linked by the build at
-the address it lands on), seven detours, three grown pointer tables, one
+**24 Sep 2026: a fifth row, GLIDE** (OFF, 1..127) — the SYNTH machine's
+glide time (`modules/synth`: 10 ms at 1, 100 ms at 64, 1 s at 127) and,
+with it on, **303-style legato on the CHROMATIC keys**: a key pressed while
+another key of the same track is still held does not restart the voice, it
+only moves the pitch (which the synth then glides to); releasing the first
+key does nothing, releasing the last one releases the note. Saved as
+`#SYNTH_GLIDE=n` after the SCALE line. Section "GLIDE and legato" below.
+
+One linked ColdFire unit (1,484 bytes, floating, linked by the build at
+the address it lands on; 1,292 bytes before GLIDE — the unit now assembles
+its branches with the `jb<cc>` forms, short where they reach), one pinned
+4-byte unit (the GLIDE byte), nine detours, three grown pointer tables, one
 poke — all in the main-OS section; the bootstrap and every flash-
-programming path are untouched. **UNFLASHED**; everything below is
-measured under `ot_emu` through the virtual panel, 13 Sep 2026. Logs and
-screens: `out/_agents/quantizer/`.
+programming path are untouched. The SCALE half was **flashed** as
+OCTATRICK1..3 (23-24 Sep 2026) and works on the unit; the GLIDE half is
+measured under `ot_emu` through the virtual panel only (24 Sep 2026). The
+13 Sep measurements below are the SCALE half's; logs and screens:
+`out/_agents/quantizer/`.
 
 ## The scales
 
@@ -104,6 +116,8 @@ stock bytes before anything is written (`manifest.py`).
 | `0x40055170` knob handler `0x40055008`, the store | `1482 1a82 320e` — `move.b %d2,(%a2); move.b %d2,(%a5); move.w %fp,%d1` | jsr | `qz_knob` | the three, after recomputing d2 |
 | `0x40050e60` p-lock editor, the lock store | `1384 8859 73b9 100b14cc` — `move.b %d4,(0x59,%a1,%a0.l); mvz.b 0x100b14cc,%d1` | jsr + 2 nops | `qz_plock` | the two (the store as `(0x59,%a0,%a1.l)`, the same address), after recomputing d4 |
 | `0x4004fc58` CHROMATIC key → pitch | `45f2 ac04 71b9 100b14cf` — `lea (4,%a2,%a2.l*4),%a2; mvz.b 0x100b14cf,%d0` | jsr + 2 nops | `qz_chrom` | the two, after snapping a2 |
+| `0x4004fbfe` CHROMATIC key handler, the note-off gate | `4ab9 46c7dd26 663e` — `tst.l 0x46c7dd26; bne 0x4004fc44` | jmp + nop | `qz_leg1` | the FUNC test; with GLIDE on and a key held: the old key's MIDI note-off, `jmp 0x4004fc44` (no voice note-off); else `jmp 0x4004fc06` / `0x4004fc44` as stock |
+| `0x4004fc94` the same handler, sample trig vs trigless | `4ab9 46c7dd26 6716` — `tst.l 0x46c7dd26; beq 0x4004fcb2` | jmp + nop | `qz_leg2` | the FUNC test; with GLIDE on and a key held: held := the new key, `jmp 0x4004fc9c` (the trigless trig); else `jmp 0x4004fcb2` / `0x4004fc9c` as stock |
 | `0x40065bca` SEQUENCER draw loop | `4282 4fef 0020` — `clr.l %d2; lea 32(%sp),%sp` | jmp | `qz_draw` | the `lea`; d2 := scroll offset × 4; `jmp 0x40065bd0` |
 | `0x400866cc` project loader entry | `2c2f 05c0 202f 05c4` — `move.l 1472(%sp),%d6; move.l 1476(%sp),%d0` | jmp + nop | `qz_ld_entry` | both; `jmp 0x400866d4` |
 | `0x400867a2` project loader, the `#` check | `122f 048f 7101 7a23` — `move.b 1167(%sp),%d1; mvs.b %d1,%d0; moveq #35,%d5` | jmp + nop | `qz_ld_line` | the three; `jmp 0x400867aa` (or `0x40088224`, next line, when the line is ours) |
@@ -169,6 +183,125 @@ pushed; `qz_chrom`: d0, d1; `qz_quant` saves all but d2); ColdFire
 `movem` has no `-(sp)` form, so the saves are plain pushes. The unit
 uses only ISA_A+ forms the stock code itself uses (`mvs/mvz`, `btst
 Dn,Dy`, long compares, `mulu.l Dy,Dx`).
+
+## GLIDE and legato (24 Sep 2026)
+
+**The row.** `PROJECT > CONTROL > SEQUENCER`, [DOWN] ×4: `GLIDE OFF`; the
+LEVEL knob steps it 1..127 (clamped), [YES] steps with wrap-around
+(127 → OFF). The count poke is now `pea 3` → `pea 5` (the window scrolls
+its three rows over five: CHAIN AFTER, SILENCE TRACKS, LFO AUTO CHANGE,
+SCALE, GLIDE), the three grown tables carry two entries each
+(`qz_lbl_glide` / `qz_get_glide` / `qz_set_glide`; `qz_set_any` is the
+shared clamp-or-wrap tail, a0 = the byte, d1 = its maximum). The getter
+prints the number with the firmware's `sprintf` (`0x40013a08`, `"%d"` at
+`0x400b465d`) into a buffer in the unit.
+
+**The byte.** `qz_glide` is **pinned at `0x400d2cdc`** (`glide.s`, a
+4-byte `Linked` unit; the last long of the second zero run
+`0x400d24d0..0x400d2ce0`, whose start holds the synth's page cave) because
+two units read it: this one by symbol (the build's link resolves it) and
+the synth voice cave, which is position independent with ratified bytes and
+therefore reads an OS absolute. Each unit has ONE accessor (`qz_glide_of`
+here, `sy_glide` in `synth.s`: d2 = track → d0 = 0..127), so the storage can
+move — the AMP page's XVOL slot was considered and rejected for this
+build (`modules/synth/README.md`, "AMP slot F").
+
+**The project line.** `qz_wr` prints `#SEQUENCER_SCALE=%d` then
+`#SYNTH_GLIDE=%d` (a shared `qz_wr_line`); `qz_ld_line` matches either key
+(`qz_l_cmp`) and clamps 0..24 / 0..127 (else OFF); `qz_ld_entry` clears
+both bytes for a storing load. A stock unit skips both lines.
+
+**Legato.** The CHROMATIC key handler `0x4004fb94(track, key 0..24,
+press)` keeps ONE held key per track at `0x460d171d + track` (key + 1, 0 =
+none; the MIDI note out is key + 71, sent at `0x4004fd62` on the press and
+matched on release at `0x4004fbe6`: a release of any other key returns at
+once). Stock, a press while a key is held first ends that key at
+`0x4004fbfe..0x4004fc40` — mailbox `0x46c80354[track] |= 0x40` (the frame
+builder's note-off, `0x4000b4e4`: the voice state `0x80004858[...] := 4`,
+i.e. the AMP release), the MIDI note-off, `held := 0` — then starts a new
+voice at `0x4004fcb2` (`0x40005030`, cmd `0x1d`: bit 2 = start). With FUNC
+held (`0x46c7dd26`) stock skips the note-off and posts a TRIGLESS trig at
+`0x4004fc9c` instead (mailbox `|= 0x119`, no bit 2: the frame builder
+applies the staged PTCH lock `0x46c7dfda + track*32` to the track's lock
+block at `0x4000b75c` and starts no voice — `0x4000b5a8` starts one only
+on bit 2). `qz_leg1` / `qz_leg2` take that path without FUNC when GLIDE is
+on and a key is held: the MIDI note-off of the old key still goes out
+(external gear sees stock's note sequence), the voice note-off does not,
+and the new key becomes the held key (its release ends the note as stock;
+the old key's release matches nothing). GLIDE OFF, FUNC held, a release, a
+first key, or audio-track trigs off (`0x8000004c` bit 0): the stock bytes'
+paths, unchanged. Legato is not limited to synth tracks: a sample track
+changes pitch without a restart the way FUNC + key does. Live recording
+records the legato press as stock records a key press (a sample trig with
+the PTCH lock, `0x40042d1c`), not as a trigless trig.
+
+### Measurements (24 Sep 2026, `out/mainos_cf.bin` = `REMIX=tim make cf`, the panel on 8593 with a copy of the OTLIVE card, `--sound on`; scripts and rows in the session scratchpad `glide_*.py`, `ga2/`, `ga3/`, `gs2/`)
+
+**1. The rows** (`gm/`): boot (the card's project: CHAIN AFTER 256/16 —
+a 17 saved by the 13 Sep build, clamped; SCALE MIXOLYD; GLIDE OFF), PROJECT
+> CONTROL > SEQUENCER, [DOWN] ×4 → `GLIDE OFF` (list state offset 2,
+cursor 4, count 5, visible 3); LEVEL +1 → 1, +63 → 64, +100 → 127
+(clamped), −127 → OFF, −3 → OFF, +64 → 64, [YES] → 65, at 127 [YES] → OFF
+(wrap); [UP] → SCALE, [UP] → LFO AUTO CHANGE. The byte at `0x400d2cdc`
+followed every step. CHAIN AFTER on the same window: PAT.LEN → **DIRECT**
+→ 2/16 by LEVEL +1, DIRECT + [YES] → 2/16, −20 → PAT.LEN; the byte
+`0x8000004e` / mirror `0x100b14ae` read 0 → 1 → 2.
+
+**2. Legato and glide, T2 = the FM synth** (`ga2/`, `ga3/`; T2's Part set
+to STRT 0 / LEN 0 = a clean carrier, AMP HOLD INF / REL 40; CHROMATIC
+mode; the card's SCALE = MIXOLYD snaps [TRIG 16] (+3) to +2 semitones —
+the quantizer at work). Hold [TRIG 13] (C4), press [TRIG 16] 0.6 s later,
+release 13 after 1.2 s, release 16 after 0.6 s more; zero-crossing pitch
+and 10 ms RMS from the panel's main out:
+
+| GLIDE | f(A) → f(B) | pitch after B's press: 63 % / 95 % of the way | A released, B held | B released |
+|---|---|---|---|---|
+| OFF | 261.6 → 293.7 Hz (+2.00 st) | a step (16 / 16 ms: the stock restart) | 293.7 Hz | −82 dB in 100 ms, silence |
+| 1 (10 ms) | 261.6 → 293.7 | 41 / 61 ms | 293.7 | released |
+| 64 (100 ms) | 261.6 → 293.6 | 126 / 326 ms | 293.7 | −71 dB in 100 ms, silence |
+| 127 (1 s) | 261.6 → 291.9 (still moving at 3.2 s) | 947 / 2,387 ms | 292.5 | released |
+
+(the wall-clock press marks carry ~20 ms of panel latency, so 126/326 ms
+is τ ≈ 100 ms, 947/2,387 ms τ ≈ 1 s.) The held-key byte `0x460d171e`
+read 0 after every run. A single [TRIG 16] with GLIDE 64 sounds at
+293.6 Hz from its first 10 ms bin (no slide from the previous note). With
+AMP ATK 64 (a 600 ms attack ramp, −50 → −19 dB on a fresh note) the
+legato press showed no ramp: the AMP envelope is not retriggered.
+What does move: a **2.3 dB level step 200 ms after the second key** (−17.4
+→ −19.7 → −16.6 dB across the GLIDE 64 transition, the same at GLIDE 1
+once the pitch had settled) — and exactly the same step follows every
+fresh note start and every stock FUNC + key trigless trig on this track
+(`ga3/`, `ga4/FUNC_key_stock_trigless`: −19..−20 dB for 200 ms, then
+−17). It is not the AMP envelope (above) and not the pitch (GLIDE 1); it
+is the DSP's own response to a trig word — T2's FX1 is a FILTER with a
+0.5 s envelope (DEPTH 111, DEC 49), the likely consumer, but DEPTH 0 left
+the resonant filter (Q 94) ringing through the sweep and settled nothing.
+Posting the trig word without mailbox bit 3 (`0x111`; frame flag 0x20 /
+event-byte bit 3) changed neither the step nor the glide (t63 113 ms), so
+the legato keeps stock's own trigless word (`0x4004fc9c`, `0x119`): the
+legato behaves exactly as FUNC + key does, minus the FUNC.
+
+**3. Sequenced** (`gs2/`, GLIDE 64): the pattern cleared, T2 trig on step 1
+(PTCH −12 from the Part: 130.8 Hz) and a trigless trig on step 9 with a
+PTCH lock of +12 (`0x7c`): PLAY → 130.8 Hz, then from step 9 (1.0 s at
+120 BPM) a two-octave glide to 523.0 Hz, 63 % / 95 % at 120 / 320 ms;
+GLIDE OFF: the same pattern jumps in one 10 ms bin (t63 = t95 = 40 ms, the
+step-time estimate). (The level rises 14 dB with the pitch: T2's FX1 is
+a FILTER with BASE 0 / WIDTH 72, its response, not the voice.)
+
+**4. Persistence** (`pt/`): PROJECT > SYNC TO CARD with CHAIN AFTER =
+DIRECT, SCALE MIXOLYD, GLIDE 64 → the card's `OTLIVE/PROJECT/project.work`
+reads `PATTERN_CHANGE_CHAIN_BEHAVIOR=1` / `#SEQUENCER_SCALE=5` /
+`#SYNTH_GLIDE=64` (read on the Mac through `/card/eject`); `/card/insert`
+(a power cycle) reloads `0x8000004e = 01`, `0x400d2cdc = 40`.
+Then the migration cases, editing the mounted card's `project.work` and
+`/card/insert`-ing (`pt3/`, `bc/`): `PATTERN_CHANGE_CHAIN_BEHAVIOR=17` +
+`#SYNTH_GLIDE=100` (a project saved by the 13 Sep DIRECT JUMP build) →
+`0x8000004e = 0x10` (the window shows **256/16**), GLIDE **100**;
+`=1` + `#SYNTH_GLIDE=33` → `0x01` (**DIRECT**), GLIDE **33**; `=5` +
+`#SYNTH_GLIDE=0` → `0x05` (**6/16**, a stock value), GLIDE **OFF**. The
+mirror `0x100b14ae` followed each time. A storing load without the GLIDE
+line starts from OFF (`qz_ld_entry`, as SCALE's).
 
 ## Measurements (all `out/_agents/quantizer/`)
 
@@ -300,7 +433,13 @@ mode_views" (the Makefile's SKIP).
 - The boot A/B differs by the phase of one breathing LED pair (above);
   the two per-line loader detours are the cost of a file format whose
   stock reader rejects unknown keys.
-- **Not flashed.**
+- **The GLIDE half is not flashed** (the SCALE half is, OCTATRICK1..3).
+- **Legato and live recording**: a legato key press is recorded as a
+  normal trig with its PTCH lock, not as a trigless trig (stock's
+  recording path is untouched); place trigless trigs by hand for slides.
+- **The old key's MIDI note-off** goes out at the legato press (as stock
+  sends it before a fresh trig), so an external mono synth does not see a
+  MIDI legato.
 
 Background: `docs/firmware/PARAM_PAGES.md` (the descriptor layout),
 `docs/firmware/midi_re_note.md` (the chromatic lock block),

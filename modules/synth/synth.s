@@ -54,10 +54,24 @@
 | 0xa8*track: +0 active byte (0 = the CF voice ended), +8 the sample's
 | settings record (0x100b14f0 + 0x448*slot; its path string at +0).
 |
+| GLIDE (24 Sep 2026): with the project's GLIDE setting on (PROJECT > CONTROL
+| > SEQUENCER > GLIDE, 1..127, modules/quantizer; read here through ONE
+| accessor, sy_glide, from its fixed address) the pitch does not jump to a
+| new PTCH word but slews toward it: a per-track "current PTCH word" (S_CUR,
+| Q12) moves toward the record's word every frame with a first-order lag
+| whose time constant is 10 ms at 1 .. 1 s at 127 (exponential: x10 every
+| 63 steps), and the stock rate arithmetic runs on the slewed word, so RATE,
+| the locks, LFOs and scenes keep working. A voice START snaps S_CUR to its
+| own pitch (no slide from the previous note); a trigless trig, a slide trig
+| or a legato key (the quantizer's qz_leg1/2) changes the word without a
+| start, and glides. GLIDE OFF: S_CUR follows the word exactly (bit-identical
+| rate).
+|
 | Position independent: OS absolutes and pc-relative references only.
-| Layout (fixed with .org): +0x000 sy_render (the kind-table entry) and the
-| ratio table (+0x31e), +0x360 sy_tab (257 x s16 sine, amplitude 0x4000 =
-| -6 dBFS), +0x564 the per-track state (8 x 40 bytes); 1,700 bytes.
+| Layout: +0x000 sy_render (the kind-table entry), sy_slew / sy_glide, the
+| ratio table, then (.balign) sy_tab (257 x s16 sine, amplitude 0x4000 =
+| -6 dBFS) and the per-track state (8 x 44 bytes); the manifest's CAVE_LEN
+| and the README give the offsets of a build.
 
         .text
         .set    VOICE_BASE, 0x800049d8
@@ -78,7 +92,8 @@
         .set    INDEX_SCALE, 2628        | 8 rad / 127 in cycles * 2^18 (offset = m_Q14 * I)
         .set    FB_SCALE, 516            | 0.25 cycle / 127 * 2^16
         .set    RAMP_STEP, 4096          | gain Q15: 0 -> 1.0 over 8 frames (2.9 ms)
-        .set    ST_STRIDE, 40
+        .set    GLIDE_AT, 0x400d2cdc     | the GLIDE byte (modules/quantizer/manifest.py GLIDE_AT; 0 = off)
+        .set    ST_STRIDE, 44
         .set    S_PHC, 0                 | carrier phase, Q32 cycles
         .set    S_PHM, 4                 | modulator phase
         .set    S_ENV, 8                 | index envelope, Q24
@@ -89,6 +104,7 @@
         .set    S_FB, 28                 | feedback multiplier
         .set    S_LASTM, 32              | the modulator's last sample, Q14
         .set    S_ON, 36                 | the playing voice is a synth
+        .set    S_CUR, 40                | the slewed PTCH word, Q12 (GLIDE)
 
 | ---- sy_render(track, ping, start, end) ------------------------------------
 sy_render:
@@ -147,6 +163,10 @@ sy_cmp:
         move.l  %d1,S_ENV(%a3)
         move.l  RS_PTR,%a0
         clr.l   4(%a0)                   | the retrig count the packer just latched: no stock retrigs
+        mvz.w   (%a4),%d1                | a fresh note starts at its own pitch: no slide (GLIDE)
+        lsl.l   #8,%d1
+        lsl.l   #4,%d1
+        move.l  %d1,S_CUR(%a3)
         moveq   #1,%d3
         bra     sy_set
 sy_no:
@@ -157,6 +177,7 @@ sy_ison:
         tst.b   S_ON(%a3)
         beq     sy_call
         mvz.w   (%a4),%d6                | PTCH word (raw << 8; 0x4000 = 0 semitones)
+        bsr     sy_slew                  | GLIDE: d6 := the word slewed toward it
         mvz.w   6(%a4),%d5               | RATE word (0x7f00 = 1.0)
         move.w  #0x4000,(%a4)            | the stock renderer computes rate 1.0 from these
         move.w  #0x7f00,6(%a4)
@@ -345,6 +366,78 @@ sy_done:
         lea     48(%sp),%sp
         rts
 
+| ---- sy_glide: d0 := the track's GLIDE value, 0 = off, 1..127 -----------------
+| d2 = track (unused: the setting is per project). The ONE place this cave
+| reads the storage (quantizer.s qz_glide_of is its twin), so it can move.
+sy_glide:
+        mvz.b   GLIDE_AT,%d0
+        rts
+
+| ---- sy_slew: d6 := the PTCH word slewed toward d6 (GLIDE) ---------------------
+| a3 = the track's state (S_CUR = the current word, Q12), d2 = track. Once a
+| frame (the second call). GLIDE off: S_CUR := the target, so turning it on
+| later starts from where the note is. GLIDE g: cur += (target - cur) * k,
+| k = T / tau, T = one frame = 16 / 44100 s, tau = 10 ms * 100^((g - 1) / 126)
+| (10 ms at 1, 31 ms at 32, 100 ms at 64, 320 ms at 96, 1 s at 127). k in
+| Q16 from the stock 2^x curve PITCH_TAB (entry i = 2 * 2^((i - 512) / 480),
+| Q26, i = 0..512, so 2^f = entry 32 + 480 f): with e = 127 - g, x = e *
+| log2(100) / 126 = n + f, k = 23.78 * 2^n * 2^f (23 at 127 .. 2378 at 1).
+| The step is (|diff| >> 8) * k >> 8 (|diff| < 2^27, k < 2^12: no overflow);
+| the slew settles within 0.7 word (0.03 cent) of the target at the slowest
+| setting. Clobbers d0, d1, d3, d7, a0.
+sy_slew:
+        bsr     sy_glide
+        move.l  %d0,%d1                  | g
+        move.l  %d6,%d0
+        lsl.l   #8,%d0
+        lsl.l   #4,%d0                   | the target, Q12
+        tst.l   %d1
+        beq     sy_sl_snap
+        moveq   #127,%d3
+        sub.l   %d1,%d3                  | e = 127 - g
+        move.l  #3456,%d7                | log2(100) / 126 * 2^16
+        mulu.l  %d7,%d3                  | x, Q16
+        move.l  %d3,%d1
+        swap    %d1
+        mvz.w   %d1,%d1                  | n = 0..6
+        mvz.w   %d3,%d3                  | f, Q16
+        move.l  #480,%d7
+        mulu.l  %d7,%d3
+        swap    %d3
+        mvz.w   %d3,%d3                  | 480 f = the table index above entry 32
+        lea     PITCH_TAB+128,%a0        | entry 32 = 2^0
+        move.l  (%a0,%d3.l*4),%d3        | 2^f, Q26
+        lsr.l   #8,%d3
+        lsr.l   #2,%d3                   | Q16
+        move.l  #6087,%d7                | 23.78 * 256
+        mulu.l  %d7,%d3
+        moveq   #24,%d7
+        sub.l   %d1,%d7
+        lsr.l   %d7,%d3                  | k = 23.78 * 2^n * 2^f, Q16
+        move.l  S_CUR(%a3),%d1           | the current word, Q12
+        sub.l   %d1,%d0                  | diff = target - current
+        bpl     sy_sl_up
+        neg.l   %d0
+        lsr.l   #8,%d0
+        mulu.l  %d3,%d0
+        lsr.l   #8,%d0
+        sub.l   %d0,%d1
+        bra     sy_sl_store
+sy_sl_up:
+        lsr.l   #8,%d0
+        mulu.l  %d3,%d0
+        lsr.l   #8,%d0
+        add.l   %d0,%d1
+        bra     sy_sl_store
+sy_sl_snap:
+        move.l  %d0,%d1                  | off: no lag
+sy_sl_store:
+        move.l  %d1,S_CUR(%a3)
+        lsr.l   #8,%d1
+        lsr.l   #4,%d1
+        move.l  %d1,%d6                  | the slewed PTCH word
+        rts
+
 sy_name:
         .ascii  "SYNTH"
         .align  2
@@ -357,7 +450,7 @@ sy_ratio:
         .short  2304, 2560, 2816, 3072, 3328, 3584, 3840, 4096   | 9 10 11 12 13 14 15 16
 
 | ---- the sine table: 256 + 1 entries, s16, amplitude 0x4000 ---------------
-        .org    0x360
+        .balign 4
 sy_tab:
         .short  0, 402, 804, 1205, 1606, 2006, 2404, 2801
         .short  3196, 3590, 3981, 4370, 4756, 5139, 5520, 5897
@@ -393,8 +486,8 @@ sy_tab:
         .short  -3196, -2801, -2404, -2006, -1606, -1205, -804, -402
         .short  0
 
-| ---- state (RAM: the main OS runs from DRAM): 8 tracks x 40 bytes ----------
+| ---- state (RAM: the main OS runs from DRAM): 8 tracks x 44 bytes ----------
         .align  4
 sy_state:
-        .fill   8 * 40, 1, 0
+        .fill   8 * 44, 1, 0
 sy_end:

@@ -55,6 +55,25 @@ records it as the trig's PTCH lock (0x40042158 with a2). The detour snaps
 the index before the lea. The MIDI note the key sends stays the key's own
 (it is matched on release).
 
+GLIDE (24 Sep 2026). A fifth SEQUENCER row, GLIDE: OFF / 1..127, the synth
+machine's glide time (modules/synth/synth.s slews a synth voice's PTCH word
+toward its target with a first-order lag, 10 ms at 1 .. 1 s at 127), saved
+as "#SYNTH_GLIDE=n" after the SCALE line by the same writer and loader
+detours (a storing load starts from OFF). The byte, qz_glide, is PINNED at
+GLIDE_AT (glide.s, the last long of the second zero run) because the synth
+cave -- position independent, ratified bytes -- reads it as an OS absolute;
+this unit reaches it by symbol through one accessor (qz_glide_of). With
+GLIDE on, a CHROMATIC key pressed while another key of the track is held is
+a LEGATO note: two jmp detours in the key handler 0x4004fb94 (qz_leg1 at
+0x4004fbfe, qz_leg2 at 0x4004fc94) take the stock's FUNC + key trigless path
+-- no voice restart, no envelope retrigger, the pitch changes and glides --
+suppress the old key's voice note-off (its MIDI note-off still goes out) and
+make the new key the held key: releasing the first key does nothing,
+releasing the last releases the note (the 303 rule). GLIDE OFF, FUNC held, a
+release or nothing held: stock, byte for byte. Legato applies to any audio
+track (a sample changes pitch without a restart); the glide itself is the
+synth's.
+
 Verified in ot_emu through the virtual panel (README). UNFLASHED.
 """
 
@@ -62,13 +81,21 @@ from remix.schema import Detour, Kind, Linked, Module, Poke, TableGrow
 
 H = bytes.fromhex
 
+# The GLIDE byte's fixed address (glide.s): the last long of the second zero
+# run 0x400d24d0..0x400d2ce0 (the synth page cave is pinned at its start and
+# ends at 0x400d2c6c). modules/synth/synth.s reads it as GLIDE_AT -- keep
+# the two constants equal.
+GLIDE_AT = 0x400d2cdc
+
 MODULE = Module(
     name="quantizer",
     key="SCALE QUANTIZER",
     kind=Kind.CF_PATCH,
     doc="PROJECT > CONTROL > SEQUENCER > SCALE: the PTCH knob and CHROMATIC "
-        "trig keys quantize to a scale (24 scales, OFF = stock).",
-    linked=(
+        "trig keys quantize to a scale (24 scales, OFF = stock); > GLIDE: the "
+        "synth's glide time (OFF, 1..127) and 303-style legato on the chromatic keys.",
+    linked=(                                   # link order: qz names qz_glide
+        Linked("qzg", "modules/quantizer/glide.s", cpu="5475", cave_addr=GLIDE_AT),
         Linked("qz", "modules/quantizer/quantizer.s", cpu="5475"),
     ),
     detours=(
@@ -81,6 +108,12 @@ MODULE = Module(
         Detour(0x4004fc58, H("45f2ac04" "71b9100b14cf"), "qz", "qz_chrom",
                "CHROMATIC trig key -> pitch: snap the key index to the scale",
                kind="jsr", pad_to=10),
+        Detour(0x4004fbfe, H("4ab946c7dd26" "663e"), "qz", "qz_leg1",
+               "CHROMATIC key held + a new key with GLIDE on: keep the held key, no voice note-off",
+               kind="jmp", pad_to=8),
+        Detour(0x4004fc94, H("4ab946c7dd26" "6716"), "qz", "qz_leg2",
+               "CHROMATIC legato with GLIDE on: the trigless trig, the new key becomes the held key",
+               kind="jmp", pad_to=8),
         Detour(0x40065bca, H("4282" "4fef0020"), "qz", "qz_draw",
                "SEQUENCER window draw loop: index the row tables from the scroll offset",
                kind="jmp"),
@@ -96,18 +129,18 @@ MODULE = Module(
     ),
     tables=(
         TableGrow("SEQUENCER labels", old=0x400b27d0, count=3,
-                  symbols=(("qz", "qz_lbl_scale"),),
+                  symbols=(("qz", "qz_lbl_scale"), ("qz", "qz_lbl_glide")),
                   refs=((0x40065bd8, 0x400b27d0),)),
         TableGrow("SEQUENCER getters", old=0x400b27dc, count=3,
-                  symbols=(("qz", "qz_get"),),
+                  symbols=(("qz", "qz_get"), ("qz", "qz_get_glide")),
                   refs=((0x40065bde, 0x400b27dc),)),
         TableGrow("SEQUENCER setters", old=0x400b282c, count=3,
-                  symbols=(("qz", "qz_set"),),
+                  symbols=(("qz", "qz_set"), ("qz", "qz_set_glide")),
                   refs=((0x40065cc4, 0x400b282c), (0x40065d3e, 0x400b282c),
                         (0x40065d58, 0x400b282c), (0x40065d72, 0x400b282c))),
     ),
     pokes=(
-        Poke(0x40065c7c, expect=H("48780003"), write=H("48780004"),
-             note="SEQUENCER window: 3 -> 4 rows (3 visible, scrolls)"),
+        Poke(0x40065c7c, expect=H("48780003"), write=H("48780005"),
+             note="SEQUENCER window: 3 -> 5 rows (SCALE, GLIDE; 3 visible, scrolls)"),
     ),
 )
