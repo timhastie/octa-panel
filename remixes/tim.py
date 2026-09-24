@@ -1,11 +1,17 @@
 """TIM -- DIRECT JUMP + SCALE QUANTIZER + SYNTH MACHINE in one image, no effects.
 
-All three are ColdFire caves that touch only the main-OS section: the pattern
-change option (CHAIN AFTER = DIRECT, its unused value 1 since 24 Sep 2026),
-the SCALE and GLIDE rows next to it in PROJECT > CONTROL > SEQUENCER (GLIDE:
-the synth's glide time and 303-style legato on the CHROMATIC keys), and the
-SYNTH machine (a FLEX track whose sample is named SYNTH*.wav plays a
-two-operator FM voice with glide, modules/synth). Build with `REMIX=tim make cf` ->
+ColdFire only, no DSP code: the pattern change option (CHAIN AFTER = DIRECT,
+its unused value 1 since 24 Sep 2026), the SCALE, GLIDE and POLY rows next to
+it in PROJECT > CONTROL > SEQUENCER (GLIDE: the synth's glide time and
+303-style legato on the CHROMATIC keys; POLY: the synth's paraphonic mode
+and polyphonic CHROMATIC keys), and the SYNTH machine (a FLEX track whose
+sample is named SYNTH*.wav plays a two-operator FM voice with glide and, with
+POLY on, four-voice chord shapes from the LFO page's CHRD slot,
+modules/synth). Since 24 Sep 2026 the voice engine is a DRAM unit: the build
+appends octabam's loader and the packed runtime behind the OS and takes the
+platform's 10 MB off the bottom of the audio page arena (the unit shows
+FREE MEM 53.5 instead of 63.5 MB on the OTLIVE card); direct-jump, the
+quantizer and the synth page stay ROM caves. Build with `REMIX=tim make cf` ->
 out/mainos_cf.bin (`make image-cf` for the card): the ColdFire-only build
 leaves both DSP payloads and the FX2 chooser stock, so every stock effect
 stays selectable. `REMIX=tim make bus` also builds, but rebuilds the

@@ -1,5 +1,10 @@
-# Synth machine (phase 4: glide; phase 3: the page; phase 2: the FM voice; phase 1: the hollow voice)
+# Synth machine (phase 5: paraphonic chords, the engine in DRAM; phase 4: glide; phase 3: the page; phase 2: the FM voice; phase 1: the hollow voice)
 
+Phase 5 (24 Sep 2026) moves the FM voice engine into a DRAM unit (`poly.s`,
+the ROM cave `synth.s` kept for the record) and adds **POLY** -- four voices a
+track playing chord shapes chosen by the LFO page's slot 5 (CHRD), with
+per-voice release and glide, polyphonic CHROMATIC keys and LFO 3 muted --
+**"Phase 5"** below.
 Phase 4 (24 Sep 2026) adds **GLIDE** -- the pitch slews toward a new PTCH
 instead of jumping, with the time set by the new PROJECT > CONTROL >
 SEQUENCER > GLIDE row (`modules/quantizer`, which also gives the CHROMATIC
@@ -10,6 +15,213 @@ whose parameters are the FLEX PLAYBACK page's other slots -- **"Phase 2: the
 FM voice"** below has the design, the parameter map and the numbers. Phase
 1's text follows it as written (its record-layout guess is corrected in the
 phase-2 section and marked in place).
+
+---
+
+## Phase 5: paraphonic chords, and the engine in DRAM (24 Sep 2026)
+
+**The FM voice engine now lives in a DRAM unit (`poly.s`, `Linked(dram=True)`)
+and has a paraphonic mode: with the project's POLY setting on (PROJECT >
+CONTROL > SEQUENCER > POLY, `modules/quantizer`) a synth track plays up to
+four notes -- a CHORD SHAPE chosen by the LFO page's slot 5 (renamed CHRD on
+such a track), capped by the voice count in its slot 2 (VOIC, 1..4), every
+note snapped onto the quantizer's SCALE when one is set, at every trig or
+live key, with per-voice envelopes, release and glide -- summed into the
+track's one source stream.** POLY off is phase 4, bit for bit (LFO 3 aside:
+see the second follow-up below). Emulation only (`ot_emu` through the virtual panel and
+the pipe), UNFLASHED; scripts, captures and screens in the session
+scratchpad `poly/` (`pan.py` helpers, `polyA..G.py`, `cost/`).
+
+### The DRAM chain (step 1)
+
+`REMIX=tim make cf` accepted a DRAM unit as it was -- no build change was
+needed for that: `poly.s` is assembled and linked as the platform runtime at
+the base of the arena reserve (`0x40a955e0`; `sy_render` at +0), packed and
+appended behind the loader (`append 3,078 B at 0x4010fdf0`; `out/mainos_cf.bin`
+1,115,638 B), the platform takes **1,707 pages (10,487,808 B) off the bottom
+of the audio page arena** (base `0x40a955e0 -> 0x41495de0`, 12,895 pages =
+75 MB left, 28 words rewritten; `PLATFORM_PAGES` untouched), the boot detour
+`0x4000050c` runs the loader, which depacks the unit; `REMIX=tim
+verify_dram_boot` PASSES (loader ran 1x, its fatal hang 0x, the reserve
+reads back equal to the linked runtime, 7,140 B, 0 bytes differ). The unit
+shows the reduced pool where it shows sample memory: the FLEX slot list's
+header reads **FREE MEM:53.5** against **63.5** on the stock OS with the same
+card (PROJECT > CONTROL > MEMORY only has the format/reserve rows; SYSTEM >
+STATUS has no RAM figure).
+
+**One build change was needed to point the kind table at the unit**: a
+`Poke`'s `write` is bytes fixed before the link, so it cannot name a DRAM
+symbol. `Detour(kind="ptr")` (`tools/build/build_bus.py`, `tools/remix/
+schema.py`, `docs/remixer/MODULES.md`) rewrites a 4-byte pointer in a stock
+table to a symbol's address, `expect` being the stock pointer -- the FLEX
+entry `0x400d6438` (`40004008` -> `sy_render`), asserted like every other
+detour. The ROM cave (`synth.s`) and its `PINNED` bytes are gone from the
+manifest (the source stays beside `poly.s` for the record); `page.s` is
+untouched. **The third zero run has 1,700 B free** (was 168 B): direct-jump
+358 B at `0x400d6b80`, the quantizer 1,916 B at `0x400d6d00`, its three
+tables at `0x400d7480..0x400d7598`.
+
+### The engine (`poly.s`, 7,140 B: code +0x000..+0x9d6, tables to +0xe48, state to +0x1be4)
+
+| what | where |
+|---|---|
+| `sy_render` +0 | the kind-table entry, phase 4's wrapper: marker scan at a start, PTCH/RATE neutralised around the stock call; with POLY off the mono path (`po_rate` +0x2d8 is the stock rate arithmetic as a subroutine, `sy_slew` +0x358 the glide) |
+| `po_frame` +0x3e2 | POLY, the second call: the key mask diff (`qz_pmask`, released keys -> their voices release), the start (`po_start`: fold the PTCH delta into the sounding voices, read `qz_pkey`, a sequencer trig releases everything, the scale mask through `SCALE_AT`, the voice count `0x80000810 + t*72 + 8` (VOIC, clamped 1..4), the chord byte `+ 11` -> `po_shapes[raw >> 2]`, the first VOIC notes of the shape each snapped by `po_snap` and given a voice through `po_alloc`: free, else the oldest releasing, else the oldest sounding), then per voice: target = `V_ROOT + (PTCH word - T_REF)`, `sy_slew` on the voice's own `V_CUR`, the word folded into `0x0400..0x7c00` by octaves and the increment shifted back, ratio, index envelope, the amplitude envelope (ramp 8 frames; release `gain -= gain * k`, `po_relk[REL]`: tau = 5 ms * 1000^(rel/126), 5 ms .. 5 s, 127 = INF; freed below 64/16384) |
+| `po_fill` +0x774 | both calls: clear, every sounding voice adds `c * gain` (gain Q14), the sum doubled and saturated into the mono format, L and R |
+| `po_lfo3` / `po_lfo3b` | the LFO engine's depth read, `mvsw %a2@(0x12,%d2:l:2),%d0; lea ...` -- the engine exists twice, a routine at `0x40003b90` (site `0x40003ca4`) and a copy inlined in the frame builder at `0x4000cf40` (site `0x4000d03e`, the one that runs for the audio tracks' frames; the first build hooked only the routine and the chord byte kept modulating PTCH): LFO 3's depth reads 0 on a track whose playing voice is a synth, **POLY on or off** (the follow-up below) |
+| `po_snap` | a note's word snapped onto the SCALE the quantizer's way (`qz_chrom`): its semitone number from PTCH raw 64 (the scale's root) mod 12, moved to the nearest degree of the mask, the lower candidate first at each distance; whole semitones only, the word's fraction kept. The mask comes from `qz_scale_mask` through the pinned trampoline `SCALE_AT = 0x400d2ca8` (`modules/quantizer/scale.s`) -- no copy of the table here; only reached with POLY on, which only the quantizer can set |
+| `po_lfopage` | the page resolver's kind-1 load `movel #0x400d37f6,%d0; bras` at `0x40031e62`: for a FLEX track whose assigned slot is a SYNTH* sample (page.s's test) with POLY on, a clone of the LFO descriptor built from the stock record on first use (no Elektron bytes in the repo): slot 5 named CHRD, formatter `po_fmt_chord` (the shape's name); slot 2 (SPD3's byte, free because LFO 3 is muted on a synth track) named VOIC, formatter `po_fmt_voic` ("1".."4", the byte clamped), **range 1..4, default 4, the stock enum stepper as its knob handler** (handler 0, PMTR/WAVE's: about four detents a step; the accumulator handlers scale a step by the range and cannot move a 4-wide slot); both always shown (nibbles 2 and 5 = 5). A Part's stock SPD3 byte (32) lies outside 1..4 and reads as 4 -- a fresh track shows and plays 4 -- and the first turn clamps it into the range |
+| `po_shapes` / `po_names` | 32 shapes x 4 semitone offsets (-128 ends), four knob values each: `---- 4TH 5TH OCT MI3 MA3 MI7 MA7 PWR MAJ MIN SUS2 SUS4 DIM AUG MAJ1 MAJ2 MIN1 MIN2 MAJS MINS MAJ6 MIN6 MAJ7 MIN7 DOM7 M7B5 DIM7 ADD9 5OCT OCT2 OCT3` |
+| state | 8 track records x 128 B (the mono voice's 44 + `T_REF T_LAST T_MASK T_DK T_RK T_RATIO T_I T_W`), 32 voice records x 64 B (`V_PHC V_PHM V_ENV V_INC V_INCM V_IEFF V_GAIN V_FB V_LASTM V_STATE V_KEY V_CUR V_ROOT V_AGE`), the LFO descriptor clone |
+
+**VOIC** caps the notes a trig takes: the shape's offsets are listed root
+first, ascending, so a count below the shape's size keeps the root and drops
+from the top; 1 = the root alone, mono with release tails (the previous note
+rings out on its own voice). Stealing stays oldest-first. Locks on the slot
+are honoured like CHRD's.
+
+The keys come from the quantizer's hooks (`modules/quantizer/README.md`
+"POLY"): `qz_pkey[t]` (the live key's index + 1, read and cleared at the
+voice start; 0 = a sequencer trig) and `qz_pmask[t]` (the held keys) at the
+pinned `KEYS_AT = 0x400d2cb0`, the POLY byte at `0x400d2cdd` next to GLIDE.
+The stock voice lifecycle is untouched: a live key restarts the DSP voice
+(the AMP and filter envelopes run over the whole mix, so **AMP ATK 0, HOLD
+INF (127)** and REL to taste are the settings that make sense -- REL is also
+the voices' own release, so a short REL cuts and a long REL lets chords ring
+into each other), the last key's release posts the AMP release as stock.
+Level: a poly note is 6 dB below the mono voice (each voice at 1/2), four
+in phase reach full scale.
+
+### Measurements (24 Sep 2026, the panel on 8593, a copy of the OTLIVE card, T2 = SYNTH slot 5, INDX 0 / FDBK 0 for clean lines unless said; `poly/pB3 pC pD2 pF cost`)
+
+- **POLY OFF == OCTATRICK4**: the lockstep rig on `synth8q.img` (T8 = SYNTH,
+  trigs on steps 1 and 9, PLAY 2.2 s, `cost/mono` vs `cost/o4`): **120,090
+  frames, 0 samples differ**. Through the panel the same key sequence (13
+  held, 9 added, released; then GLIDE 64 legato 13 -> 6) matches in level
+  and trajectory but not sample for sample (`pE_*`, 81-88 % of samples
+  differ, max |diff| 28,858): the carrier phase runs on from each run's own
+  history and the presses land at different sub-frame positions, as they
+  would between any two panel runs of one image.
+- **A sequencer trig with CHRD = MAJ** (a lock of 36 on step 1, T2's PTCH
+  -12): lines at **130.8 / 164.8 / 196.0 Hz = 1 : 1.260 : 1.498**; step 5
+  MIN7 130.8/155.6/196.0/233.0; step 9 (PTCH lock +7, no CHRD lock) a single
+  195.9; step 13 5OCT 130.8/196.0/261.6/392.0. A live key 13 with CHRD MAJ:
+  261.6 / 329.6 / 392.0; MIN7: 261.6 / 311.1 / 392.0 / 466.2.
+- **Two keys held live** (13 + 6): 261.6 and 174.6. Keys 13, 9, 6 pressed in
+  turn and released in turn (REL 20): `[261.6]`, `[261.6, 207.6]`, `[261.6,
+  207.6, 174.6]`, `[207.6, 174.6]`, `[174.6]`, silence (-84.9 dBFS). Two MAJ
+  chords (keys 13 then 6, six notes): the four voices hold G4, C4, A3, F3 --
+  the oldest two of the first chord were stolen.
+- **Release**: REL 20, key 13 released -> -77.7 dBFS within 0.1 s; REL 100,
+  key 13 released and key 6 pressed 0.3 s later -> 261.6 still -2.8 dB
+  under 174.6 for the next 0.6 s and -4.9 dB after both are released. In the
+  sequencer with REL 110 the MIN7 of step 5 (233.1, 155.6) rings under step
+  9's single note (-5.3 / -6.3 dB); with REL 40 it is gone. A four-note chord
+  steals all four voices, so nothing rings into it.
+- **LFO 3**: LFO 3's default PMTR is PTCH, so without the mute the chord byte
+  is a pitch LFO. With POLY on (DEP3 = 40 = MIN, SPD3 92) the lines hold:
+  261.7-261.8 and 392.1 Hz over 1.2 s, per 100 ms; with POLY off the same key
+  wanders 228-313 Hz; T7 (a sample) with LFO 3 DEP 20 swings its 5,122 Hz
+  line 4,718-5,520 Hz on this image and on OCTATRICK4 alike.
+- **The LFO page** shows CHRD only on a synth track with POLY on (`pA/A1`,
+  `A2` "MAJ", `pG/G1` the lock view "MAJ" inverted, `G2` "MIN7"); T7 and a
+  synth track with POLY off draw the stock DEP3 (`A0`, `G4`). The LFO SETUP
+  page (double-tap LFO, LFO 3 selected) shows the chord byte as its DEP dial
+  (`G3`) -- that is its own code and is left as is.
+- **Persistence**: SYNC TO CARD, eject, insert: POLY 1, the CHRD locks 36 /
+  96 / 116 on steps 1 / 5 / 13 and the PTCH lock 39 on step 9 come back;
+  the SEQUENCER rows read SCALE OFF / GLIDE OFF / POLY ON (`pF`).
+- **The synth page and PLAY**: FM SYNTH>FLEX with the icons (`pF/F5`), PLAY
+  2 s -19.7 dBFS.
+- **CPU cost** (the lockstep rig on `synth8q.img`, PC watches at `sy_render`
+  / its `rts` and the stock pair, `cost2.py`; per 16-sample frame = the two
+  calls [0,4) + [4,16), T8 = SYNTH; the stock renderer inside is 418 + 855 =
+  1,273, the README's 936 being the [0,16) form):
+
+| engine's own, per frame | mean | max |
+|---|---|---|
+| POLY off (phase 4's voice) | 205 + 627 = **832** | 1,000 |
+| POLY on, 1 voice (CHRD ----, REL 0) | 290 + 882 = **1,172** | 447 + 1,769 = 2,216 (a start frame) |
+| POLY on, 4 voices (CHRD OCT3) | 769 + 2,535 = **3,304** | 769 + 3,187 = 3,956 |
+
+About 40 instructions a sample a voice, as the mono voice, plus ~100 a voice
+a frame; four voices are ~3.5 x the mono engine and ~2.6 x the stock FLEX
+renderer. Hardware cost unmeasured.
+
+### Follow-ups (24 Sep 2026, later the same day)
+
+1. **"The same key gave a different pitch each press with POLY off" -- not
+   the engine.** Reproduced: POLY off, CHRD left at 36 (MAJ) from a POLY
+   session, key 13 five times: 191.3 / 247.1 / 317.9 / 382.4 / 297.7 Hz;
+   with the slot at 0: 261.6 x5. The slot is LFO 3's DEP byte and LFO 3's
+   default PMTR is PTCH, so with POLY off the chord value was a slow pitch
+   LFO (exactly what stock does with DEP3 = 36 -- and what "LFO 3 untouched
+   with POLY off" had asked for). Resolution: **LFO 3's depth reads 0 on a
+   synth track in both modes** (`po_lfo3_depth` no longer tests POLY); on a
+   synth track slot 5 is CHRD and slot 2 VOIC, never LFO 3's depth and
+   speed. This supersedes the earlier rule; the one-line revert is the
+   `tst.b POLY_AT` that was there. Measured on the final build (`bug1d`):
+   fresh boot, POLY off, GLIDE off: key 13 x5 = 261.6 x5; then POLY on
+   (chords play), POLY off again: key 13 x5 = 261.6 x5, key 16 x5 = 311.1
+   x5, the same with GLIDE 64, and a sequencer single trig 130.8 at every
+   pattern start. Lockstep A/B against OCTATRICK4 on `synth8q.img` (POLY
+   off): the sequencer fixture (PLAY 2.2 s) **0 of 120,090 frames differ**;
+   a CHROMATIC key sequence through the pipe (T8, key 13 500 ms, +key 9
+   400 ms, -13, -9; `chromrig.py`) identical for the first 141,377 frames
+   (3.206 s, up to the first key) and then identical at a **one-frame (16
+   sample) lag** -- the key landed one audio frame later on one image (the
+   boot's timing differs by the appended runtime), 0 samples differ once
+   aligned. LFO 3 on T7 (a sample) is untouched: DEP 20 swings its 5,122 Hz
+   line 4,718..5,520 Hz on this image and on OCTATRICK4 alike.
+2. **Chords obey SCALE** (`po_snap`, above). Measured (VOIC 4, INDX 0, key
+   13 = C4): SCALE OFF, MAJ: 261.6 / 329.6 / 392.0 = **1 : 1.260 : 1.498**;
+   DORIAN and PHRYGN, MAJ: 261.6 / 311.1 / 392.0 = **1 : 1.189 : 1.498**
+   (the minor third); MAJOR, AUG [0,4,8]: 261.6 / 329.6 / 392.0 (G# -> G,
+   1 : 1.26 : 1.498; OFF: 1 : 1.26 : 1.588); MINOR, MAJ7: 261.6 / 311.1 /
+   392.0 / 466.2 (1 : 1.189 : 1.498 : 1.782); DORIAN, MAJ on key 11 (A#3, on
+   the scale): 233.1 / 293.7 / 349.2 (stays major), on key 9 (G#3, snapped
+   to G3 by `qz_chrom`): 196.0 / 233.1 / 293.7 (minor); a sequencer trig
+   with a CHRD MAJ lock: DORIAN 130.8 / 155.6 / 196.0 (1 : 1.19 : 1.498),
+   OFF 130.8 / 164.8 / 196.0. The quantizer's SCALE OFF stays byte for byte:
+   `T_SCALE` = 0 skips the snap.
+3. **VOIC** (above). Measured (CHRD MAJ, key 13): VOIC 4 -> 261.6 / 329.6 /
+   392.0; **2 -> 261.6 / 329.6**; **1 -> 261.6**; 3 -> three; MAJ7 with VOIC
+   2 -> two, with 4 -> four; VOIC 1 with REL 100, key 13 then key 9: 261.6
+   rings at -3.1 dB under 207.7. A fresh Part's byte 32 shows `4`; the knob
+   steps 1..4 (about four detents a step, the enum stepper); SYNC TO CARD +
+   eject/insert brings VOIC 2 back; the LFO page shows VOIC (and CHRD) only
+   on a synth track with POLY on (`voic4/W_*`: POLY off draws the stock
+   SPD3/DEP3). The stored byte is SPD3's: with POLY off the stock page shows
+   it as LFO 3's speed, which does nothing on a synth track (LFO 3 muted).
+
+Sizes after the follow-ups: `poly.s` 7,420 B (`REMIX=tim make cf`:
+`out/mainos_cf.bin` 1,115,838 B, 3,537 changed, append 3,278 B), the
+quantizer 1,936 B at `0x400d6d00` plus `scale.s` 6 B pinned at
+`0x400d2ca8`, **1,572 B of the third run left**; `verify_dram_boot` PASS
+(the reserve == the linked runtime, 7,420 B).
+
+### What does not work, and what is left
+
+- **A four-note chord steals every voice**: only chords of three or fewer
+  notes let the previous chord ring into them.
+- **The DSP AMP envelope retriggers at every live key** (the stock
+  lifecycle): AMP ATK above 0 dips the whole mix at each key; HOLD below INF
+  releases the mix while keys are held.
+- **Legato is off while POLY is on** (overlapping keys are voices); GLIDE
+  still slews every voice when PTCH moves by a lock, slide or LFO.
+- **LFO 3 does nothing on a synth track, POLY on or off** (its slots are
+  CHRD and VOIC there); LFO 1 and 2 are the synth's LFOs. LFO 3's PMTR,
+  WAVE, MULT and TRIG on the LFO SETUP page still show for it.
+- **A refused key trig** (no sample loaded) leaves `qz_pkey[t]` set until the
+  next start, which is then tagged as that key and does not release the
+  notes before it -- once.
+- **MIDI**: the note-on per key is stock's; a note-off per key goes out at
+  each release (`qz_leg0`), untested (the panel has no MIDI in).
+- **Hardware**: the unit executes from the arena reserve inside the audio
+  interrupt; the loader is Octakit's design (her runtime runs there on her
+  units) but this unit has not. The emulator's voice-start burst (phase 2)
+  is present at every live key.
+- A poly note is 6 dB below a mono note.
 
 ---
 

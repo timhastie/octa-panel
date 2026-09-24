@@ -74,6 +74,18 @@ release or nothing held: stock, byte for byte. Legato applies to any audio
 track (a sample changes pitch without a restart); the glide itself is the
 synth's.
 
+POLY (24 Sep 2026). A sixth SEQUENCER row, POLY: OFF / ON, the synth
+machine's paraphonic mode (modules/synth/poly.s), saved as "#SYNTH_POLY=n"
+after the GLIDE line; the byte qz_poly is pinned next to qz_glide. With POLY
+on, on a FLEX track whose assigned slot holds a SYNTH* sample, the CHROMATIC
+keys are polyphonic: a third detour on the handler's release path (qz_leg0,
+0x4004fbde) and the two legato detours keep a per-track held-key mask and
+post each key for the engine (keys.s, pinned at KEYS_AT: qz_pkey, qz_pmask);
+a press ends nothing, a release ends only its own key, the last release
+takes the stock note-off path. Legato is off while POLY is on; every other
+track is stock. The synth snaps chord notes onto SCALE through
+qz_scale_mask, reached by the six-byte trampoline scale.s pinned at SCALE_AT.
+
 Verified in ot_emu through the virtual panel (README). UNFLASHED.
 """
 
@@ -86,6 +98,13 @@ H = bytes.fromhex
 # ends at 0x400d2c6c). modules/synth/synth.s reads it as GLIDE_AT -- keep
 # the two constants equal.
 GLIDE_AT = 0x400d2cdc
+# The POLY key mailbox's fixed address (keys.s): 40 bytes above the GLIDE
+# byte, below the synth page cave's end (0x400d2c6c). modules/synth/poly.s
+# reads it as KEYS_AT -- keep the two constants equal.
+KEYS_AT = 0x400d2cb0
+# The SCALE accessor's trampoline (scale.s, `jmp qz_scale_mask`): 6 bytes
+# under the mailbox; modules/synth/poly.s calls it as SCALE_AT.
+SCALE_AT = 0x400d2ca8
 
 MODULE = Module(
     name="quantizer",
@@ -93,10 +112,13 @@ MODULE = Module(
     kind=Kind.CF_PATCH,
     doc="PROJECT > CONTROL > SEQUENCER > SCALE: the PTCH knob and CHROMATIC "
         "trig keys quantize to a scale (24 scales, OFF = stock); > GLIDE: the "
-        "synth's glide time (OFF, 1..127) and 303-style legato on the chromatic keys.",
-    linked=(                                   # link order: qz names qz_glide
+        "synth's glide time (OFF, 1..127) and 303-style legato on the chromatic keys; "
+        "> POLY: the synth's paraphonic mode (OFF/ON) with polyphonic chromatic keys.",
+    linked=(                                   # link order: qz names qz_glide/qz_poly/qz_pkey/qz_pmask
         Linked("qzg", "modules/quantizer/glide.s", cpu="5475", cave_addr=GLIDE_AT),
+        Linked("qzk", "modules/quantizer/keys.s", cpu="5475", cave_addr=KEYS_AT),
         Linked("qz", "modules/quantizer/quantizer.s", cpu="5475"),
+        Linked("qzs", "modules/quantizer/scale.s", cpu="5475", cave_addr=SCALE_AT),
     ),
     detours=(
         Detour(0x40055170, H("1482" "1a82" "320e"), "qz", "qz_knob",
@@ -108,11 +130,14 @@ MODULE = Module(
         Detour(0x4004fc58, H("45f2ac04" "71b9100b14cf"), "qz", "qz_chrom",
                "CHROMATIC trig key -> pitch: snap the key index to the scale",
                kind="jsr", pad_to=10),
+        Detour(0x4004fbde, H("73b02800" "200a"), "qz", "qz_leg0",
+               "CHROMATIC key release with POLY on a synth track: the held-key mask decides the note-off",
+               kind="jmp"),
         Detour(0x4004fbfe, H("4ab946c7dd26" "663e"), "qz", "qz_leg1",
-               "CHROMATIC key held + a new key with GLIDE on: keep the held key, no voice note-off",
+               "CHROMATIC key held + a new key with GLIDE on: keep the held key, no voice note-off (POLY: nothing ends)",
                kind="jmp", pad_to=8),
         Detour(0x4004fc94, H("4ab946c7dd26" "6716"), "qz", "qz_leg2",
-               "CHROMATIC legato with GLIDE on: the trigless trig, the new key becomes the held key",
+               "CHROMATIC legato with GLIDE on: the trigless trig, the new key becomes the held key (POLY: a fresh voice, the key posted for the engine)",
                kind="jmp", pad_to=8),
         Detour(0x40065bca, H("4282" "4fef0020"), "qz", "qz_draw",
                "SEQUENCER window draw loop: index the row tables from the scroll offset",
@@ -129,18 +154,18 @@ MODULE = Module(
     ),
     tables=(
         TableGrow("SEQUENCER labels", old=0x400b27d0, count=3,
-                  symbols=(("qz", "qz_lbl_scale"), ("qz", "qz_lbl_glide")),
+                  symbols=(("qz", "qz_lbl_scale"), ("qz", "qz_lbl_glide"), ("qz", "qz_lbl_poly")),
                   refs=((0x40065bd8, 0x400b27d0),)),
         TableGrow("SEQUENCER getters", old=0x400b27dc, count=3,
-                  symbols=(("qz", "qz_get"), ("qz", "qz_get_glide")),
+                  symbols=(("qz", "qz_get"), ("qz", "qz_get_glide"), ("qz", "qz_get_poly")),
                   refs=((0x40065bde, 0x400b27dc),)),
         TableGrow("SEQUENCER setters", old=0x400b282c, count=3,
-                  symbols=(("qz", "qz_set"), ("qz", "qz_set_glide")),
+                  symbols=(("qz", "qz_set"), ("qz", "qz_set_glide"), ("qz", "qz_set_poly")),
                   refs=((0x40065cc4, 0x400b282c), (0x40065d3e, 0x400b282c),
                         (0x40065d58, 0x400b282c), (0x40065d72, 0x400b282c))),
     ),
     pokes=(
-        Poke(0x40065c7c, expect=H("48780003"), write=H("48780005"),
-             note="SEQUENCER window: 3 -> 5 rows (SCALE, GLIDE; 3 visible, scrolls)"),
+        Poke(0x40065c7c, expect=H("48780003"), write=H("48780006"),
+             note="SEQUENCER window: 3 -> 6 rows (SCALE, GLIDE, POLY; 3 visible, scrolls)"),
     ),
 )

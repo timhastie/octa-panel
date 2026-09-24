@@ -1,6 +1,10 @@
 | SYNTH MACHINE -- ColdFire code cave, phase 2: the two-operator FM voice
 | (22 Sep 2026). GNU as, -mcpu=5475.
 |
+| SUPERSEDED 24 Sep 2026: the engine moved to the DRAM unit poly.s (phase 5,
+| paraphonic chords); this file is no longer built and is kept for the record
+| -- poly.s's mono path is this code, bit for bit in its output.
+|
 | A FLEX track whose sample is named SYNTH* (the file name on the card, e.g.
 | SYNTH.wav in any FLEX slot) has its sample data GENERATED here every frame
 | instead of taken from the flex pool. Phase 1 wrote a sine at C4 and let the

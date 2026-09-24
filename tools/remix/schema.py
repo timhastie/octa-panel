@@ -574,10 +574,15 @@ class Detour:
     """A stock instruction rewritten to reach a linked unit's symbol.
 
     `kind`: "jmp" (the stub replays what it displaced and jumps back or on;
-    the common case), "jsr" (the stub returns), or "lea" (the six-byte
+    the common case), "jsr" (the stub returns), "lea" (the six-byte
     `lea abs.l,An` at `site` keeps its opcode and gets the symbol as its
-    operand -- midisc's SAVE_ALL). `expect` is stock bytes at `site`, whole
-    instructions. `pad_to` = total bytes to overwrite: the six-byte
+    operand -- midisc's SAVE_ALL), or "ptr" (24 Sep 2026: `site` is a
+    4-byte POINTER in a stock table -- the kind table's FLEX renderer entry
+    0x400d6438 -- and the symbol's address replaces it; `expect` is the
+    stock pointer, four bytes, nothing is padded. This is how a stock
+    pointer array names a DRAM unit's routine: a Poke cannot, its `write`
+    is bytes fixed before the link). `expect` is stock bytes at `site`,
+    whole instructions. `pad_to` = total bytes to overwrite: the six-byte
     instruction then `nop`s, so a displaced span longer than six is not
     left half-rewritten (midisc's 8/10-byte sites); None writes six.
     `target` names a STOCK address instead of a symbol (midisc's

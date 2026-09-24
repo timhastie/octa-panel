@@ -592,7 +592,10 @@ is the stock bytes at `site` (whole instructions), asserted before
 anything is written — a site that has moved stops the build rather than
 being written over. `kind="jmp"` for a stub that replays what it displaced
 and jumps on (the common shape), `"jsr"` for a callable that returns,
-`"lea"` to rewrite the operand of a six-byte `lea abs.l,An`. `pad_to` nops
+`"lea"` to rewrite the operand of a six-byte `lea abs.l,An`, `"ptr"` to
+rewrite a four-byte pointer in a stock table (the kind table's FLEX
+renderer entry that `modules/synth` points at its DRAM unit; `expect` is
+the stock pointer). `pad_to` nops
 the rest of a displaced span longer than six bytes; `target=` names a
 stock address instead of a symbol.
 

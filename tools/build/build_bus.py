@@ -1669,12 +1669,21 @@ def main():
             sys.exit(f"{_m.key} detour {_d.note or _d.symbol} at 0x{_d.site:08x} finds "
                      f"{_got.hex()}, not {_d.expect.hex()}; refusing")
         _target = _d.target if _d.target is not None else _sym[_d.unit][_d.symbol]
-        _op = {"jmp": b"\x4e\xf9", "jsr": b"\x4e\xb9", "lea": _d.expect[:2]}[_d.kind]
+        # "ptr" (24 Sep 2026): a 4-byte POINTER -- a table entry, the kind
+        # table's FLEX renderer 0x400d6438 -- rewritten to the symbol, so a
+        # stock pointer array can name a DRAM unit's routine the way a jmp
+        # names it (a Poke cannot: its `write` is bytes decided before the
+        # link). `expect` is the stock pointer, four bytes; nothing is padded.
+        _op = {"jmp": b"\x4e\xf9", "jsr": b"\x4e\xb9", "lea": _d.expect[:2],
+               "ptr": b""}[_d.kind]
         _w = _op + _target.to_bytes(4, "big")
-        _n = _d.pad_to or 6
-        assert _n >= 6 and _n % 2 == 0, \
-            f"{_m.key} detour at 0x{_d.site:08x}: pad_to {_n} must be an even count >= 6"
-        img[_d.site - BASE:_d.site - BASE + _n] = _w + b"\x4e\x71" * ((_n - 6) // 2)
+        _n = _d.pad_to or len(_w)
+        assert _n >= len(_w) and _n % 2 == 0, \
+            f"{_m.key} detour at 0x{_d.site:08x}: pad_to {_n} must be an even count >= {len(_w)}"
+        if _d.kind == "ptr" and (len(_d.expect) != 4 or _n != 4):
+            sys.exit(f"{_m.key} detour at 0x{_d.site:08x}: a ptr detour rewrites exactly the "
+                     f"four bytes of one pointer (expect {len(_d.expect)} B, pad_to {_n})")
+        img[_d.site - BASE:_d.site - BASE + _n] = _w + b"\x4e\x71" * ((_n - len(_w)) // 2)
         _what = f"{_d.unit}:{_d.symbol}" if _d.target is None else "stock"
         print(f"  {_m.key}: {_d.kind} 0x{_d.site:08x} -> {_what} 0x{_target:08x}  {_d.note}")
 

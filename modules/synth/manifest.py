@@ -46,96 +46,51 @@ feedback loop and the index envelope over the stock dial. Ranges, defaults
 and knob handlers are the stock record's; every other page and every
 non-synth track draws as stock.
 
+THE ENGINE IN DRAM, AND POLY (phase 5, 24 Sep 2026). The voice engine is a
+DRAM unit now, modules/synth/poly.s (`Linked(dram=True)`: linked into the
+platform runtime at the arena reserve's base, appended behind the loader,
+depacked at boot; the unit gives up 10 MB of sample memory); the kind
+table's FLEX entry is pointed at its sy_render by a Detour of kind "ptr"
+(added to the build for this: a 4-byte stock pointer rewritten to a
+symbol). With the project's POLY setting on (modules/quantizer, the byte
+next to GLIDE) a synth track has four voices playing the chord shape the
+LFO page's slot 5 (CHRD) selects, per-voice release from the AMP REL byte,
+per-voice glide, live keys held together (the quantizer's key hooks feed
+the engine through a pinned mailbox), every chord note snapped onto the
+quantizer's SCALE (its mask through the pinned trampoline SCALE_AT), a
+voice count VOIC in the LFO page's slot 2 (1..4, default 4: a trig takes
+that many notes of the shape, the root first), LFO 3 muted on a synth track
+in both modes (two detours at the LFO engine's depth read -- the routine and
+its copy inlined in the frame builder; its default PMTR is PTCH and its
+slots are CHRD and VOIC there) and an LFO page whose slots 2 and 5 read
+VOIC and CHRD (a detour at the page resolver's LFO-descriptor load; the
+clone is built from the stock record on first use). POLY off is phase 4,
+bit for bit (LFO 3 aside).
+
 Verified in ot_emu through the virtual panel and the pipe (README).
 UNFLASHED.
 """
 
-from remix.schema import CavePatch, Kind, Module
+from remix.schema import CavePatch, Detour, Kind, Linked, Module
 
 # The kind table's FLEX entry: kind -> renderer, 8 longs at 0x400d6434.
 KIND_TABLE_FLEX = 0x400d6438
 STOCK_RENDERER = bytes.fromhex("40004008")
+# POLY (24 Sep 2026, poly.s): the LFO engine's depth read `mvsw %a2@(0x12,
+# %d2:l:2),%d0; lea %a0@(0,%d4:l:2),%a1` (LFO 3 is muted on a poly synth
+# track) and the page resolver's LFO-descriptor load `movel #0x400d37f6,%d0;
+# bras 0x40031ed6` (the CHRD page for a poly synth track).
+LFO_DEPTH_HOOK = 0x40003ca4              # the routine 0x40003b90
+LFO_DEPTH_HOOK2 = 0x4000d03e             # its copy inlined in the frame builder (0x4000cf40..)
+LFO_DEPTH_STOCK = bytes.fromhex("71722a12" "43f04a00")
+LFO_PAGE_HOOK = 0x40031e62
+LFO_PAGE_STOCK = bytes.fromhex("203c400d37f6" "606c")
 
-# synth.s layout (24 Sep 2026, GLIDE): sy_render at +0, sy_glide +0x326,
-# sy_slew +0x32e, the ratio table +0x3be, the sine table +0x400 (.balign),
-# the per-track state +0x604 (8 x 44 bytes; +40 = the slewed PTCH word).
-CAVE_LEN = 0x764
-
-# Ratified bytes: synth.s with m68k-elf-as -mcpu=5475, linked at 0x400d7000
-# and 0x400d7300 (identical: OS absolutes and pc-relative references only).
-# Pinned 24 Sep 2026 (GLIDE; linked at 0x400d7000 and 0x400d7300: identical).
-PINNED = bytes.fromhex(
-    "4fefffd048d77cfc247980001c80242f0034762c4c02380047fa05ead7c32879"
-    "800062a878007210b2af0040660000c841f946104d0c41f02800081000046700"
-    "0098263c000000a84c02380041f9800049d8207038082608670000780483100b"
-    "14f00c8300024640640000682248263c000000ff7398670000140c810000002f"
-    "66000004224853836600ffea41fa032a760573987b99b2856600003853836600"
-    "fff242ab000442ab002042ab0018223c01000000274100082079800062a442a8"
-    "000473d4e189e989274100287601600000047600174300244a2b002467000018"
-    "7dd46100024a7bec000638bc4000397c7f00000678012f2f00402f2f00402f2f"
-    "00402f2f00404eb9400040084fef00102f40002c4a8467000146388639450006"
-    "2006a3430c4040006f00000a048000003c0076002200ea8041f9400aa29441f0"
-    "0c00741be5a92418e289a102a4982901a401080075ac001b6600002a24050c42"
-    "7f006c000020a1c04842e58a6400000ae28a44826000000ae28a068280000000"
-    "a4000900a1c0e6a0223c0184cbb7a0010800a1c0eb882740000c73ec0002e089"
-    "e48941fa021a73f01a00e0804c0108002740001073ec0008203c000002044c00"
-    "1000e0892741001c73ec000ae0896700004224014c021000203c002ed1e04c41"
-    "00000c80000fffff6f000008203c000fffff222b00080481001000006f00001e"
-    "e089e8894c001000e08993ab00086000000c223c010000002741000873ec0004"
-    "203c00000a444c001000e089242b0008e08ae88a4c021000e089e88927410014"
-    "222b00180681000010000c81000080006f000008223c00008000274100184a2b"
-    "0024670000b4242f0034263c000000a84c02380041f9800049d84a3038006700"
-    "00987faa00036700009043ea001020132c2b00042a2b000c246b0010286b0020"
-    "41fa015e7618220c4c2b1800001cd2862401e6aad48279702800757028029484"
-    "e08973c14c012800e082e082d88228444c2b48000014d8802404e6aad4827370"
-    "2800757028029481e08c79c44c042800e082e082d2824c2b18000018d2814241"
-    "22c122c1d085dc8a53876600ff9a268027460004274c0020202f002c4cd77cfc"
-    "4fef00304e7571b9400d2cdc4e756100fff622002006e188e9884a816700006c"
-    "767f96812e3c00000d804c0730002203484173c177c32e3c000001e04c073000"
-    "484377c341f9400aa31426303c00e08be48b2e3c000017c74c0730007e189e81"
-    "eeab222b002890816a0000124480e0884c030000e088928060000012e0884c03"
-    "0000e088d28060000004220027410028e089e8892c014e7553594e5448000040"
-    "008000c0010001030140016a018001c002000203028003000380040004030480"
-    "050005800600068007000780080009000a000b000c000d000e000f0010000000"
-    "00000192032404b5064607d609640af10c7c0e060f8d11121294141315901709"
-    "187e19ef1b5d1cc61e2b1f8c20e7223d238e24da26202760289a29ce2afb2c21"
-    "2d412e5a2f6c307631793274336834533537361236e537b03871392b39db3a82"
-    "3b213bb63c423cc53d3f3daf3e153e723ec53f0f3f4f3f853fb13fd43fec3ffb"
-    "40003ffb3fec3fd43fb13f853f4f3f0f3ec53e723e153daf3d3f3cc53c423bb6"
-    "3b213a8239db392b387137b036e536123537345333683274317930762f6c2e5a"
-    "2d412c212afb29ce289a2760262024da238e223d20e71f8c1e2b1cc61b5d19ef"
-    "187e170915901413129411120f8d0e060c7c0af1096407d6064604b503240192"
-    "0000fe6efcdcfb4bf9baf82af69cf50ff384f1faf073eeeeed6cebedea70e8f7"
-    "e782e611e4a3e33ae1d5e074df19ddc3dc72db26d9e0d8a0d766d632d505d3df"
-    "d2bfd1a6d094cf8ace87cd8ccc98cbadcac9c9eec91bc850c78fc6d5c625c57e"
-    "c4dfc44ac3bec33bc2c1c251c1ebc18ec13bc0f1c0b1c07bc04fc02cc014c005"
-    "c000c005c014c02cc04fc07bc0b1c0f1c13bc18ec1ebc251c2c1c33bc3bec44a"
-    "c4dfc57ec625c6d5c78fc850c91bc9eecac9cbadcc98cd8cce87cf8ad094d1a6"
-    "d2bfd3dfd505d632d766d8a0d9e0db26dc72ddc3df19e074e1d5e33ae4a3e611"
-    "e782e8f7ea70ebeded6ceeeef073f1faf384f50ff69cf82af9bafb4bfcdcfe6e"
-    "0000000000000000000000000000000000000000000000000000000000000000"
-    "0000000000000000000000000000000000000000000000000000000000000000"
-    "0000000000000000000000000000000000000000000000000000000000000000"
-    "0000000000000000000000000000000000000000000000000000000000000000"
-    "0000000000000000000000000000000000000000000000000000000000000000"
-    "0000000000000000000000000000000000000000000000000000000000000000"
-    "0000000000000000000000000000000000000000000000000000000000000000"
-    "0000000000000000000000000000000000000000000000000000000000000000"
-    "0000000000000000000000000000000000000000000000000000000000000000"
-    "0000000000000000000000000000000000000000000000000000000000000000"
-    "0000000000000000000000000000000000000000000000000000000000000000"
-    "00000000"
-)
-assert len(PINNED) == CAVE_LEN, len(PINNED)
-assert PINNED[:4] == bytes.fromhex("4fefffd0")          # sy_render: lea -48(%sp),%sp
-
-
-def emit(addr: int):
-    """The source is the only truth for the bytes (b""); the one poke depends on
-    where the cave lands: the kind table's FLEX entry -> sy_render (+0)."""
-    return b"", ((KIND_TABLE_FLEX, STOCK_RENDERER, addr.to_bytes(4, "big")),)
-
-
+# The FM voice engine is a DRAM unit since 24 Sep 2026 (poly.s, the
+# paraphonic engine): linked into the platform runtime at the base of the
+# arena reserve, depacked by the loader at boot; the kind table's FLEX entry
+# is rewritten to its sy_render by a "ptr" detour (the pointer's stock value
+# asserted first). synth.s, the ROM cave it replaced, is kept for the record.
 # ---- phase 3: the page (modules/synth/page.s) ----------------------------------
 # The PLAYBACK page presents the synth: a detour in the page-descriptor
 # resolver (0x40031da4, the kind-0 `tbl[machine]` load at 0x40031ece) returns a
@@ -234,17 +189,24 @@ MODULE = Module(
         "voice (STRT/LEN/RTRG/RTIM = ratio/index/feedback/decay); the DSP "
         "shapes and effects it as a sample. Its PLAYBACK page reads RATO/INDX/"
         "FDBK/DEC with icons and the title FM SYNTH.",
+    linked=(
+        Linked("poly", "modules/synth/poly.s", cpu="5475", dram=True),
+    ),
+    detours=(
+        Detour(KIND_TABLE_FLEX, STOCK_RENDERER, "poly", "sy_render",
+               "kind table FLEX renderer -> the DRAM unit's sy_render (SYNTH*-named "
+               "samples become the FM voice)", kind="ptr"),
+        Detour(LFO_DEPTH_HOOK, LFO_DEPTH_STOCK, "poly", "po_lfo3",
+               "LFO engine (the routine) depth read: LFO 3 reads depth 0 on a synth track with POLY on",
+               kind="jmp", pad_to=8),
+        Detour(LFO_DEPTH_HOOK2, LFO_DEPTH_STOCK, "poly", "po_lfo3b",
+               "LFO engine (the frame builder's inlined copy) depth read: the same",
+               kind="jmp", pad_to=8),
+        Detour(LFO_PAGE_HOOK, LFO_PAGE_STOCK, "poly", "po_lfopage",
+               "page resolver LFO descriptor: a synth track with POLY on gets the CHRD clone",
+               kind="jmp", pad_to=8),
+    ),
     cf_patches=(
-        CavePatch(
-            label="synth cave",
-            cave_addr=None,                   # floats: position independent
-            pinned=PINNED,
-            source="modules/synth/synth.s",
-            emit=emit,
-            reference=lambda addr: PINNED,    # the same bytes at any address
-            report_note=" (FLEX renderer kind-table entry 0x400d6438 -> sy_render; "
-                        "SYNTH*-named samples become a 2-op FM voice)",
-        ),
         CavePatch(
             label="synth page",
             cave_addr=PAGE_AT,                # pinned: the descriptor clone's pointers
