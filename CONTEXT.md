@@ -301,3 +301,5 @@ EMAC-fixed Unicorn (`scripts/build_unicorn.sh`), `vendor/dsp56300` pinned to
 - Memory: the child's RSS is flat during play since O18 (13 Sep 2026: the
   peripheral-write seed log was unbounded); the panel UART tx buffer still
   grows ~0.7 MB per hour (needs a cursor change in main.cpp).
+
+- **23 Sep 2026, first hardware candidate: BUILD 80 = SCALE QUANTIZER only** (`BUILD=80 REMIX=quantizer make image-cf`): `out/OCTATRACK_OCTABAM80_cf.bin` (card path) / `out/OCTATRACK_OS1.40C_OCTABAM80_cf.syx` (MIDI path), copy of the OS section at `out/mainos_quantizer_80.bin`. Verified before hand-over: the official .syx holds ONE section (id 3 MAIN OS, no bootstrap), the packer round-trips it byte-identically, our .syx has the same single section, checksums ok, section 3 == the build, 1,239 bytes differ from stock at the 17 documented sites (three detours, the SEQUENCER window, three project-file hooks, the cave 0x400d6b82.., the grown tables 0x400d7100/7180/7200); the emulator boots it, PLAY sounds, PROJECT > CONTROL > SEQUENCER shows SCALE OFF -> PHRYGN -> OFF. NOT flashed yet. `out/mainos_cf.bin` is back to the full tim build (the app's default).
