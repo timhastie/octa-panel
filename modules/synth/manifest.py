@@ -46,26 +46,25 @@ feedback loop and the index envelope over the stock dial. Ranges, defaults
 and knob handlers are the stock record's; every other page and every
 non-synth track draws as stock.
 
-THE ENGINE IN DRAM, AND POLY (phase 5, 24 Sep 2026). The voice engine is a
-DRAM unit now, modules/synth/poly.s (`Linked(dram=True)`: linked into the
-platform runtime at the arena reserve's base, appended behind the loader,
-depacked at boot; the unit gives up 10 MB of sample memory); the kind
-table's FLEX entry is pointed at its sy_render by a Detour of kind "ptr"
-(added to the build for this: a 4-byte stock pointer rewritten to a
-symbol). With the project's POLY setting on (modules/quantizer, the byte
-next to GLIDE) a synth track has four voices playing the chord shape the
-LFO page's slot 5 (CHRD) selects, per-voice release from the AMP REL byte,
-per-voice glide, live keys held together (the quantizer's key hooks feed
-the engine through a pinned mailbox), every chord note snapped onto the
-quantizer's SCALE (its mask through the pinned trampoline SCALE_AT), a
-voice count VOIC in the LFO page's slot 2 (1..4, default 4: a trig takes
-that many notes of the shape, the root first), LFO 3 muted on a synth track
-in both modes (two detours at the LFO engine's depth read -- the routine and
-its copy inlined in the frame builder; its default PMTR is PTCH and its
-slots are CHRD and VOIC there) and an LFO page whose slots 2 and 5 read
-VOIC and CHRD (a detour at the page resolver's LFO-descriptor load; the
-clone is built from the stock record on first use). POLY off is phase 4,
-bit for bit (LFO 3 aside).
+THE ENGINE IN DRAM, AND PARAPHONIC CHORDS (phase 5, 24 Sep 2026). The
+voice engine is a DRAM unit now, modules/synth/poly.s (`Linked(dram=True)`:
+linked into the platform runtime at the arena reserve's base, appended
+behind the loader, depacked at boot; the unit gives up 10 MB of sample
+memory); the kind table's FLEX entry is pointed at its sy_render by a
+Detour of kind "ptr" (added to the build for this: a 4-byte stock pointer
+rewritten to a symbol). On a synth track the LFO page is always a clone
+(built from the stock record on first use, a detour at the page resolver's
+LFO-descriptor load) whose slot 2 is VOIC (1..4, default 1; SPD3's byte, a
+stock or out-of-range byte reads 1) and slot 5 CHRD (the chord shape, "----"
+while VOIC is 1); LFO 3 is muted on a synth track (two detours at the LFO
+engine's depth read -- the routine and its copy inlined in the frame
+builder; its default PMTR is PTCH). VOIC is the switch: 1 = the mono synth
+of phase 4, bit for bit (GLIDE legato, the stock lifecycle); 2..4 = that
+many voices playing the chord shape at every trig or live key, per-voice
+release from the AMP REL byte, per-voice glide, live keys held together
+(the quantizer's key hooks feed the engine through a pinned mailbox), every
+chord note snapped onto the quantizer's SCALE (its mask through the pinned
+trampoline SCALE_AT).
 
 Verified in ot_emu through the virtual panel and the pipe (README).
 UNFLASHED.
@@ -76,10 +75,10 @@ from remix.schema import CavePatch, Detour, Kind, Linked, Module
 # The kind table's FLEX entry: kind -> renderer, 8 longs at 0x400d6434.
 KIND_TABLE_FLEX = 0x400d6438
 STOCK_RENDERER = bytes.fromhex("40004008")
-# POLY (24 Sep 2026, poly.s): the LFO engine's depth read `mvsw %a2@(0x12,
-# %d2:l:2),%d0; lea %a0@(0,%d4:l:2),%a1` (LFO 3 is muted on a poly synth
-# track) and the page resolver's LFO-descriptor load `movel #0x400d37f6,%d0;
-# bras 0x40031ed6` (the CHRD page for a poly synth track).
+# Phase 5 (24 Sep 2026, poly.s): the LFO engine's depth read `mvsw %a2@(0x12,
+# %d2:l:2),%d0; lea %a0@(0,%d4:l:2),%a1` (LFO 3 is muted on a synth track)
+# and the page resolver's LFO-descriptor load `movel #0x400d37f6,%d0; bras
+# 0x40031ed6` (the VOIC/CHRD page for a synth track).
 LFO_DEPTH_HOOK = 0x40003ca4              # the routine 0x40003b90
 LFO_DEPTH_HOOK2 = 0x4000d03e             # its copy inlined in the frame builder (0x4000cf40..)
 LFO_DEPTH_STOCK = bytes.fromhex("71722a12" "43f04a00")
@@ -197,13 +196,13 @@ MODULE = Module(
                "kind table FLEX renderer -> the DRAM unit's sy_render (SYNTH*-named "
                "samples become the FM voice)", kind="ptr"),
         Detour(LFO_DEPTH_HOOK, LFO_DEPTH_STOCK, "poly", "po_lfo3",
-               "LFO engine (the routine) depth read: LFO 3 reads depth 0 on a synth track with POLY on",
+               "LFO engine (the routine) depth read: LFO 3 reads depth 0 on a synth track",
                kind="jmp", pad_to=8),
         Detour(LFO_DEPTH_HOOK2, LFO_DEPTH_STOCK, "poly", "po_lfo3b",
                "LFO engine (the frame builder's inlined copy) depth read: the same",
                kind="jmp", pad_to=8),
         Detour(LFO_PAGE_HOOK, LFO_PAGE_STOCK, "poly", "po_lfopage",
-               "page resolver LFO descriptor: a synth track with POLY on gets the CHRD clone",
+               "page resolver LFO descriptor: a synth track gets the VOIC/CHRD clone",
                kind="jmp", pad_to=8),
     ),
     cf_patches=(

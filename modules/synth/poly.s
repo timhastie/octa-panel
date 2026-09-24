@@ -4,8 +4,8 @@
 | PLACEMENT.md); the kind table's FLEX entry 0x400d6438 is pointed at
 | sy_render by a "ptr" detour (modules/synth/manifest.py). synth.s, the ROM
 | cave this grew out of, is kept beside it for the record: everything under
-| "the mono voice" below is that cave's code, and with POLY off the samples
-| it produces are the same, bit for bit.
+| "the mono voice" below is that cave's code, and at VOIC 1 the samples it
+| produces are the same, bit for bit.
 |
 | WHAT (phases 1-4, unchanged): a FLEX track whose sample is named SYNTH* has
 | its sample data GENERATED here every frame instead of taken from the flex
@@ -18,11 +18,14 @@
 | around every frame (the voice lifecycle, streaming and the record's
 | headers are its), with PTCH := 0 and RATE := 1.0 for the call.
 |
-| POLY (phase 5). With the project's POLY setting on (PROJECT > CONTROL >
-| SEQUENCER > POLY, the byte at POLY_AT = GLIDE_AT + 1, modules/quantizer)
-| a synth track has FOUR VOICES, each with its own phases, index envelope,
-| slewed pitch and amplitude envelope, summed into the track's one source
-| stream at half level with saturation:
+| PARAPHONIC (phase 5). VOIC, the LFO page's slot 2 on a synth track (SPD3's
+| byte, the page names it VOIC: 1..4, a stock or out-of-range byte reads 1),
+| is the switch: at 1 the track is the mono synth of phase 4 (this file's
+| mono path, GLIDE legato, the stock voice lifecycle, bit for bit); at 2..4
+| a voice START makes the track paraphonic (T_POLY, latched per note): that
+| many voices, each with its own phases, index envelope, slewed pitch and
+| amplitude envelope, summed into the track's one source stream at half
+| level with saturation:
 |   * a voice START (the packer's event bit 4: a sequencer trig or a live
 |     CHROMATIC key) allocates one voice per note of the CHORD SHAPE --
 |     the track's LFO page slot 5 byte (DEP3's storage, the "current value"
@@ -31,12 +34,9 @@
 |     four semitone offsets -- at the record's PTCH word plus the offset,
 |     each note snapped onto the quantizer's SCALE when one is set (po_snap:
 |     the mask through the pinned accessor SCALE_AT, nearest degree, ties
-|     down -- a MAJ shape in a minor scale comes out MIN). VOIC, the LFO
-|     page's slot 2 (SPD3's byte, free because LFO 3 is muted here; current
-|     value 0x80000810 + t*72 + 8, locks honoured), caps the notes a trig
-|     takes at 1..4 -- the root first, dropped from the top; 1 = the root
-|     alone, mono with release tails. A byte outside 1..4 (a Part's stock
-|     SPD3 default, 32) reads as 4;
+|     down -- a MAJ shape in a minor scale comes out MIN). VOIC (current
+|     value 0x80000810 + t*72 + 8, locks honoured) caps the notes a trig
+|     takes at 2..4 -- the root first, dropped from the top;
 |     A free voice is taken first, else the oldest releasing one, else the
 |     oldest sounding one (a global allocation stamp, V_AGE);
 |   * a live key (the quantizer's key hooks leave the key's index+1 in
@@ -70,13 +70,13 @@
 |
 | ALSO HERE: po_lfo3 / po_lfo3b (detours at the depth read of the LFO engine's
 | two copies, 0x40003ca4 and 0x4000d03e: LFO 3's depth is read as 0 on a track
-| whose playing voice is a synth, POLY on or off -- the slot is the chord byte
-| there, and LFO 3's default PMTR is PTCH, so with POLY off a chord left in
-| the slot was a pitch LFO: the same key gave a different pitch each press)
-| and po_lfopage (a detour at the page resolver's LFO-descriptor load
-| 0x40031e62: a synth track with POLY on gets a clone of the LFO descriptor
-| built here on first use, slot 5 named CHRD with a formatter printing the
-| shape's name, slot 2 named VOIC printing 1..4 with that range and default).
+| whose playing voice is a synth, whatever VOIC -- its slots are VOIC and CHRD
+| there, and LFO 3's default PMTR is PTCH, so a chord byte read as its depth
+| was a pitch LFO: the same key gave a different pitch each press) and
+| po_lfopage (a detour at the page resolver's LFO-descriptor load 0x40031e62:
+| every synth track gets a clone of the LFO descriptor built here on first
+| use, slot 2 named VOIC printing 1..4 with that range and default 1, slot 5
+| named CHRD printing the shape's name, or "----" while VOIC is 1).
 |
 | Layout: code, then the tables (ratio, shapes, names, po_relk, the sine
 | table) and the RAM state (per-track records, 32 voice records, the LFO
@@ -104,9 +104,10 @@
         .set    FB_SCALE, 516            | 0.25 cycle / 127 * 2^16
         .set    RAMP_STEP, 4096          | gain Q15: 0 -> 1.0 over 8 frames (2.9 ms)
         .set    RAMP4, 2048              | the same ramp for the poly voices' Q14 gain
+        .set    INC_MAX, 0x2e700000      | a carrier above ~8 kHz (increment > 0.18 cycle a sample) is no note of
+                                         | this synth: the safety net resets such a voice (24 Sep 2026)
         .set    GAIN4, 16384             | a poly voice's full gain (Q14 = 1/2 of the mono voice)
         .set    GLIDE_AT, 0x400d2cdc     | the GLIDE byte (modules/quantizer/manifest.py GLIDE_AT; 0 = off)
-        .set    POLY_AT, 0x400d2cdd      | the POLY byte, next to it (glide.s qz_poly)
         .set    KEYS_AT, 0x400d2cb0      | modules/quantizer/keys.s: qz_pkey[8] bytes, qz_pmask[8] longs at +8
         .set    SCALE_AT, 0x400d2ca8     | modules/quantizer/scale.s: `jmp qz_scale_mask` -- d0 := the scale's pitch-class mask, 0 = OFF
         .set    CURVALS, 0x80000810      | the frame builder's per-track current values, 72 B a track, locks applied
@@ -135,15 +136,20 @@
         .set    S_LASTM, 32              | the modulator's last sample, Q14
         .set    S_ON, 36                 | the playing voice is a synth
         .set    S_CUR, 40                | the slewed PTCH word, Q12 (GLIDE)
-        .set    T_REF, 44                | POLY: the PTCH word at the last voice start
-        .set    T_LAST, 48               | POLY: the PTCH word seen last frame
-        .set    T_MASK, 52               | POLY: the held-key mask seen last frame
-        .set    T_DK, 56                 | POLY: the index decay k this frame (0 = hold)
-        .set    T_RK, 60                 | POLY: the release k this frame (Q16)
-        .set    T_RATIO, 64              | POLY: the ratio this frame (Q8)
-        .set    T_I, 68                  | POLY: the index I this frame
-        .set    T_W, 72                  | POLY: this frame's PTCH word
-        .set    T_SCALE, 76              | POLY: the scale mask at the last start (0 = OFF)
+        .set    T_REF, 44                | paraphonic: the PTCH word at the last voice start
+        .set    T_LAST, 48               | paraphonic: the PTCH word seen last frame
+        .set    T_MASK, 52               | paraphonic: the held-key mask seen last frame
+        .set    T_DK, 56                 | paraphonic: the index decay k this frame (0 = hold)
+        .set    T_RK, 60                 | paraphonic: the release k this frame (Q16)
+        .set    T_RATIO, 64              | paraphonic: the ratio this frame (Q8)
+        .set    T_I, 68                  | paraphonic: the index I this frame
+        .set    T_W, 72                  | paraphonic: this frame's PTCH word
+        .set    T_SCALE, 76              | paraphonic: the scale mask at the last start (0 = OFF)
+        .set    T_POLY, 80               | the note that started last is paraphonic (VOIC 2..4 then)
+        .set    PART_PTR, 0x46c82456     | the bank blob; the Part = blob + part index * 6322
+        .set    PART_IDX, 0x100b14cf
+        .set    UI_TRACK, 0x100b14cc
+        .set    LFO_PAGE_OFF, 0x8ee9a    | the Part's LFO page bytes, 24 a track: +2 = VOIC, +5 = CHRD
 | ---- a voice record, 64 bytes (the first 36 match the mono voice's fields)
         .set    V_STRIDE, 64
         .set    V_PHC, 0
@@ -221,9 +227,21 @@ sy_cmp:
         lsl.l   #8,%d1
         lsl.l   #4,%d1
         move.l  %d1,S_CUR(%a3)
+        move.l  #CV_STRIDE,%d1           | VOIC (the current value, locks applied) 2..4: this note
+        muls.l  %d2,%d1                  | is paraphonic; 1, or anything outside 1..4: the mono voice
+        lea     CURVALS,%a0
+        mvz.b   CV_VOIC(%a0,%d1.l),%d1
+        subq.l  #2,%d1
+        cmpi.l  #2,%d1
+        sls     %d1
+        move.b  %d1,T_POLY(%a3)
+        bne     sy_synth                 | a mono note: whatever paraphonic voices the track had
+        bsr     po_free                  | are ownerless now -- freed (safety net)
+sy_synth:
         moveq   #1,%d3
         bra     sy_set
 sy_no:
+        bsr     po_free                  | not a synth: nothing of ours may sound on this track
         moveq   #0,%d3
 sy_set:
         move.b  %d3,S_ON(%a3)
@@ -231,8 +249,8 @@ sy_ison:
         tst.b   S_ON(%a3)
         beq     sy_call
         mvz.w   (%a4),%d6                | PTCH word (raw << 8; 0x4000 = 0 semitones)
-        tst.b   POLY_AT
-        bne     sy_neutral               | POLY: the voices slew on their own (po_frame)
+        tst.b   T_POLY(%a3)
+        bne     sy_neutral               | paraphonic: the voices slew on their own (po_frame)
         bsr     sy_slew                  | GLIDE: d6 := the word slewed toward it
 sy_neutral:
         mvz.w   6(%a4),%d5               | RATE word (0x7f00 = 1.0)
@@ -251,14 +269,20 @@ sy_call:
         beq     sy_check
         move.w  %d6,(%a4)                | restore PTCH and RATE for the DSP
         move.w  %d5,6(%a4)
-        tst.b   POLY_AT
+        tst.b   T_POLY(%a3)
         beq     sy_mono_frame
-        bsr     po_frame                 | POLY: the voices' frame (preserves a2, a3, d2)
+        bsr     po_frame                 | paraphonic: the voices' frame (preserves a2, a3, d2)
         bra     sy_check
 
 | ---- the mono voice's frame: the rate, as the stock renderer computes it -----
 sy_mono_frame:
         bsr     po_rate                  | d0 = C4_INC * rate(d6, d5) (clobbers d0/d1/d3/d4/a0)
+        cmpi.l  #INC_MAX,%d0             | safety net: an impossible pitch (a word off the curve's
+        bls     sy_mono_inc              | table, a stale record) silences the voice instead of
+        moveq   #0,%d0                   | playing garbage -- increment 0, gain 0 (the ramp
+        clr.l   S_GAIN(%a3)              | recovers as soon as the word is sane again)
+        clr.l   S_IEFF(%a3)
+sy_mono_inc:
         move.l  %d0,S_INC(%a3)           | carrier increment: the true pitch
 
 | ---- the parameters ---------------------------------------------------------
@@ -326,13 +350,18 @@ sy_check:
         move.l  #VOICE_STRIDE,%d3
         muls.l  %d2,%d3
         lea     VOICE_BASE,%a0
-        tst.b   (%a0,%d3.l)              | the CF voice ended: leave stock's silence
+        tst.b   (%a0,%d3.l)              | the CF voice ended: leave stock's silence ...
+        bne     sy_alive
+        tst.b   T_POLY(%a3)
         beq     sy_done
+        bsr     po_free                  | ... and free the paraphonic voices: their owner is gone
+        bra     sy_done
+sy_alive:
         mvz.b   3(%a2),%d7               | source samples shipped by this call
         beq     sy_done
         lea     16(%a2),%a1              | their first L long
-        tst.b   POLY_AT
-        bne     po_fill                  | POLY: sum the voices (ends at sy_done)
+        tst.b   T_POLY(%a3)
+        bne     po_fill                  | paraphonic: sum the voices (ends at sy_done)
         move.l  S_PHC(%a3),%d0
         move.l  S_PHM(%a3),%d6
         move.l  S_INC(%a3),%d5
@@ -504,7 +533,7 @@ sy_sl_store:
         move.l  %d1,%d6                  | the slewed PTCH word
         rts
 
-| ==== POLY: the voices' frame (the second call, after the stock call) ============
+| ==== PARAPHONIC: the voices' frame (the second call, after the stock call) ======
 | In: d2 = track, a3 = the track record, a4 = fp, d6 = the PTCH word, d5 = the
 | RATE word. Preserves a2, a3, d2 (sy_check needs them). Uses a5 = the track
 | record, a6 = the voice being updated, a2 = the end of the track's voices.
@@ -617,6 +646,12 @@ po_fr_down:
         neg.l   %d7
         asr.l   %d7,%d0
 po_fr_inc:
+        cmpi.l  #INC_MAX,%d0             | safety net: an impossible pitch frees the voice
+        bls     po_fr_inc1
+        clr.b   V_STATE(%a6)
+        clr.l   V_GAIN(%a6)
+        bra     po_fr_next
+po_fr_inc1:
         move.l  %d0,V_INC(%a6)
         asr.l   #8,%d0
         muls.l  T_RATIO(%a5),%d0
@@ -683,6 +718,22 @@ po_fr_next:
         lea     8(%sp),%sp
         rts
 
+| ---- po_free: track d2's four voices freed (state 0, gain 0): the safety net when
+| their owner -- the stock voice, or a paraphonic note -- is gone. Clobbers d0, a0.
+po_free:
+        lea     po_voices(%pc),%a0
+        move.l  %d2,%d0
+        lsl.l   #8,%d0
+        add.l   %d0,%a0
+        moveq   #4,%d0
+po_free1:
+        clr.b   V_STATE(%a0)
+        clr.l   V_GAIN(%a0)
+        lea     V_STRIDE(%a0),%a0
+        subq.l  #1,%d0
+        bne     po_free1
+        rts
+
 | ---- po_voices_of: a6 = track d2's four voice records, a2 = their end ---------
 po_voices_of:
         lea     po_voices(%pc),%a6
@@ -726,19 +777,23 @@ po_st_rel1:
         cmp.l   %a2,%a6
         bne     po_st_rel
 po_st_chord:
-        jsr     SCALE_AT                 | the quantizer's SCALE: its pitch-class mask, 0 = OFF (clobbers d0, a0)
+        moveq   #0,%d0
+        mvz.w   SCALE_AT,%d1             | the quantizer's SCALE accessor is there (`jmp`; a remix
+        cmpi.l  #0x4ef9,%d1              | without the quantizer has zeros: no scale) ...
+        bne     po_st_ns
+        jsr     SCALE_AT                 | ... its pitch-class mask, 0 = OFF (clobbers d0, a0)
+po_st_ns:
         move.l  %d0,T_SCALE(%a5)
         move.l  #CV_STRIDE,%d0
         muls.l  %d2,%d0
         lea     CURVALS,%a0
-        mvz.b   CV_VOIC(%a0,%d0.l),%d6   | VOIC: the notes a trig may take, locks applied; the byte
-        bne     po_st_v1                 | is 1..4 once the knob has touched it, and a Part's stock
-        moveq   #1,%d6                   | SPD3 default (32) or anything above reads as 4
+        mvz.b   CV_VOIC(%a0,%d0.l),%d6   | VOIC: the notes a trig may take, locks applied (2..4 here:
+        subq.l  #1,%d6                   | the note started paraphonic on this byte; a byte outside
+        cmpi.l  #3,%d6                   | 1..4 reads 1)
+        bls     po_st_v1
+        moveq   #0,%d6
 po_st_v1:
-        cmpi.l  #4,%d6
-        ble     po_st_v2
-        moveq   #4,%d6
-po_st_v2:
+        addq.l  #1,%d6
         mvz.b   CV_CHRD(%a0,%d0.l),%d0   | the chord byte, locks applied
         lsr.l   #2,%d0                   | 0..31
         lea     po_shapes(%pc),%a1
@@ -883,7 +938,7 @@ po_rank:
         .byte   0, 2, 1, 0
         .align  2
 
-| ==== POLY: the samples -- every sounding voice summed into the record ===========
+| ==== PARAPHONIC: the samples -- every sounding voice summed into the record =====
 | From sy_check: a1 = the first L long, d7 = the source count, a3 = the track
 | record, 52(sp) = track. Each voice adds c * gain (Q14) into the L long; the
 | final pass doubles (the mono voice's Q15 format), saturates and copies to R.
@@ -987,8 +1042,8 @@ po_fi_satp:
 | for the audio tracks' frames). At the depth read of both -- `mvsw
 | %a2@(0x12,%d2:l:2),%d0; lea %a0@(0,%d4:l:2),%a1` at 0x40003ca4 and at
 | 0x4000d03e -- d2 = the LFO (2 = LFO 3), a4 = the track's LFO state
-| (LFO_STATE + 8 * track), a2 = its fp record, a0 = its staging record. With
-| POLY on and the track playing a synth voice, LFO 3's depth reads as 0: the
+| (LFO_STATE + 8 * track), a2 = its fp record, a0 = its staging record. On a
+| track playing a synth voice LFO 3's depth reads as 0, whatever VOIC: the
 | chord byte modulates nothing. d1/d3/d4/d7 are dead here (reloaded by the
 | code that follows); a0 is done with. The stubs share po_lfo3_depth.
 po_lfo3:
@@ -1002,7 +1057,7 @@ po_lfo3_depth:
         lea     (%a0,%d4.l*2),%a1        | displaced
         cmpi.l  #2,%d2
         bne     po_l3_back
-        move.l  %a4,%d1                  | (POLY on or off: slot 5 is the chord byte on a synth track,
+        move.l  %a4,%d1                  | (whatever VOIC: slot 5 is the chord byte on a synth track,
         subi.l  #LFO_STATE,%d1
         lsr.l   #3,%d1                   | the track
         lsl.l   #7,%d1
@@ -1017,12 +1072,10 @@ po_l3_back:
 | `movel #0x400d37f6,%d0; bras 0x40031ed6`. d3 = track, d1 = part index, a1 =
 | the bank blob, d5 = the machine byte (0x40031e2a); d2-d5 are restored by the
 | epilogue at RESOLVER_RET, d0/d1/a0/a1 are C scratch. For a FLEX track whose
-| assigned FLEX slot's sample is named SYNTH* (page.s's test) with POLY on, the
-| clone -- built from the stock descriptor on first use -- is returned.
+| assigned FLEX slot's sample is named SYNTH* (page.s's test) the clone --
+| built from the stock descriptor on first use -- is returned.
 po_lfopage:
         move.l  #LFO_P,%d0               | displaced: the stock descriptor
-        tst.b   POLY_AT
-        beq     po_lp_done
         cmpi.l  #1,%d5                   | FLEX?
         bne     po_lp_done
         move.l  #6322,%d2
@@ -1082,11 +1135,11 @@ po_lp_copy:
         move.w  (%a0),0x16+16(%a1)
         lea     po_fmt_voic(%pc),%a0     | ... printing 1..4 ...
         move.l  %a0,0xca+8(%a1)
-        moveq   #1,%d4                   | ... range 1..4, default 4 (the knob clamps to them;
-        move.l  %d4,0x6a+8(%a1)          | a Part's stock byte 32 reads as 4 until turned) ...
+        moveq   #1,%d4                   | ... range 1..4, default 1 (the knob clamps to them;
+        move.l  %d4,0x6a+8(%a1)          | a Part's stock byte 32 reads as 1 until turned) ...
+        move.b  %d4,0x5e+2(%a1)
         moveq   #4,%d4
         move.l  %d4,0x9a+8(%a1)
-        move.b  %d4,0x5e+2(%a1)
         clr.l   0x12a+8(%a1)             | ... the stock enum stepper (handler 0, as PMTR/WAVE: one
                                          | step a detent; the accumulator handlers scale by the range) ...
         move.l  0x18e(%a1),%d4           | ... both always shown (nibbles 2 and 5, bit 2)
@@ -1100,15 +1153,15 @@ po_lp_have:
 po_lp_done:
         jmp     RESOLVER_RET
 
-| ---- po_fmt_voic: fmt(buf, value) -> "1".."4" (the byte clamped, as the engine reads it) --
+| ---- po_fmt_voic: fmt(buf, value) -> "1".."4" (a byte outside 1..4 reads 1, as the engine reads it) --
 po_fmt_voic:
         move.l  8(%sp),%d0
-        bne     po_fv1
-        moveq   #1,%d0
+        subq.l  #1,%d0
+        cmpi.l  #3,%d0
+        bls     po_fv1
+        moveq   #0,%d0
 po_fv1:
-        cmpi.l  #4,%d0
-        ble     po_fv2
-        moveq   #4,%d0
+        addq.l  #1,%d0
 po_fv2:
         move.l  %d0,-(%sp)
         pea     po_f_d(%pc)
@@ -1117,11 +1170,31 @@ po_fv2:
         lea     12(%sp),%sp
         rts
 
-| ---- po_fmt_chord: fmt(buf, value) -> the shape's name, sprintf "%s" -----------
+| ---- po_fmt_chord: fmt(buf, value) -> the shape's name, sprintf "%s"; "----" while the
+| current track's Part VOIC is 1 (the chord has no effect then) ------------------
 po_fmt_chord:
+        movea.l PART_PTR,%a0
+        mvz.b   PART_IDX,%d0
+        move.l  #6322,%d1
+        muls.l  %d1,%d0
+        adda.l  %d0,%a0                  | the Part
+        adda.l  #LFO_PAGE_OFF,%a0
+        mvz.b   UI_TRACK,%d0
+        lsl.l   #3,%d0                   | track * 8 ...
+        move.l  %d0,%d1
+        add.l   %d1,%d0
+        add.l   %d1,%d0                  | ... * 3 = track * 24
+        mvz.b   2(%a0,%d0.l),%d0         | its VOIC
+        subq.l  #2,%d0
+        cmpi.l  #2,%d0                   | 2..4: the shape
+        bls     po_fc_shape
+        moveq   #0,%d0                   | 1: "----"
+        bra     po_fc_name
+po_fc_shape:
         move.l  8(%sp),%d0               | the value
         lsr.l   #2,%d0
         andi.l  #31,%d0
+po_fc_name:
         move.l  %d0,%d1
         lsl.l   #2,%d1
         add.l   %d1,%d0                  | * 5

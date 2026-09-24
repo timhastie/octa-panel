@@ -28,19 +28,18 @@
 | first key does nothing and releasing the last one releases the note (the
 | 303 rule). Two more detours in the chromatic key handler, qz_leg1 / qz_leg2.
 |
-| POLY (24 Sep 2026): a sixth SEQUENCER row, OFF / ON, the synth machine's
-| paraphonic mode (modules/synth/poly.s: four voices a track, chord shapes
-| from the LFO page's slot 5), saved as "#SYNTH_POLY=n" after the GLIDE
-| line; the byte is qz_poly, pinned next to qz_glide (glide.s). With POLY on,
-| on a FLEX track whose assigned slot is a SYNTH* sample (qz_is_synth), the
-| CHROMATIC keys are polyphonic: a press while keys are held starts a fresh
-| voice and ends nothing (qz_leg1); every press posts the key for the engine
-| (qz_pkey) and sets its bit in the track's held-key mask (qz_pmask, keys.s);
-| a release clears the bit -- the engine releases that key's voices -- sends
-| the key's MIDI note-off, and only the LAST key's release takes the stock
-| note-off path, which posts the track's AMP release (qz_leg0, a third detour
-| on the handler's release path). Legato is off while POLY is on. Every
-| other track behaves as stock.
+| PARAPHONIC KEYS (24 Sep 2026): on a FLEX track whose assigned slot is a
+| SYNTH* sample (qz_is_synth) and whose Part's VOIC byte -- the LFO page's
+| slot 2, SPD3's byte, which the synth's page names VOIC -- is 2..4
+| (qz_polytrack), the CHROMATIC keys are polyphonic: a press while keys are
+| held starts a fresh voice and ends nothing (qz_leg1); every press posts the
+| key for the engine (qz_pkey) and sets its bit in the track's held-key mask
+| (qz_pmask, keys.s); a release clears the bit -- the engine releases that
+| key's voices -- sends the key's MIDI note-off, and only the LAST key's
+| release takes the stock note-off path, which posts the track's AMP release
+| (qz_leg0, a third detour on the handler's release path). Legato is off on
+| such a track. VOIC 1 (or a byte outside 1..4, the stock 32) and every
+| other track: stock, byte for byte -- the mono synth with GLIDE legato.
 |
 | Linked by the build at the address it lands on (modules/quantizer/
 | manifest.py names the sites); the only absolute references to itself are
@@ -50,7 +49,7 @@
         .global qz_knob, qz_plock, qz_chrom, qz_draw, qz_ld_entry, qz_ld_line, qz_wr
         .global qz_get, qz_set, qz_lbl_scale, qz_scale
         .global qz_get_glide, qz_set_glide, qz_lbl_glide, qz_leg1, qz_leg2
-        .global qz_get_poly, qz_set_poly, qz_lbl_poly, qz_leg0, qz_scale_mask
+        .global qz_leg0, qz_scale_mask
         .set    HELD, 0x460d171d          | the chromatic key handler's held key per track (key + 1; 0 = none)
         .set    FUNC_HELD, 0x46c7dd26
         .set    MIDI_NOTE, 0x4003f3a8     | (track, note, velocity): the key's MIDI note out
@@ -83,13 +82,40 @@ qz_scale_mask:
 qz_sm_ret:
         rts
 
-| qz_polytrack: d0 := 1 (flags NE) when POLY is on and track d2 is a FLEX
-| track whose assigned FLEX slot holds a SYNTH*-named sample, else 0 (EQ).
-| The one place the key hooks read the POLY byte (glide.s qz_poly).
+| qz_polytrack: d0 := 1 (flags NE) when track d2 is a FLEX track whose
+| assigned FLEX slot holds a SYNTH*-named sample AND its Part's VOIC byte
+| (the LFO page's slot 2: Part + 0x8ee9a + track*24 + 2) is 2..4, else 0
+| (EQ). Preserves everything but d0.
 qz_polytrack:
-        mvz.b   qz_poly,%d0
-        jbeq    qz_pt_ret
         jbsr    qz_is_synth
+        jbeq    qz_pt_ret
+        move.l  %a0,-(%sp)
+        move.l  %d1,-(%sp)
+        movea.l 0x46c82456,%a0
+        mvz.b   0x100b14cf,%d0
+        move.l  #6322,%d1
+        muls.l  %d1,%d0
+        adda.l  %d0,%a0                 | the Part
+        adda.l  #0x8ee9a,%a0            | its LFO page bytes
+        move.l  %d2,%d1
+        lsl.l   #3,%d1
+        add.l   %d1,%d1
+        add.l   %d1,%d1                 | track * 24 ... (8 + 16)
+        move.l  %d2,%d0
+        lsl.l   #3,%d0
+        add.l   %d0,%d1                 | (16 + 8 = 24) ...
+        mvz.b   2(%a0,%d1.l),%d0        | VOIC
+        subq.l  #2,%d0
+        cmpi.l  #2,%d0                  | 2..4?
+        jbls    qz_pt_yes
+        moveq   #0,%d0
+        jbra    qz_pt_out
+qz_pt_yes:
+        moveq   #1,%d0
+qz_pt_out:
+        move.l  (%sp)+,%d1
+        movea.l (%sp)+,%a0
+        tst.l   %d0
 qz_pt_ret:
         rts
 
@@ -402,8 +428,8 @@ qz_leg1:
         mvs.b   0x8000004c,%d0
         btst    #0,%d0
         jbeq     qz_g1_stock             | audio-track trigs off: stock
-        jbsr     qz_polytrack            | POLY on a synth track: the held keys' voices keep
-        jbne     qz_g1_skip              | sounding -- no note-off at all (theirs come with their releases)
+        jbsr     qz_polytrack            | a paraphonic synth track (VOIC 2..4): the held keys' voices
+        jbne     qz_g1_skip              | keep sounding -- no note-off at all (theirs come with their releases)
         jbsr     qz_glide_of
         tst.l   %d0
         jbeq     qz_g1_stock             | GLIDE OFF: stock (the note-off, then a fresh trig)
@@ -432,9 +458,9 @@ qz_leg2:
         jbne    qz_g2_trigless          | FUNC held: the stock trigless trig
         jbsr    qz_polytrack
         jbeq    qz_g2_glide
-        lea     qz_pmask,%a0            | POLY: the key joins the held set, the engine is told
+        lea     qz_pmask,%a0            | paraphonic: the key joins the held set, the engine is told
         move.l  %d3,%d0                 | which key this trig is (index + 1), and the stock trig
-        subq.l  #1,%d0                  | starts a fresh voice -- no legato while POLY is on
+        subq.l  #1,%d0                  | starts a fresh voice -- no legato on such a track
         move.l  (%a0,%d2.l*4),%d1
         bset    %d0,%d1
         move.l  %d1,(%a0,%d2.l*4)
@@ -457,7 +483,7 @@ qz_g2_trig:
 | 0x4004fbde, the release path: `mvzb %a0@(0,%d2:l),%d1; movel %a2,%d0` (6
 | bytes) -> jmp qz_leg0. a0 = HELD, d2 = track, a2 = the key index; stock
 | goes on at 0x4004fbe4 with d0 = the index and d1 = the held key + 1, and
-| returns at once unless they match. With POLY on a synth track the mask
+| returns at once unless they match. On a paraphonic synth track the mask
 | decides: the key leaves qz_pmask (the engine releases its voices); with keys
 | still held the key's MIDI note-off goes out and nothing else happens (HELD
 | stays, whichever key it names, so the next release still gets here); the
@@ -473,7 +499,7 @@ qz_leg0:
         move.l  (%a0,%d2.l*4),%d0       | the held keys
         move.l  %a2,%d4
         btst    %d4,%d0
-        jbeq    qz_g0_stock             | a key never seen pressed (POLY was off): stock
+        jbeq    qz_g0_stock             | a key never seen pressed (VOIC was 1 then): stock
         bclr    %d4,%d0
         move.l  %d0,(%a0,%d2.l*4)
         jbne    qz_g0_more
@@ -498,7 +524,7 @@ qz_g0_more:
 | ---- the SEQUENCER window ------------------------------------------------------
 | Its draw loop (0x40065b14) draws min(visible, count) rows but indexes the
 | label / getter tables from 0, so a fourth row could never scroll into
-| view: with the count grown to 6 (manifest poke; SCALE, GLIDE, POLY) and 3
+| view: with the count grown to 5 (manifest poke; SCALE, GLIDE) and 3
 | visible, start the index at the list's scroll offset instead. jmp planted
 | at 0x40065bca.
 qz_draw:
@@ -507,7 +533,7 @@ qz_draw:
         lea     32(%sp),%sp             | displaced
         jmp     0x40065bd0
 
-| The fourth, fifth and sixth rows' getters and setters, reached through the grown
+| The fourth and fifth rows' getters and setters, reached through the grown
 | tables (labels 0x400b27d0, getters 0x400b27dc, setters 0x400b282c). A getter
 | returns the value's string (C scratch d0/d1/a0/a1). A setter is jumped to
 | with (delta, wrap) at 4(%sp) / 8(%sp) exactly like CHAIN AFTER's 0x400659ec:
@@ -535,21 +561,9 @@ qz_gg_num:
         lea     qz_gbuf(%pc),%a0
         move.l  %a0,%d0
         rts
-qz_get_poly:                            | "OFF" / "ON"
-        lea     qz_n0(%pc),%a0
-        mvz.b   qz_poly,%d0
-        jbeq    qz_gp_ret
-        lea     qz_n_on(%pc),%a0
-qz_gp_ret:
-        move.l  %a0,%d0
-        rts
 qz_set:
         lea     qz_scale(%pc),%a0
         moveq   #24,%d1
-        jbra     qz_set_any
-qz_set_poly:
-        lea     qz_poly,%a0
-        moveq   #1,%d1
         jbra     qz_set_any
 qz_set_glide:
         lea     qz_glide,%a0
@@ -581,7 +595,7 @@ qz_s_store:
 | ---- the project file ------------------------------------------------------------
 | The loader 0x400866c4 reads project.work line by line; a line starting
 | with '#' is skipped at 0x400867a2 before any key is compared, on stock
-| firmware too. Ours: "#SEQUENCER_SCALE=n", "#SYNTH_GLIDE=n", "#SYNTH_POLY=n". Entry (jmp at
+| firmware too. Ours: "#SEQUENCER_SCALE=n" and "#SYNTH_GLIDE=n". Entry (jmp at
 | 0x400866cc): a storing pass (second argument != 0) starts from OFF, so a
 | project saved without the lines loads as OFF. Line (jmp at 0x400867a2):
 | d3 = the line; d0/d1 must hold its first character when stock continues at
@@ -593,8 +607,6 @@ qz_ld_entry:
         lea     qz_scale(%pc),%a0
         clr.b   (%a0)
         lea     qz_glide,%a0
-        clr.b   (%a0)
-        lea     qz_poly,%a0
         clr.b   (%a0)
 qz_e_back:
         jmp     0x400866d4
@@ -613,10 +625,6 @@ qz_ld_line:
         lea     qz_key2(%pc),%a1
         jbsr     qz_l_cmp
         jbeq     qz_l_glide
-        move.l  %d3,%a0
-        lea     qz_key3(%pc),%a1
-        jbsr     qz_l_cmp
-        jbeq     qz_l_poly
         moveq   #35,%d5                 | another comment: stock skips it
         mvs.b   %d1,%d0
 qz_l_back:
@@ -644,14 +652,6 @@ qz_l_glide:
         moveq   #0,%d0
 qz_l_gok:
         lea     qz_glide,%a0
-        jbra    qz_l_store
-qz_l_poly:
-        jbsr     qz_l_dec
-        cmpi.l  #1,%d0
-        jbls     qz_l_pok
-        moveq   #0,%d0
-qz_l_pok:
-        lea     qz_poly,%a0
 qz_l_store:
         tst.l   58(%sp)                 | parse-only pass: nothing is stored
         jbne     qz_l_next
@@ -685,9 +685,6 @@ qz_wr:
         jbsr     qz_glide_of             | (d2 = the writer's buffer, not a track: the accessor ignores it)
         lea     qz_fmt2(%pc),%a0
         jbsr     qz_wr_line
-        mvz.b   qz_poly,%d0
-        lea     qz_fmt3(%pc),%a0
-        jbsr     qz_wr_line
         mvs.b   0x8000004f,%d1          | displaced
         move.l  %d1,-(%sp)              | displaced
         jmp     0x400888b2
@@ -710,12 +707,8 @@ qz_key:         .asciz  "#SEQUENCER_SCALE="
 qz_fmt:         .asciz  "#SEQUENCER_SCALE=%d\r\n"
 qz_key2:        .asciz  "#SYNTH_GLIDE="
 qz_fmt2:        .asciz  "#SYNTH_GLIDE=%d\r\n"
-qz_key3:        .asciz  "#SYNTH_POLY="
-qz_fmt3:        .asciz  "#SYNTH_POLY=%d\r\n"
 qz_lbl_scale:   .asciz  "SCALE"
 qz_lbl_glide:   .asciz  "GLIDE"
-qz_lbl_poly:    .asciz  "POLY"
-qz_n_on:        .asciz  "ON"
 qz_synthname:   .ascii  "SYNTH"
         .balign 4
 qz_gbuf:        .fill   8, 1, 0          | the GLIDE row's number (RAM)

@@ -1,6 +1,6 @@
 # Scale quantizer
 
-(24 Sep 2026: a sixth row, POLY -- the synth's paraphonic mode and polyphonic CHROMATIC keys -- "POLY" below.)
+(24 Sep 2026: polyphonic CHROMATIC keys on a paraphonic synth track -- "Paraphonic keys" below.)
 
 **PROJECT > CONTROL > SEQUENCER gains a fourth row, SCALE** (OFF, then 24
 scales). With a scale on, the **PTCH knob** on the PLAYBACK page of a
@@ -305,45 +305,39 @@ Then the migration cases, editing the mounted card's `project.work` and
 mirror `0x100b14ae` followed each time. A storing load without the GLIDE
 line starts from OFF (`qz_ld_entry`, as SCALE's).
 
-## POLY: the sixth row, and polyphonic CHROMATIC keys (24 Sep 2026)
+## Paraphonic keys (24 Sep 2026)
 
-**PROJECT > CONTROL > SEQUENCER > POLY, OFF / ON** (the sixth row; count poke
-3 -> 6, three visible, scrolls), saved as `#SYNTH_POLY=n` after
-`#SYNTH_GLIDE`, reset to OFF by a storing load, the byte `qz_poly` pinned
-next to `qz_glide` at `GLIDE_AT + 1 = 0x400d2cdd` (`glide.s`) because the
-synth's DRAM engine (`modules/synth/poly.s`) reads it as an OS absolute. What
-it does to the sound is the synth's (`modules/synth/README.md` "Phase 5");
-what it does here is the keys.
+The synth machine's LFO page has a VOIC slot (`modules/synth/README.md`
+"Phase 5": 1..4, the Part's LFO page byte `+ track*24 + 2`, SPD3's storage);
+on a FLEX track whose assigned FLEX slot's sample is named SYNTH*
+(`qz_is_synth`, the synth page's own test, run on the UI thread at each key
+event) with VOIC 2..4 (`qz_polytrack`), the CHROMATIC handler `0x4004fb94`
+keeps every held key instead of one:
 
-**The key hooks.** On a FLEX track whose assigned FLEX slot's sample is
-named SYNTH* (`qz_is_synth`, the synth page's own test, run on the UI thread
-at each key event) with POLY on, the CHROMATIC handler `0x4004fb94` keeps
-every held key instead of one:
-
-| site | stock | with POLY on a synth track |
+| site | stock | with VOIC 2..4 on a synth track |
 |---|---|---|
 | `0x4004fbde` (new, `qz_leg0`, 6 bytes `mvzb %a0@(0,%d2:l),%d1; movel %a2,%d0`) -- the release path | a release of a key that is not HELD returns at once; the HELD key's release runs the note-off block | the key's bit leaves `qz_pmask[t]` (the engine releases that key's voices); with keys still held its MIDI note-off goes out and nothing else happens; the LAST key makes itself HELD first, so stock's block runs -- the voice note-off (mailbox `|= 0x40`, the AMP release), the MIDI note-off, HELD := 0 |
-| `0x4004fbfe` (`qz_leg1`) -- a press while a key is held | ends the held key first (voice note-off, MIDI note-off, HELD := 0), then trigs | ends nothing: straight to the trig (checked before the GLIDE legato test, so legato is off while POLY is on) |
+| `0x4004fbfe` (`qz_leg1`) -- a press while a key is held | ends the held key first (voice note-off, MIDI note-off, HELD := 0), then trigs | ends nothing: straight to the trig (checked before the GLIDE legato test, so legato is off on such a track) |
 | `0x4004fc94` (`qz_leg2`) -- the trig | FUNC held: trigless; else the stock trig, HELD := the key | FUNC held: trigless as stock; else the key's bit joins `qz_pmask[t]`, `qz_pkey[t]` := the key's index + 1 for the engine (read and cleared at the voice start; 0 there = a sequencer trig), the stock trig starts a fresh voice, HELD := the key |
 
 `qz_pkey[8]` (bytes) and `qz_pmask[8]` (longs, bit = key index 0..24) are
 `keys.s`, pinned at `KEYS_AT = 0x400d2cb0` -- 40 bytes of the second zero
-run between the synth page cave (ends `0x400d2c6c`) and the GLIDE/POLY bytes.
-**Chords obey SCALE** (24 Sep 2026, later): `qz_scale_mask` (d0 := the
-current scale's pitch-class mask from `qz_masks`, 0 = OFF) is the accessor
-the synth's engine calls to snap every chord note the way `qz_chrom` snaps
-a key (nearest degree, the lower candidate first); it reaches it through
+run between the synth page cave (ends `0x400d2c6c`) and the GLIDE byte.
+**Chords obey SCALE**: `qz_scale_mask` (d0 := the current scale's
+pitch-class mask from `qz_masks`, 0 = OFF) is the accessor the synth's
+engine calls to snap every chord note the way `qz_chrom` snaps a key
+(nearest degree, the lower candidate first); it reaches it through
 `scale.s`, six bytes pinned at `SCALE_AT = 0x400d2ca8` (`jmp qz_scale_mask`,
-linked after this unit so the symbol resolves) -- the mask table has one
-copy. A remix without this module never gets there: POLY is this module's
-byte.
-Every other track, POLY off, audio-track trigs off: stock, byte for byte.
-Measured (the synth README's numbers): keys 13, 9, 6 pressed in turn and
-released in turn play `[C4] [C4 G#3] [C4 G#3 F3] [G#3 F3] [F3]` then silence;
-POLY and the CHRD locks survive SYNC TO CARD + eject/insert; a MAJ chord
-under DORIAN comes out 1 : 1.189 : 1.498 (minor), under SCALE OFF 1 : 1.26 :
-1.498. Unit size: `quantizer.s` 1,936 B (`REMIX=tim make cf`, at
-`0x400d6d00`), `scale.s` 6 B.
+linked after this unit so the symbol resolves; the engine checks the `jmp`
+is there, so a remix without this module snaps nothing) -- the mask table
+has one copy. VOIC 1 (a stock byte reads 1), audio-track trigs off, every
+other track: stock, byte for byte -- the mono synth with GLIDE legato.
+Measured (the synth README's numbers): at VOIC 2, keys 13 + 9 held together
+play C4 and G#3; at VOIC 4 keys 13, 9, 6 pressed in turn and released in
+turn play `[C4] [C4 G#3] [C4 G#3 F3] [G#3 F3] [F3]` then silence; a MAJ
+chord under DORIAN or PHRYGN comes out 1 : 1.189 : 1.498 (minor), under
+SCALE OFF 1 : 1.26 : 1.498. Unit size: `quantizer.s` 1,888 B (`REMIX=tim
+make cf`, at `0x400d6d00`), `scale.s` 6 B, `keys.s` 40 B, `glide.s` 4 B.
 
 ## Measurements (all `out/_agents/quantizer/`)
 
