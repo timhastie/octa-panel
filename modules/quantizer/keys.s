@@ -9,10 +9,16 @@
 |                t; the engine reads and clears it at the voice start, so a
 |                start with 0 here is a sequencer trig;
 |   qz_pmask[t]  the keys held on track t, bit = key index 0..24; the engine
-|                releases a key's voices when its bit goes.
+|                releases a key's voices when its bit goes;
+|   qz_clock     written by the engine at its first frame: the address of its
+|                sequencer clock (ticks, ticks a step, frames a step -- poly.s
+|                po_clock), which the live-record note-length hooks read
+|                (0 until the engine has run).
         .text
-        .global qz_pkey, qz_pmask
+        .global qz_pkey, qz_pmask, qz_clock
 qz_pkey:
         .fill   8, 1, 0
 qz_pmask:
         .fill   8, 4, 0
+qz_clock:
+        .long   0

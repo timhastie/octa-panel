@@ -108,7 +108,20 @@
                                          | this synth: the safety net resets such a voice (24 Sep 2026)
         .set    GAIN4, 16384             | a poly voice's full gain (Q14 = 1/2 of the mono voice)
         .set    GLIDE_AT, 0x400d2cdc     | the GLIDE byte (modules/quantizer/manifest.py GLIDE_AT; 0 = off)
-        .set    KEYS_AT, 0x400d2cb0      | modules/quantizer/keys.s: qz_pkey[8] bytes, qz_pmask[8] longs at +8
+        .set    KEYS_AT, 0x400d2cb0      | modules/quantizer/keys.s: qz_pkey[8] bytes, qz_pmask[8] longs at +8,
+        .set    CLOCK_AT, KEYS_AT+40     | qz_clock at +40: where this unit publishes po_clock's address
+        .set    SEQ_STEP, 0x800065b2     | the sequencer's step (word) and tick (byte, counting down) ...
+        .set    SEQ_TICK, 0x800065b6     | ... the clock below counts their changes
+        .set    CV_HOLD, 13              | flat slot 13 = AMP page slot 1 (HOLD): a sequencer note's gate
+        .set    CK_TICKS, 0              | po_clock: ticks seen (monotonic, no pattern wrap)
+        .set    CK_TPS, 4                | ticks a step (the largest tick value seen + 1; 0 = not yet)
+        .set    CK_FPS, 8                | frames a step (measured between step changes; 345 until then)
+        .set    CK_FRAMES, 12            | frames seen
+        .set    CK_LAST, 16              | the last (step << 8 | tick)
+        .set    CK_PING, 20              | (unused)
+        .set    CK_STEP, 24              | the last step
+        .set    CK_FSTEP, 28             | frames at the last step change
+        .set    FPS_DEFAULT, 345         | 120 BPM, 1x: 60 / 120 / 4 s * 44100 / 16
         .set    SCALE_AT, 0x400d2ca8     | modules/quantizer/scale.s: `jmp qz_scale_mask` -- d0 := the scale's pitch-class mask, 0 = OFF
         .set    CURVALS, 0x80000810      | the frame builder's per-track current values, 72 B a track, locks applied
         .set    CV_STRIDE, 72
@@ -166,6 +179,7 @@
         .set    V_CUR, 40                | the slewed word, Q12 (sy_slew's S_CUR)
         .set    V_ROOT, 44               | the note's word, Q8, relative to T_REF
         .set    V_AGE, 48                | the allocation stamp
+        .set    V_HOLD, 52               | a sequencer note: frames left before it releases (0 = no gate)
 
 | ---- sy_render(track, ping, start, end) ------------------------------------
 sy_render:
@@ -416,6 +430,46 @@ sy_done:
         move.l  44(%sp),%d0
         movem.l (%sp),%d2-%d7/%a2-%a6
         lea     48(%sp),%sp
+        rts
+
+| ---- po_tick: the sequencer clock, once an audio frame -------------------------
+| Called from po_lfo3b for track 0's LFO 3 -- the frame builder's LFO pass runs
+| every frame for every track from boot, voice or no voice (sy_render runs
+| only once a FLEX voice has started, which left the first note of a session
+| untimed). Counts frames and the changes of the sequencer's (step, tick) pair
+| -- a monotonic tick count the live-record note-length hooks read through
+| qz_clock (the pattern's step word wraps, this does not); ticks a step = the
+| largest tick value seen + 1; frames a step measured at each step change
+| (the HOLD gate's unit). Clobbers d1, d3, a0; d0 untouched.
+po_tick:
+        lea     po_clock(%pc),%a0
+        move.l  %a0,CLOCK_AT             | published for the quantizer
+        addq.l  #1,CK_FRAMES(%a0)
+        mvz.w   SEQ_STEP,%d1
+        lsl.l   #8,%d1
+        mvz.b   SEQ_TICK,%d3
+        or.l    %d3,%d1
+        cmp.l   CK_LAST(%a0),%d1
+        beq     po_tk_done
+        move.l  %d1,CK_LAST(%a0)
+        addq.l  #1,CK_TICKS(%a0)
+        addq.l  #1,%d3
+        cmp.l   CK_TPS(%a0),%d3
+        ble     po_tk_step
+        move.l  %d3,CK_TPS(%a0)
+po_tk_step:
+        lsr.l   #8,%d1
+        cmp.l   CK_STEP(%a0),%d1
+        beq     po_tk_done
+        move.l  %d1,CK_STEP(%a0)
+        move.l  CK_FRAMES(%a0),%d1
+        move.l  %d1,%d3
+        sub.l   CK_FSTEP(%a0),%d3
+        move.l  %d1,CK_FSTEP(%a0)
+        cmpi.l  #16,%d3                  | a plausible step (not the first after a stop)
+        blt     po_tk_done
+        move.l  %d3,CK_FPS(%a0)
+po_tk_done:
         rts
 
 | ---- po_rate: d0 := C4_INC * rate, the rate as the stock renderer computes it ----
@@ -681,6 +735,13 @@ po_fr_env:
         move.l  %d1,V_IEFF(%a6)          | I * E
         move.l  S_FB(%a5),%d0
         move.l  %d0,V_FB(%a6)
+        move.l  V_HOLD(%a6),%d0          | a gated sequencer note: its HOLD runs out -> release
+        beq     po_fr_amp
+        subq.l  #1,%d0
+        move.l  %d0,V_HOLD(%a6)
+        bne     po_fr_amp
+        move.b  #2,V_STATE(%a6)
+po_fr_amp:
         move.l  V_GAIN(%a6),%d1          | the amplitude envelope
         mvz.b   V_STATE(%a6),%d0
         cmpi.l  #2,%d0
@@ -817,9 +878,27 @@ po_st_note:                              | the shape's size keeps the root and d
         lsl.l   #4,%d0
         move.l  %d0,V_CUR(%a0)           | a fresh note starts at its own pitch
         move.b  %d7,V_KEY(%a0)
+        clr.l   V_HOLD(%a0)
         moveq   #1,%d0
         tst.l   %d7
-        beq     po_st_state
+        bne     po_st_live
+        move.l  #CV_STRIDE,%d1           | a sequencer note is gated for the step's HOLD (the lock,
+        muls.l  %d2,%d1                  | else the Part's byte): frames = hold * frames a step
+        lea     CURVALS,%a4
+        mvz.b   CV_HOLD(%a4,%d1.l),%d1
+        cmpi.l  #127,%d1
+        beq     po_st_state              | INF: until the next trig
+        lea     po_hold128(%pc),%a4
+        mvz.w   (%a4,%d1.l*2),%d1        | 1/128 steps
+        lea     po_clock(%pc),%a4
+        move.l  CK_FPS(%a4),%d4
+        mulu.l  %d4,%d1
+        lsr.l   #7,%d1
+        addq.l  #1,%d1
+        move.l  %d1,V_HOLD(%a0)
+        move.l  FP_PTR,%a4               | (a4 = the parameter record again)
+        bra     po_st_state
+po_st_live:
         move.l  %d7,%d1
         subq.l  #1,%d1
         move.l  T_MASK(%a5),%d4
@@ -1050,6 +1129,13 @@ po_lfo3:
         bsr     po_lfo3_depth
         jmp     0x40003cac
 po_lfo3b:
+        move.l  %a4,%d1
+        subi.l  #LFO_STATE,%d1
+        bne     po_l3b_depth
+        cmpi.l  #2,%d2
+        bne     po_l3b_depth
+        bsr     po_tick                  | track 0, LFO 3: the clock, once a frame
+po_l3b_depth:
         bsr     po_lfo3_depth
         jmp     0x4000d046
 po_lfo3_depth:
@@ -1291,6 +1377,26 @@ po_relk:
         .short  10, 10, 9, 9, 8, 8, 7, 7
         .short  7, 6, 6, 6, 5, 5, 5, 0
 
+| ---- po_hold128: the AMP HOLD byte -> steps in 1/128 (the firmware's own table of
+| strings at 0x400d18d0: 0.0078 .. 128.0, 127 = INF), the sequencer note's gate ----
+po_hold128:
+        .short  1, 1, 2, 3, 4, 6, 8, 11
+        .short  16, 23, 32, 45, 64, 91, 128, 136
+        .short  144, 152, 160, 168, 176, 184, 192, 200
+        .short  208, 216, 224, 232, 240, 248, 256, 272
+        .short  288, 304, 320, 336, 352, 368, 384, 400
+        .short  416, 432, 448, 464, 480, 496, 512, 544
+        .short  576, 608, 640, 672, 704, 736, 768, 800
+        .short  832, 864, 896, 928, 960, 992, 1024, 1088
+        .short  1152, 1216, 1280, 1344, 1408, 1472, 1536, 1600
+        .short  1664, 1728, 1792, 1856, 1920, 1984, 2048, 2176
+        .short  2304, 2432, 2560, 2688, 2816, 2944, 3072, 3200
+        .short  3328, 3456, 3584, 3712, 3840, 3968, 4096, 4352
+        .short  4608, 4864, 5120, 5376, 5632, 5888, 6144, 6400
+        .short  6656, 6912, 7168, 7424, 7680, 7936, 8192, 8704
+        .short  9216, 9728, 10240, 10752, 11264, 11776, 12288, 12800
+        .short  13312, 13824, 14336, 14848, 15360, 15872, 16384, 65535
+
 | ---- the sine table: 256 + 1 entries, s16, amplitude 0x4000 ---------------
         .balign 4
 sy_tab:
@@ -1336,6 +1442,8 @@ po_voices:                               | 8 tracks x 4 voices x 64 bytes
         .fill   8 * 4 * V_STRIDE, 1, 0
 po_seq:                                  | the allocation stamp
         .long   0
+po_clock:                                | the sequencer clock (po_tick), read by the quantizer through qz_clock
+        .long   0, 0, FPS_DEFAULT, 0, -1, -1, -1, 0
 po_lfo_built:
         .byte   0
         .align  4

@@ -207,6 +207,25 @@ presses with GLIDE 64 and off) ran **10 fresh boots clean** (every key press 261
 3 of them the blind FUNC + DOWN left the unit out of CHROMATIC
 before the peek corrected it, which is the slip the report saw.
 
+### The played note length (25 Sep 2026)
+
+The quantizer records a live-played note's length as a HOLD lock on synth
+tracks (`modules/quantizer/README.md` "The played note length"); two things
+of it live here. `po_tick` is the clock it reads: ticked once a frame from
+`po_lfo3b` (the frame builder's LFO pass runs for every track from boot,
+`sy_render` only once a FLEX voice has started), it counts frames and the
+changes of the sequencer's (step, tick) pair, keeps ticks a step and the
+frames a step measured between step changes, and publishes its address at
+`qz_clock` (`KEYS_AT + 40`). And a **sequencer-started paraphonic voice is
+gated for the step's HOLD**: `po_start` reads the current HOLD byte
+(`0x80000810 + t*72 + 13`, the lock else the Part's byte), converts it
+through `po_hold128` (the firmware's own table, in 1/128 steps) and the
+measured frames a step into `V_HOLD`, which `po_frame` counts down into the
+release; INF (127) gates nothing, a live key's voice is released by its key.
+Measured (VOIC 3, CHRD MAJ, a chord live-recorded for 0.5 s -> HOLD 4.25):
+on playback the chord ends at 0.60 s after its onset against 0.55 s in the
+live take. `poly.s` 7,764 B.
+
 ### What does not work, and what is left
 
 - **A four-note chord steals every voice**: only chords of three or fewer

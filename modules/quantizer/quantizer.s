@@ -49,7 +49,10 @@
         .global qz_knob, qz_plock, qz_chrom, qz_draw, qz_ld_entry, qz_ld_line, qz_wr
         .global qz_get, qz_set, qz_lbl_scale, qz_scale
         .global qz_get_glide, qz_set_glide, qz_lbl_glide, qz_leg1, qz_leg2
-        .global qz_leg0, qz_leg3, qz_scale_mask
+        .global qz_leg0, qz_leg3, qz_leg4, qz_scale_mask
+        .set    LOCK_WRITE, 0x40042158    | (track, flat slot, value, step, ctx): the stock p-lock writer
+        .set    REC_CTX, 0x46c7e956       | the recorder's context the handler passes it
+        .set    FLAT_HOLD, 13             | the AMP page's HOLD slot
         .set    HELD, 0x460d171d          | the chromatic key handler's held key per track (key + 1; 0 = none)
         .set    FUNC_HELD, 0x46c7dd26
         .set    MIDI_NOTE, 0x4003f3a8     | (track, note, velocity): the key's MIDI note out
@@ -432,7 +435,14 @@ qz_leg1:
         jbne     qz_g1_skip              | keep sounding -- no note-off at all (theirs come with their releases)
         jbsr     qz_glide_of
         tst.l   %d0
-        jbeq     qz_g1_stock             | GLIDE OFF: stock (the note-off, then a fresh trig)
+        jbne     qz_g1_legato
+        jbsr     qz_is_synth             | GLIDE OFF: stock (the note-off, then a fresh trig) -- the held
+        jbeq     qz_g1_stock             | key's note ends here: its length becomes its step's HOLD lock
+        move.l  %d1,%d0
+        subq.l  #1,%d0
+        jbsr    qz_holdrel
+        jbra    qz_g1_stock
+qz_g1_legato:
         clr.l   -(%sp)                  | the old key's MIDI note-off, as stock's 0x4004fc24
         move.l  %d1,%a0
         pea     71(%a0)
@@ -456,8 +466,12 @@ qz_g1_stock:
 qz_leg2:
         lea     qz_legato(%pc),%a0
         clr.b   (%a0)                   | this press is not a legato one until decided below
+        clr.l   qz_chain-qz_legato(%a0) | ... nor a continuation of a held note's chain
         tst.l   FUNC_HELD
-        jbne    qz_g2_trigless          | FUNC held: the stock trigless trig
+        jbeq    qz_g2_nofunc
+        jbsr    qz_chain_of             | FUNC held: the stock trigless trig continues the held note
+        jbra    qz_g2_trigless
+qz_g2_nofunc:
         jbsr    qz_polytrack
         jbeq    qz_g2_glide
         lea     qz_pmask,%a0            | paraphonic: the key joins the held set, the engine is told
@@ -476,6 +490,8 @@ qz_g2_glide:
         lea     HELD,%a0
         tst.b   (%a0,%d2.l)             | a key still held on this track (qz_leg1 kept it)?
         jbeq    qz_g2_trig              | no: a fresh note, the stock trig
+        jbsr    qz_chain_of             | legato: the new step continues the held note's chain
+        lea     HELD,%a0
         move.b  %d3,(%a0,%d2.l)         | legato: the new key is the held key
         lea     qz_legato(%pc),%a0
         move.b  %d3,(%a0)               | ... and the live recorder records it as trigless (qz_leg3)
@@ -505,6 +521,207 @@ qz_g3_trigless:
 qz_g3_sample:
         jmp     0x4004fcf8              | records a sample trig
 
+| ---- the note length (OCTATRICK7 report: a recorded note droned for the AMP HOLD) --
+| 0x4004fd06, after the recorder returned: `addql #8,%sp; tstl %d0; blts
+| 0x4004fd3e` (6 bytes) -> jmp qz_leg4. d0 = the step the press was recorded on
+| (-1 = none), d2 = track, d3 = the key + 1, a2 = the raw pitch. On a synth track
+| the press is noted -- key, step, the engine's tick count (po_clock through
+| qz_clock, 0 until the engine has run) -- in one of the track's four slots;
+| at the key's release (qz_leg0, every key), or when a legato press ends the
+| previous note (qz_leg2), qz_holdrel turns the elapsed ticks into the HOLD
+| parameter's own units (steps, 1/128 .. 128 through qz_hold128, the smallest
+| value that is not shorter: a tap is never silent) and writes it as the
+| step's HOLD lock through the stock writer (flat slot 13), which itself
+| refuses once live recording has stopped. Non-synth tracks: untouched.
+qz_leg4:
+        addq.l  #8,%sp                  | displaced
+        tst.l   %d0                     | displaced
+        jbmi    qz_g4_none              | displaced: no step recorded
+        move.l  %d0,-(%sp)
+        jbsr    qz_is_synth
+        jbeq    qz_g4_out
+        move.l  %a0,-(%sp)
+        move.l  %a1,-(%sp)
+        move.l  %d1,-(%sp)
+        move.l  %d4,-(%sp)
+        movea.l qz_clock,%a1
+        move.l  %a1,%d0
+        jbeq    qz_g4_res               | the engine has not run: nothing to time
+        jbsr    qz_slot_find            | a0 = the track's slot for key d3 - 1 (reused) or a free one
+        move.l  16(%sp),%d0             | the step
+        move.b  %d0,1(%a0)
+        move.l  %d3,%d0
+        subq.l  #1,%d0
+        move.b  %d0,(%a0)
+        move.b  #1,2(%a0)               | in use
+        move.l  (%a1),4(%a0)            | the tick count at the press ...
+        lea     qz_chain(%pc),%a1
+        move.l  (%a1),%d0
+        jbeq    qz_g4_res
+        move.l  %d0,4(%a0)              | ... or the chain's start for a legato / FUNC press
+qz_g4_res:
+        move.l  (%sp)+,%d4
+        move.l  (%sp)+,%d1
+        movea.l (%sp)+,%a1
+        movea.l (%sp)+,%a0
+qz_g4_out:
+        move.l  (%sp)+,%d0
+        jmp     0x4004fd0c              | the PTCH lock, as stock
+qz_g4_none:
+        jmp     0x4004fd3e
+
+| qz_slot_find: a0 := track d2's slot for key index d0 (in use), else a free one,
+| else slot 0. Slots: 8 bytes -- key, step, in-use, pad, the tick count.
+qz_slot_find:
+        lea     qz_press(%pc),%a0
+        move.l  %d2,%d1
+        lsl.l   #5,%d1
+        add.l   %d1,%a0                 | the track's four
+        move.l  %a0,-(%sp)              | slot 0, the fallback
+        moveq   #3,%d1
+qz_sf_key:                              | the key's own slot first (a repeat)
+        tst.b   2(%a0)
+        jbeq    qz_sf_key1
+        cmp.b   (%a0),%d0
+        jbeq    qz_sf_take
+qz_sf_key1:
+        addq.l  #8,%a0
+        subq.l  #1,%d1
+        jbpl    qz_sf_key
+        movea.l (%sp),%a0
+        moveq   #3,%d1
+qz_sf_free:                             | else the first free one
+        tst.b   2(%a0)
+        jbeq    qz_sf_take
+        addq.l  #8,%a0
+        subq.l  #1,%d1
+        jbpl    qz_sf_free
+        movea.l (%sp),%a0               | none free: slot 0
+qz_sf_take:
+        addq.l  #4,%sp
+        rts
+
+| qz_holdrel: key index d0 on track d2 was released (or ended by a legato press):
+| its slot's elapsed ticks -> the HOLD lock on its step, the slot freed. Preserves
+| everything but d0 (C scratch d1/a0/a1 saved around the writer).
+qz_holdrel:
+        lea     -20(%sp),%sp
+        movem.l %d1/%d3/%d4/%a0/%a1,(%sp)
+        movea.l qz_clock,%a1
+        move.l  %a1,%d1
+        jbeq    qz_hr_out
+        lea     qz_press(%pc),%a0
+        move.l  %d2,%d1
+        lsl.l   #5,%d1
+        add.l   %d1,%a0
+        moveq   #3,%d1
+qz_hr_find:
+        tst.b   2(%a0)
+        jbeq    qz_hr_next
+        cmp.b   (%a0),%d0
+        jbeq    qz_hr_found
+qz_hr_next:
+        addq.l  #8,%a0
+        subq.l  #1,%d1
+        jbpl    qz_hr_find
+        jbra    qz_hr_out               | no note of that key was recorded
+qz_hr_found:
+        clr.b   2(%a0)                  | freed
+        move.l  (%a1),%d0
+        sub.l   4(%a0),%d0              | elapsed ticks
+        lsl.l   #7,%d0                  | * 128
+        move.l  4(%a1),%d1              | ticks a step
+        jbne    qz_hr_tps
+        moveq   #6,%d1                  | (1x, not yet measured)
+qz_hr_tps:
+        divu.l  %d1,%d0                 | the length in 1/128 steps
+        lea     qz_hold128(%pc),%a1
+        moveq   #0,%d1
+qz_hr_raw:
+        mvz.w   (%a1,%d1.l*2),%d3
+        cmp.l   %d0,%d3                 | the first entry that is not shorter
+        jbcc    qz_hr_write
+        addq.l  #1,%d1
+        cmpi.l  #126,%d1
+        jble    qz_hr_raw
+qz_hr_write:
+        mvz.b   1(%a0),%d0              | the step
+        pea     REC_CTX
+        move.l  %d0,-(%sp)
+        move.l  %d1,-(%sp)              | HOLD raw
+        pea     FLAT_HOLD
+        move.l  %d2,-(%sp)
+        jsr     LOCK_WRITE
+        lea     20(%sp),%sp
+qz_hr_out:
+        movem.l (%sp),%d1/%d3/%d4/%a0/%a1
+        lea     20(%sp),%sp
+        rts
+
+| qz_chain_of: the press in flight continues the held key's note: qz_chain := that
+| key's slot's tick count (the chain's start), which qz_leg4 gives the new step
+| instead of now -- the DSP's HOLD runs from the voice START, and a trigless
+| step's HOLD lock re-lengthens it from there, so every step of a legato chain
+| must carry the chain's whole length. Preserves everything but d0.
+qz_chain_of:
+        lea     -12(%sp),%sp
+        movem.l %d1/%a0/%a1,(%sp)
+        lea     HELD,%a0
+        mvz.b   (%a0,%d2.l),%d0
+        jbeq    qz_co_out
+        subq.l  #1,%d0                  | the held key
+        lea     qz_press(%pc),%a0
+        move.l  %d2,%d1
+        lsl.l   #5,%d1
+        add.l   %d1,%a0
+        moveq   #3,%d1
+qz_co_find:
+        tst.b   2(%a0)
+        jbeq    qz_co_next
+        cmp.b   (%a0),%d0
+        jbeq    qz_co_found
+qz_co_next:
+        addq.l  #8,%a0
+        subq.l  #1,%d1
+        jbpl    qz_co_find
+        jbra    qz_co_out
+qz_co_found:
+        move.l  4(%a0),%d0
+        lea     qz_chain(%pc),%a1
+        move.l  %d0,(%a1)
+qz_co_out:
+        movem.l (%sp),%d1/%a0/%a1
+        lea     12(%sp),%sp
+        rts
+
+| qz_holdall: the note (chain) on track d2 ends now: every in-use slot's step gets
+| its length as HOLD (all from the chain's start), the slots freed. Preserves
+| everything but d0.
+qz_holdall:
+        lea     -8(%sp),%sp
+        movem.l %d1/%a0,(%sp)
+        lea     qz_press(%pc),%a0
+        move.l  %d2,%d1
+        lsl.l   #5,%d1
+        add.l   %d1,%a0
+        moveq   #3,%d1
+qz_ha_loop:
+        tst.b   2(%a0)
+        jbeq    qz_ha_next
+        move.l  %d1,-(%sp)
+        move.l  %a0,-(%sp)
+        mvz.b   (%a0),%d0
+        jbsr    qz_holdrel              | (finds the same slot by its key, writes, frees)
+        movea.l (%sp)+,%a0
+        move.l  (%sp)+,%d1
+qz_ha_next:
+        addq.l  #8,%a0
+        subq.l  #1,%d1
+        jbpl    qz_ha_loop
+        movem.l (%sp),%d1/%a0
+        lea     8(%sp),%sp
+        rts
+
 | 0x4004fbde, the release path: `mvzb %a0@(0,%d2:l),%d1; movel %a2,%d0` (6
 | bytes) -> jmp qz_leg0. a0 = HELD, d2 = track, a2 = the key index; stock
 | goes on at 0x4004fbe4 with d0 = the index and d1 = the held key + 1, and
@@ -518,8 +735,19 @@ qz_g3_sample:
 qz_leg0:
         mvz.b   (%a0,%d2.l),%d1         | displaced
         move.l  %a2,%d0                 | displaced
-        jbsr    qz_polytrack
+        jbsr    qz_is_synth
         jbeq    qz_g0_stock
+        jbsr    qz_polytrack
+        jbne    qz_g0_para
+        cmp.l   %a2,%d1                 | VOIC 1: the held key's release ends the note (and its legato
+        subq.l  #1,%d1                  | chain) -- every step of it gets the chain's length as HOLD;
+        cmp.l   %a2,%d1                 | another key's release ends nothing (the 303 rule)
+        jbne    qz_g0_stock
+        jbsr    qz_holdall
+        jbra    qz_g0_stock
+qz_g0_para:
+        move.l  %a2,%d0
+        jbsr    qz_holdrel              | paraphonic: the released key's own note length -> its step's HOLD
         lea     qz_pmask,%a0
         move.l  (%a0,%d2.l*4),%d0       | the held keys
         move.l  %a2,%d4
@@ -739,6 +967,25 @@ qz_synthname:   .ascii  "SYNTH"
 qz_gbuf:        .fill   8, 1, 0          | the GLIDE row's number (RAM)
 qz_legato:      .byte   0                | the press in flight is a legato one (qz_leg2 -> qz_leg3)
         .balign 4
+qz_chain:       .long   0                | ... and continues a held note: that note's start (ticks), 0 = a fresh note
+qz_press:       .fill   8 * 4 * 8, 1, 0  | the notes being played on each track: 4 x (key, step, in use, pad, ticks)
+qz_hold128:                              | the AMP HOLD byte -> steps in 1/128 (the firmware's own string table 0x400d18d0)
+        .short  1, 1, 2, 3, 4, 6, 8, 11
+        .short  16, 23, 32, 45, 64, 91, 128, 136
+        .short  144, 152, 160, 168, 176, 184, 192, 200
+        .short  208, 216, 224, 232, 240, 248, 256, 272
+        .short  288, 304, 320, 336, 352, 368, 384, 400
+        .short  416, 432, 448, 464, 480, 496, 512, 544
+        .short  576, 608, 640, 672, 704, 736, 768, 800
+        .short  832, 864, 896, 928, 960, 992, 1024, 1088
+        .short  1152, 1216, 1280, 1344, 1408, 1472, 1536, 1600
+        .short  1664, 1728, 1792, 1856, 1920, 1984, 2048, 2176
+        .short  2304, 2432, 2560, 2688, 2816, 2944, 3072, 3200
+        .short  3328, 3456, 3584, 3712, 3840, 3968, 4096, 4352
+        .short  4608, 4864, 5120, 5376, 5632, 5888, 6144, 6400
+        .short  6656, 6912, 7168, 7424, 7680, 7936, 8192, 8704
+        .short  9216, 9728, 10240, 10752, 11264, 11776, 12288, 12800
+        .short  13312, 13824, 14336, 14848, 15360, 15872, 16384, 65535
 qz_names:                               | index 0..24 -> label, 7 characters at most (the value column is 33 px wide)
         .long   qz_n0, qz_n1, qz_n2, qz_n3, qz_n4, qz_n5, qz_n6, qz_n7, qz_n8, qz_n9, qz_n10, qz_n11, qz_n12, qz_n13, qz_n14, qz_n15, qz_n16, qz_n17, qz_n18, qz_n19, qz_n20, qz_n21, qz_n22, qz_n23, qz_n24
 qz_n0:  .asciz  "OFF"

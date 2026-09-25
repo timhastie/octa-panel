@@ -85,7 +85,12 @@ takes the stock note-off path. Legato is off on such a track; VOIC 1 and
 every other track are stock. A fourth detour, qz_leg3 at 0x4004fce0, makes
 the LIVE RECORDER record a legato press (GLIDE on, a key held, VOIC 1) as a
 trigless trig with its PTCH lock, as FUNC + key does, so playback slides
-too (the OCTATRICK6 report); everything else records as stock. The synth
+too (the OCTATRICK6 report); everything else records as stock. A fifth,
+qz_leg4 at 0x4004fd06, notes the step a press recorded and the engine's tick
+count; the key's release (or the stock note-off that ends it) writes the
+played length as the step's HOLD lock through the stock writer 0x40042158
+(flat slot 13), a legato chain getting its whole length on every step (the
+OCTATRICK7 report). The synth
 snaps chord notes onto SCALE through qz_scale_mask, reached by the six-byte
 trampoline scale.s pinned at SCALE_AT.
 
@@ -145,6 +150,9 @@ MODULE = Module(
         Detour(0x4004fce0, H("4ab946c7dd26" "6710"), "qz", "qz_leg3",
                "CHROMATIC key -> the live recorder: a legato press records a trigless trig, as FUNC + key does",
                kind="jmp", pad_to=8),
+        Detour(0x4004fd06, H("508f" "4a80" "6d32"), "qz", "qz_leg4",
+               "CHROMATIC key recorded: note the step and the time; the release writes the note length as the HOLD lock",
+               kind="jmp"),
         Detour(0x40065bca, H("4282" "4fef0020"), "qz", "qz_draw",
                "SEQUENCER window draw loop: index the row tables from the scroll offset",
                kind="jmp"),

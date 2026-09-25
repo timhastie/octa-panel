@@ -339,6 +339,58 @@ steps 1-8 (byte 14 steps 9-16), locks at `+0x59 + step*32`):
 (The stock and fixed steps differ -- 10 vs 8 -- only because the FUNC press
 in the driver adds 0.15 s.)
 
+## The played note length (25 Sep 2026, OCTATRICK7 report)
+
+**Reported on hardware:** the recorded slide plays back, but the notes drone
+for the whole AMP HOLD -- audio tracks have no note length and live recording
+never writes the key release. **Now, on a synth track (`qz_is_synth`) during
+live recording, a key's played length is written as a HOLD lock on the step
+its press recorded.** The HOLD byte's unit is sequencer steps, through the
+firmware's own 128-entry table of strings (`0x400d18d0`: 0.0078 = 1/128
+step, 1.0000 at raw 14, 4.0000 at 46, 128.0 at 126, INF = 127; measured:
+HOLD 40 = "3.2500" runs 0.40 s at 120 BPM); `qz_hold128` holds the same
+values in 1/128 steps and the lock is the smallest entry that is not shorter
+than what was played (a tap is never silent: 60 ms recorded as 0.5000).
+
+The path: `0x4004fd06` (`addql #8,%sp; tstl %d0; blts`, right after the
+recorder returned the step in d0) -> `qz_leg4` notes the press in one of the
+track's four slots (`qz_press`: key, step, in use, the engine's tick count).
+Time comes from the synth engine's clock (`po_clock`, published at
+`qz_clock` = `KEYS_AT + 40`: a monotonic count of the sequencer's (step,
+tick) changes -- the step word `0x800065b2` wraps at the pattern end, the
+count does not -- and ticks a step, the largest tick byte `0x800065b6` seen
++ 1; 6 at 1x), ticked once a frame from the frame builder's LFO pass, so it
+runs from boot. `qz_holdrel` turns elapsed ticks into 1/128 steps
+(`* 128 / ticks a step`), looks the raw value up and calls the stock lock
+writer `0x40042158(track, 13, raw, step, 0x46c7e956)` (flat slot 13 = AMP
+HOLD; the writer itself refuses once live recording has stopped). Who calls
+it: a key's release (`qz_leg0`, every key on a paraphonic track; on a VOIC 1
+track only the HELD key's release, which ends the note); a press that ends
+the held note with the stock note-off (`qz_leg1`, GLIDE off). **A legato or
+FUNC + key press does not end the held note**: the DSP's HOLD runs from the
+voice START and a trigless step's HOLD lock re-lengthens it from there
+(measured: a trigless HOLD of 5.75 ended the note 5.75 steps after the first
+press, not after the trigless step), so the new step inherits the chain's
+start (`qz_chain_of` -> `qz_chain` -> `qz_leg4`) and the held key's release
+writes the chain's whole length on every step of it (`qz_holdall`).
+Non-synth tracks, programmed trigs and playing without recording: untouched.
+
+Measured (`poly/holdrec.py`, T2 = SYNTH, VOIC 1, GLIDE 64, INDX 0, AMP ATK 0
+HOLD INF REL 20, 120 BPM = 8 steps a second, fresh boot; level per 50 ms
+from the note's onset, "ends" = the bin that drops below -40 dBFS):
+
+| recording | HOLD locks | live take ends | playback ends |
+|---|---|---|---|
+| key 13 held 0.55 s, legato key 6 to 1.2 s (GLIDE 64) | step 4 sample 9.50, step 8 trigless 9.50 | bin 25 (1.25 s) | bin 25, the pitch 260 -> 240 220 200 180 continuous, no restart |
+| the same with GLIDE off | step 4 sample 4.0000, step 8 sample 5.75 | bin 25 | bin 25 (a restart at bin 11, as stock) |
+| the same with FUNC + key 6 (stock trigless) | 5.25 on both (the HELD key 13's release ends the note, stock's rule) | -- | bin 14 |
+| a 60 ms tap | step 4 sample 0.5000 | bin 2 | bin 2-3 |
+| HOLD knob 40 = 3.2500, a programmed trig, no recording | none | -- | bin 8 (0.40 s): the stock DSP envelope, unchanged |
+| VOIC 3, CHRD MAJ, a chord held 0.5 s | step 4 sample 4.25 (+ the CHRD lock 36) | bin 11 (0.55 s) | bin 12 (0.60 s), lines 261.6 / 329.6 / 391.9 |
+
+Sizes: `quantizer.s` 2,916 B (`REMIX=tim make cf`, at `0x400d6d00`), `keys.s`
+44 B, **680 B of the third run left**.
+
 ## Paraphonic keys (24 Sep 2026)
 
 The synth machine's LFO page has a VOIC slot (`modules/synth/README.md`
