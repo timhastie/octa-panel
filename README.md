@@ -18,6 +18,52 @@ No firmware is distributed here, and none may be. You supply your own
 
 ---
 
+## About this fork (timhastie/octa-panel)
+
+This is a fork of [sambanks/octabam](https://github.com/sambanks/octabam),
+branch `panel-ui`. Everything below this section is Sam's project as it
+was forked; this fork adds, on top of it:
+
+- **A virtual front panel** for the emulator (`tools/panel/`): the whole
+  Octatrack panel in a browser page or a macOS app, with the LCD, every key,
+  encoder, LED colour, the crossfader and scenes, driven by the real
+  firmware running in the emulator. The panel link protocol, the key matrix
+  and the LED map are documented in [tools/panel/PANEL_LINK.md](tools/panel/PANEL_LINK.md) and
+  [tools/panel/KEYMAP.md](tools/panel/KEYMAP.md); the panel itself in [tools/panel/README.md](tools/panel/README.md).
+- **The emulator in real time, with sound**: the C++ machine (`tools/emu/ot_emu`,
+  Sam's) now runs both DSP cores under the dsp56300 JIT as workers on the
+  lockstep schedule, paced to real time, with the main, cue and eight
+  per-track outputs available through CoreAudio, persistent card images with
+  write-back, and the effects rendering correctly (milestones O15-O24 in
+  `CONTEXT.md`).
+- **Three firmware modules** built with octabam's module system, ColdFire
+  only, DSP payloads stock (`REMIX=tim make cf`, `make image-cf`):
+  `modules/direct-jump` (CHAIN AFTER gains DIRECT), `modules/quantizer`
+  (a SCALE row: the PTCH knob, locks and CHROMATIC keys snap to a scale;
+  GLIDE with 303-style legato), and `modules/synth` (a two-operator FM
+  synth machine on any FLEX track whose sample is named SYNTH*.wav, with its
+  own PLAYBACK page, paraphonic chords, VOIC/CHRD on the LFO page, and note
+  lengths recorded from live playing). All three have been flashed and used
+  on an Octatrack MKI by the fork's author; see `CONTEXT.md` for the build
+  history and the hardware notes.
+
+**Unofficial.** Not affiliated with, endorsed by or supported by Elektron.
+As in octabam, no firmware is distributed here: every image is built on
+your machine from your own copy of OS 1.40C, and modifying your unit's
+firmware is outside Elektron's licence terms and warranty. Read
+`docs/remixer/FLASHING.md` before flashing anything.
+
+**Credit, beyond the octabam credits below.** The voice engine of the
+synth builds on the trig and voice-structure findings of
+[mxldyn/octamax](https://github.com/mxldyn/octamax) and on Bryan T's EMAC
+notes (`docs/firmware/EXTERNAL.md`); the flash images are packed with
+[mischa85/elektron-firmware-tool](https://github.com/mischa85/elektron-firmware-tool);
+the emulator cores are Musashi and the dsp56300 emulator. Nearly all of
+the code in this fork was written with Claude Code, directed and tested by
+the fork's author.
+
+---
+
 ## What it carries
 
 **From the community**, built from the authors' own repositories:
