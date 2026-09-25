@@ -49,7 +49,7 @@
         .global qz_knob, qz_plock, qz_chrom, qz_draw, qz_ld_entry, qz_ld_line, qz_wr
         .global qz_get, qz_set, qz_lbl_scale, qz_scale
         .global qz_get_glide, qz_set_glide, qz_lbl_glide, qz_leg1, qz_leg2
-        .global qz_leg0, qz_scale_mask
+        .global qz_leg0, qz_leg3, qz_scale_mask
         .set    HELD, 0x460d171d          | the chromatic key handler's held key per track (key + 1; 0 = none)
         .set    FUNC_HELD, 0x46c7dd26
         .set    MIDI_NOTE, 0x4003f3a8     | (track, note, velocity): the key's MIDI note out
@@ -454,6 +454,8 @@ qz_g1_stock:
 | 3 dropped: frame flag 0x20, 0x4000b5fc, event-byte bit 3, 0x4000c662)
 | changed nothing about it, so the stock word is kept.
 qz_leg2:
+        lea     qz_legato(%pc),%a0
+        clr.b   (%a0)                   | this press is not a legato one until decided below
         tst.l   FUNC_HELD
         jbne    qz_g2_trigless          | FUNC held: the stock trigless trig
         jbsr    qz_polytrack
@@ -475,10 +477,33 @@ qz_g2_glide:
         tst.b   (%a0,%d2.l)             | a key still held on this track (qz_leg1 kept it)?
         jbeq    qz_g2_trig              | no: a fresh note, the stock trig
         move.b  %d3,(%a0,%d2.l)         | legato: the new key is the held key
+        lea     qz_legato(%pc),%a0
+        move.b  %d3,(%a0)               | ... and the live recorder records it as trigless (qz_leg3)
 qz_g2_trigless:
         jmp     0x4004fc9c
 qz_g2_trig:
         jmp     0x4004fcb2
+
+| 0x4004fce0: `tstl 0x46c7dd26; beqs 0x4004fcf8` (8 bytes) -> jmp qz_leg3. The
+| same press, a few instructions on, is handed to the LIVE RECORDER (the
+| block 0x4004fcd8..0x4004fd24 runs while 0x460d172a is set: live recording,
+| or a trig held): stock records a TRIGLESS trig (0x4004271c) when FUNC is
+| held and a sample trig (0x40042d1c) otherwise, then the PTCH lock on the
+| step it returns (0x40042158 with a2). Without this hook a legato press --
+| played trigless by qz_leg2 -- was recorded as a sample trig, so playback
+| restarted the note (the user's report, OCTATRICK6). The legato press takes
+| the trigless branch, exactly what FUNC + key records; everything else is
+| stock (qz_legato is set only on the legato path, cleared at every press).
+qz_leg3:
+        tst.l   FUNC_HELD
+        jbne    qz_g3_trigless
+        lea     qz_legato(%pc),%a0
+        tst.b   (%a0)
+        jbeq    qz_g3_sample
+qz_g3_trigless:
+        jmp     0x4004fce8              | records a trigless trig
+qz_g3_sample:
+        jmp     0x4004fcf8              | records a sample trig
 
 | 0x4004fbde, the release path: `mvzb %a0@(0,%d2:l),%d1; movel %a2,%d0` (6
 | bytes) -> jmp qz_leg0. a0 = HELD, d2 = track, a2 = the key index; stock
@@ -712,6 +737,8 @@ qz_lbl_glide:   .asciz  "GLIDE"
 qz_synthname:   .ascii  "SYNTH"
         .balign 4
 qz_gbuf:        .fill   8, 1, 0          | the GLIDE row's number (RAM)
+qz_legato:      .byte   0                | the press in flight is a legato one (qz_leg2 -> qz_leg3)
+        .balign 4
 qz_names:                               | index 0..24 -> label, 7 characters at most (the value column is 33 px wide)
         .long   qz_n0, qz_n1, qz_n2, qz_n3, qz_n4, qz_n5, qz_n6, qz_n7, qz_n8, qz_n9, qz_n10, qz_n11, qz_n12, qz_n13, qz_n14, qz_n15, qz_n16, qz_n17, qz_n18, qz_n19, qz_n20, qz_n21, qz_n22, qz_n23, qz_n24
 qz_n0:  .asciz  "OFF"

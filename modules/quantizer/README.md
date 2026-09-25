@@ -305,6 +305,40 @@ Then the migration cases, editing the mounted card's `project.work` and
 mirror `0x100b14ae` followed each time. A storing load without the GLIDE
 line starts from OFF (`qz_ld_entry`, as SCALE's).
 
+## Legato and the live recorder (24 Sep 2026, OCTATRICK6 report)
+
+**Reported on hardware:** GLIDE on, CHROMATIC, live recording, a second key
+pressed while the first is held slides live but playback restarts the note.
+**Cause:** the same key press is handed to the live recorder a few
+instructions after the trig -- `0x4004fcd8..0x4004fd24`, run while
+`0x460d172a` is set (live recording, or a trig held): with FUNC held
+(`0x46c7dd26`) stock calls `0x4004271c(track, 0x46c7e956)`, which places a
+**trigless** trig on the current step, otherwise `0x40042d1c(...)`, a
+**sample** trig; then `0x40042158(track, 0, raw pitch, step, ...)` writes
+the PTCH lock on the step returned. `qz_leg2` played the legato press
+trigless but the recorder still took the no-FUNC branch. **The fix:** a
+third detour on the same press, `qz_leg3` at `0x4004fce0` (`tstl
+0x46c7dd26; beqs 0x4004fcf8`, 8 bytes): `qz_leg2` sets `qz_legato` when
+and only when it takes the GLIDE legato path (cleared at every press;
+FUNC held and the paraphonic VOIC 2..4 path leave it clear), and `qz_leg3`
+sends a legato press down the trigless branch -- exactly what FUNC + key
+records. GLIDE off, FUNC held, VOIC 2..4 and non-synth tracks: stock.
+
+Measured (`poly/liverec.py`, T2 = SYNTH, VOIC 1, INDX 0, SCALE OFF, 120 BPM,
+the pattern cleared before each; T2's track record `0x400e21e0 + 0x91a`:
+byte 7 = the sample-trig mask of steps 1-8, byte 15 the trigless mask of
+steps 1-8 (byte 14 steps 9-16), locks at `+0x59 + step*32`):
+
+| recording | record bytes changed | playback (pitch per 25 ms) |
+|---|---|---|
+| key 13 alone | `[7] = 0x08` (sample trig, step 4), lock PTCH 64 | 261.4 Hz steady |
+| FUNC + key 6 while 13 held (stock trigless) | `[7] = 0x08`, `[14] = 0x02` (trigless, step 10), lock 29 on step 10 | 261.4 then 252.6 218.4 199.9 188.9 183.0 180.0 178.2 177.0 -> 174.6: a glide, no burst |
+| key 6 while 13 held, GLIDE 64 (the fix) | `[7] = 0x08`, `[15] = 0x80` (trigless, step 8), lock 29 on step 8 | 261.4 then 252.1 218.2 199.7 188.8 183.0 180.0 178.1 177.0 176.3 175.8 175.4: the same glide, no burst, no restart |
+| the same with GLIDE off | `[7] = 0x88` (sample trigs, steps 4 and 8), lock 29 on step 8 | 261.3 then 175.2 at once: a retrigger, as stock |
+
+(The stock and fixed steps differ -- 10 vs 8 -- only because the FUNC press
+in the driver adds 0.15 s.)
+
 ## Paraphonic keys (24 Sep 2026)
 
 The synth machine's LFO page has a VOIC slot (`modules/synth/README.md`
