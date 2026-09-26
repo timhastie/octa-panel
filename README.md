@@ -45,12 +45,12 @@ was forked; this fork adds, on top of it:
   `CONTEXT.md`).
 - **Three firmware modules** built with octabam's module system, ColdFire
   only, DSP payloads stock (`REMIX=tim make cf`, `make image-cf`):
-  `modules/direct-jump` (CHAIN AFTER gains DIRECT), `modules/quantizer`
-  (a SCALE row: the PTCH knob, locks and CHROMATIC keys snap to a scale;
-  GLIDE with 303-style legato), and `modules/synth` (a two-operator FM
-  synth machine on any FLEX track whose sample is named SYNTH*.wav, with its
-  own PLAYBACK page, paraphonic chords, VOIC/CHRD on the LFO page, and note
-  lengths recorded from live playing). All three have been flashed and used
+  `modules/synth` (a two-operator FM synth machine on any FLEX track whose
+  sample is named SYNTH*.wav, with its own PLAYBACK page, paraphonic chords,
+  VOIC/CHRD on the LFO page, and note lengths recorded from live playing),
+  `modules/quantizer` (a SCALE row: the PTCH knob, locks and CHROMATIC keys
+  snap to a scale; GLIDE with 303-style legato), and `modules/direct-jump`
+  (CHAIN AFTER gains DIRECT). All three have been flashed and used
   on an Octatrack MKI by the fork's author; see `CONTEXT.md` for the build
   history and the hardware notes.
 
