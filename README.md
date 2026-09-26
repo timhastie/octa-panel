@@ -40,7 +40,13 @@ This repository is [sambanks/octabam](https://github.com/sambanks/octabam)
 at commit `0e93543` (26 Sep 2026) plus three modules and two remixes.
 Everything below this section is Sam's project as it was then. The build
 system is unchanged: the modules use upstream's `SymbolRef` and its DRAM
-platform as they are. The additions:
+platform as they are. The module sources live in
+[timhastie/octatrick-modules](https://github.com/timhastie/octatrick-modules),
+consumed here as a git submodule under each module directory
+(`modules/<name>/upstream`, pinned to tag `v9` = OCTATRICK9); the
+`manifest.py` in each directory executes the submodule's manifest and
+re-exports its `MODULE`, the shape octabam uses for MIDI SCENES and Octakit.
+The additions:
 
 - **`modules/direct-jump`** -- CHAIN AFTER gains a DIRECT option (option 2 of
   the list): a pattern chosen while the sequencer runs starts at the next
@@ -61,8 +67,17 @@ platform as they are. The additions:
   AUDIO: the unit becomes a class-compliant MIDI port and a 20-channel
   24-bit audio input (tracks 1-16 post-FX pre-fader, MAIN 17-18, CUE 19-20).
 
-**Build:** follow octabam's quick start below (`make setup`, `make os` with
-your own OS 1.40C file, `make recon`), then
+**Build:** clone with the submodules --
+
+```
+git clone --recurse-submodules https://github.com/timhastie/octatrick
+```
+
+(or, in an existing clone, `git submodule update --init`; without it the
+three `modules/*/upstream` directories are empty and the registry finds no
+DIRECT JUMP, SCALE QUANTIZER or SYNTH MACHINE) -- then follow octabam's
+quick start below (`make setup`, `make os` with your own OS 1.40C file,
+`make recon`), then
 
 ```
 make image REMIX=octatrick-usb BUILD=1 VERSION=OCTATRICK1
