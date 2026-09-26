@@ -28,6 +28,68 @@ guide from a fresh machine to a flashed unit.
 **[docs/remixes/README.md](docs/remixes/README.md)** lists every remix with
 its contents and hardware status.
 
+---
+
+## Octatrick: three firmware modules, built with octabam
+
+[![Octatrick demo video: the FM synth, scale quantizer and direct jump running on a real Octatrack MKI](https://img.youtube.com/vi/1DqUzvs8J3U/maxresdefault.jpg)](https://www.youtube.com/watch?v=1DqUzvs8J3U)
+
+**Demo video:** [Octatrick running on a real Octatrack MKI (YouTube)](https://www.youtube.com/watch?v=1DqUzvs8J3U) -- the FM synth, scale quantizer and direct jump in use. Click the picture to watch.
+
+This repository is [sambanks/octabam](https://github.com/sambanks/octabam)
+at commit `0e93543` (26 Sep 2026) plus three modules and two remixes.
+Everything below this section is Sam's project as it was then. The build
+system is unchanged: the modules use upstream's `SymbolRef` and its DRAM
+platform as they are. The additions:
+
+- **`modules/direct-jump`** -- CHAIN AFTER gains a DIRECT option (option 2 of
+  the list): a pattern chosen while the sequencer runs starts at the next
+  step, at the step count the old pattern had reached.
+- **`modules/quantizer`** -- a SCALE row in PROJECT > CONTROL > SEQUENCER
+  (24 scales): the PTCH knob, parameter locks and CHROMATIC trig keys snap to
+  the scale; a GLIDE row with 303-style legato for the synth; live recording
+  on synth tracks writes the played note length as an AMP HOLD lock.
+- **`modules/synth`** -- a two-operator FM synth machine: any FLEX track whose
+  sample is named SYNTH*.wav becomes a synth (a silent 4 s marker file will
+  do), with its own PLAYBACK page (PTCH RATO INDX RATE FDBK DEC), and on the
+  LFO page VOIC (1 = mono, 2..4 = paraphonic) and CHRD (32 chord shapes,
+  lockable per step, snapped to SCALE). The engine is a DRAM unit in
+  octabam's sample-RAM reserve (10 MB off the sample pool).
+- **`remixes/octatrick.py`** -- the three modules plus the fourteen stock
+  effects (fallback NONE), so the DSP payloads and the effect chooser stay
+  stock. **`remixes/octatrick-usb.py`** adds markandrus's USB MIDI and USB
+  AUDIO: the unit becomes a class-compliant MIDI port and a 20-channel
+  24-bit audio input (tracks 1-16 post-FX pre-fader, MAIN 17-18, CUE 19-20).
+
+**Build:** follow octabam's quick start below (`make setup`, `make os` with
+your own OS 1.40C file, `make recon`), then
+
+```
+make image REMIX=octatrick-usb BUILD=1 VERSION=OCTATRICK1
+```
+
+(`REMIX=octatrick` for the build without USB; VERSION is the name the unit
+shows, ten characters at most; bump BUILD every flash.)
+
+**Status:** `octatrick-usb` is flashed and in use on the author's Octatrack
+MKI (26 Sep 2026): the synth, the quantizer and direct jump work as before,
+and USB audio works on the MKI with each track on its own channel pair --
+the earlier USB audio runs were on MKIIs. Every feature was verified in an
+emulator before flashing: the same modules, a real-time build of octabam's
+emulator and a virtual front panel for it live in the companion repository
+[timhastie/octa-panel](https://github.com/timhastie/octa-panel). Read
+`docs/remixer/FLASHING.md` first, power-cycle the unit after an OS upgrade,
+and SAVE or SYNC TO CARD after changing project settings. Combining with
+other modules: the synth page is pinned at the start of the second free gap
+(`0x400d24d0`), which `tempo-bus` also uses, so the ledger refuses that
+pair; the synth engine shares the sample-RAM reserve with the other DRAM
+modules (USB, MIDI SCENES) inside one runtime.
+
+**Unofficial.** Not affiliated with, endorsed by or supported by Elektron.
+No firmware is distributed here: every image is built on your machine from
+your own copy of OS 1.40C, and modifying your unit's firmware is outside
+Elektron's licence terms and warranty.
+
 ## What it carries
 
 Every module, with its author. Those with a repository are built from it.
