@@ -2,10 +2,12 @@
 
 **CHAIN AFTER's unused value 1 becomes DIRECT.** With it selected, a pattern
 chosen while the sequencer runs ([PATTERN] + [TRIG], [BANK] + [TRIG], MIDI
-program change) starts at the **next step**, at the step count the old
-pattern had reached — selected during step 11, the new pattern's LEDs read
-12, 13, 14 … — instead of at the old pattern's end or after its CHAIN AFTER
-length. The Analog Four / Analog Rytm "direct jump", on the Octatrack's own
+program change) takes over at the **next step boundary**, at the step count
+the old pattern had reached, instead of at the old pattern's end or after
+its CHAIN AFTER length. Selected during step 11: the pattern number and the
+counter switch at step 12, the old pattern still sounds its step 12 at that
+tick, and the new pattern's first sounding step is its step 13 — continuous,
+nothing skipped or doubled (audio-measured 26 Sep 2026). The Analog Four / Analog Rytm "direct jump", on the Octatrack's own
 change-length parameter. Off by default: DIRECT is a position of a setting
 every project already stores, so a project that never selects it plays
 exactly as stock.
@@ -52,6 +54,18 @@ clamp) loads it as **256/16** — select DIRECT again and save. A project
 saved with DIRECT by this build (`=1`) loads on **stock** firmware as 2/16
 (the stock bump) and on the 13 Sep build as 2/16 likewise (its setter never
 produced a 1, its loader still bumped it).
+
+**Measured under PER TRACK scales (26 Sep 2026, emulator, 41 jumps).** The
+positioning after the switch is the stock arranger's (the module only plants
+the start step), and it matches the destination pattern's own run at the same
+master step in every same-scale case, including odd lengths, MASTER LENGTH
+INF, master scale 2X and a change on every step. Two small deviations come
+from that stock code, which pattern-end changes never exercise because their
+start is 0: a track faster than the master whose step is mid-way at the
+switch fires its next step two ticks (~41 ms at 120 BPM) early and re-locks
+within a step; a track whose SCALE differs between the two patterns and whose
+planted position has a tick residue runs one tick (~21 ms) early until the
+next MASTER LENGTH restart (with INF, until the next change).
 
 **Index 1 elsewhere (checked, unchanged).** The per-pattern CHAIN BEHAVIOR
 setter in PATTERN SETTINGS (`0x40081d74..0x40081e30`) skips 1 the same way
