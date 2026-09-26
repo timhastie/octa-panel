@@ -43,7 +43,7 @@ system is unchanged: the modules use upstream's `SymbolRef` and its DRAM
 platform as they are. The module sources live in
 [timhastie/octatrick-modules](https://github.com/timhastie/octatrick-modules),
 consumed here as a git submodule under each module directory
-(`modules/<name>/upstream`, pinned to tag `v9` = OCTATRICK9); the
+(`modules/<name>/upstream`, pinned to tag `v9.1` = OCTATRICK9); the
 `manifest.py` in each directory executes the submodule's manifest and
 re-exports its `MODULE`, the shape octabam uses for MIDI SCENES and Octakit.
 The additions:

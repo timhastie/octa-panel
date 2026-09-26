@@ -1,6 +1,6 @@
 # `octatrick` and `octatrick-usb` — Tim Hastie's three modules on the stock effects
 
-Two remixes built from [timhastie/octatrick-modules](https://github.com/timhastie/octatrick-modules) (the submodule under `modules/synth`, `modules/quantizer` and `modules/direct-jump`, pinned to `v9`). No octabam DSP code: the fourteen stock effects are listed with fallback NONE, the `usb-lean` pattern, so both DSP payloads, their dispatch and the effect chooser's rows stay stock and every existing project plays as it did.
+Two remixes built from [timhastie/octatrick-modules](https://github.com/timhastie/octatrick-modules) (the submodule under `modules/synth`, `modules/quantizer` and `modules/direct-jump`, pinned to `v9.1`). No octabam DSP code: the fourteen stock effects are listed with fallback NONE, the `usb-lean` pattern, so both DSP payloads, their dispatch and the effect chooser's rows stay stock and every existing project plays as it did.
 
 | remix | adds | on hardware |
 |---|---|---|
