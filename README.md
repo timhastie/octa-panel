@@ -73,8 +73,11 @@ shows, ten characters at most; bump BUILD every flash.)
 
 **Status:** `octatrick-usb` is flashed and in use on the author's Octatrack
 MKI (26 Sep 2026): the synth, the quantizer and direct jump work as before,
-and USB audio works on the MKI with each track on its own channel pair --
-the earlier USB audio runs were on MKIIs. Every feature was verified in an
+and USB audio works on the MKI: all 20 channels, each track on its own
+channel pair, MAIN on 17-18 and CUE on 19-20 (the earlier USB audio runs
+were on MKIIs). MAIN and CUE were silent right after the OS upgrade until
+the unit was fully powered off and on, so power-cycle before judging a
+flash. Every feature was verified in an
 emulator before flashing: the same modules, a real-time build of octabam's
 emulator and a virtual front panel for it live in the companion repository
 [timhastie/octa-panel](https://github.com/timhastie/octa-panel). Read
