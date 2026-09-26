@@ -48,19 +48,19 @@ consumed here as a git submodule under each module directory
 re-exports its `MODULE`, the shape octabam uses for MIDI SCENES and Octakit.
 The additions:
 
-- **`modules/direct-jump`** -- CHAIN AFTER gains a DIRECT option (option 2 of
-  the list): a pattern chosen while the sequencer runs starts at the next
-  step, at the step count the old pattern had reached.
-- **`modules/quantizer`** -- a SCALE row in PROJECT > CONTROL > SEQUENCER
-  (24 scales): the PTCH knob, parameter locks and CHROMATIC trig keys snap to
-  the scale; a GLIDE row with 303-style legato for the synth; live recording
-  on synth tracks writes the played note length as an AMP HOLD lock.
 - **`modules/synth`** -- a two-operator FM synth machine: any FLEX track whose
   sample is named SYNTH*.wav becomes a synth (a silent 4 s marker file will
   do), with its own PLAYBACK page (PTCH RATO INDX RATE FDBK DEC), and on the
   LFO page VOIC (1 = mono, 2..4 = paraphonic) and CHRD (32 chord shapes,
   lockable per step, snapped to SCALE). The engine is a DRAM unit in
   octabam's sample-RAM reserve (10 MB off the sample pool).
+- **`modules/quantizer`** -- a SCALE row in PROJECT > CONTROL > SEQUENCER
+  (24 scales): the PTCH knob, parameter locks and CHROMATIC trig keys snap to
+  the scale; a GLIDE row with 303-style legato for the synth; live recording
+  on synth tracks writes the played note length as an AMP HOLD lock.
+- **`modules/direct-jump`** -- CHAIN AFTER gains a DIRECT option (option 2 of
+  the list): a pattern chosen while the sequencer runs starts at the next
+  step, at the step count the old pattern had reached.
 - **`remixes/octatrick.py`** -- the three modules plus the fourteen stock
   effects (fallback NONE), so the DSP payloads and the effect chooser stay
   stock. **`remixes/octatrick-usb.py`** adds markandrus's USB MIDI and USB
@@ -75,7 +75,7 @@ git clone --recurse-submodules https://github.com/timhastie/octatrick
 
 (or, in an existing clone, `git submodule update --init`; without it the
 three `modules/*/upstream` directories are empty and the registry finds no
-DIRECT JUMP, SCALE QUANTIZER or SYNTH MACHINE) -- then follow octabam's
+SYNTH MACHINE, SCALE QUANTIZER or DIRECT JUMP) -- then follow octabam's
 quick start below (`make setup`, `make os` with your own OS 1.40C file,
 `make recon`), then
 
