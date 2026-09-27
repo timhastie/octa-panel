@@ -25,11 +25,13 @@ branch `panel-ui`. Everything below this section is Sam's project as it
 was forked; this fork adds, on top of it:
 
 > **Looking for the firmware modules?** Their current home is
-> [timhastie/octatrick](https://github.com/timhastie/octatrick): the same
-> three modules rebased onto current octabam main, with a remix that adds
-> USB MIDI and USB audio (running on an Octatrack MKI). This repository's
-> `upstream-port` branch mirrors it; `panel-ui` is the emulator and panel
-> work on the older base.
+> [timhastie/octatrick](https://github.com/timhastie/octatrick): the modules
+> (FM synth, scale quantizer, direct jump, tuner) on current octabam main,
+> with remixes that add USB MIDI and USB audio (running on an Octatrack MKI);
+> the sources live in
+> [timhastie/octatrick-modules](https://github.com/timhastie/octatrick-modules).
+> This repository's `upstream-port` branch mirrors it; `panel-ui` is the
+> emulator and panel work on the older base.
 
 - **A virtual front panel** for the emulator (`tools/panel/`): the whole
   Octatrack panel in a browser page or a macOS app, with the LCD, every key,
