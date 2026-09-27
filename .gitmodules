@@ -14,3 +14,6 @@
 [submodule "modules/synth/upstream"]
 	path = modules/synth/upstream
 	url = https://github.com/timhastie/octatrick-modules
+[submodule "modules/tuner/upstream"]
+	path = modules/tuner/upstream
+	url = https://github.com/timhastie/octatrick-modules

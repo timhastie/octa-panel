@@ -37,22 +37,30 @@ its contents and hardware status.
 **Demo video:** [Octatrick running on a real Octatrack MKI (YouTube)](https://www.youtube.com/watch?v=1DqUzvs8J3U) -- the FM synth, scale quantizer and direct jump in use. Click the picture to watch.
 
 This repository is [sambanks/octabam](https://github.com/sambanks/octabam)
-at commit `0e93543` (26 Sep 2026) plus three modules and two remixes.
+at commit `0e93543` (26 Sep 2026) plus four modules and three remixes.
 Everything below this section is Sam's project as it was then. The build
 system is unchanged: the modules use upstream's `SymbolRef` and its DRAM
 platform as they are. The module sources live in
 [timhastie/octatrick-modules](https://github.com/timhastie/octatrick-modules),
 consumed here as a git submodule under each module directory
-(`modules/<name>/upstream`, pinned to tag `v9.1` = OCTATRICK9); the
+(`modules/<name>/upstream`, pinned to tag `v10`); the
 `manifest.py` in each directory executes the submodule's manifest and
 re-exports its `MODULE`, the shape octabam uses for MIDI SCENES and Octakit.
 The additions:
 
 - **`modules/synth`** -- a two-operator FM synth machine: any FLEX track whose
-  sample is named SYNTH*.wav becomes a synth (a silent 4 s marker file will
-  do), with its own PLAYBACK page (PTCH RATO INDX RATE FDBK DEC), and on the
+  sample is named FMSYNTH*.wav becomes a synth (a silent 4 s marker file will
+  do; SYNTH*.wav is still accepted, and the marker's length never ends the
+  note), with its own PLAYBACK page (PTCH RATO INDX FINE FDBK DEC -- one unit a
+  detent, 7 with the knob pressed, and FUNC + turn jumps an octave, 10 cents,
+  16 units, or to the next whole-number ratio), and on the
   LFO page VOIC (1 = mono, 2..4 = paraphonic) and CHRD (32 chord shapes,
-  lockable per step, snapped to SCALE). The engine is a DRAM unit in
+  each with three inversions on the knob, lockable per step, snapped to
+  SCALE); a chord fingered on the CHROMATIC keys or over MIDI IN during
+  live recording is recorded as PTCH / CHRD / VOIC locks (the bass, the
+  shape and its inversion, the voices heard: keys within a rolling 150 ms
+  join, a legato hand-over records single notes), and one key is
+  one voice. The engine is a DRAM unit in
   octabam's sample-RAM reserve (10 MB off the sample pool).
 - **`modules/quantizer`** -- a SCALE row in PROJECT > CONTROL > SEQUENCER
   (24 scales): the PTCH knob, parameter locks and CHROMATIC trig keys snap to
@@ -61,6 +69,12 @@ The additions:
 - **`modules/direct-jump`** -- CHAIN AFTER gains a DIRECT option (option 2 of
   the list): a pattern chosen while the sequencer runs starts at the next
   step, at the step count the old pattern had reached.
+- **`modules/tuner`** -- UP + TEMPO opens a tuner window for the current
+  audio track: note, octave, cents (a +-50 cent needle) and Hz, from the
+  track's post-FX pre-fader audio, detected on the ColdFire (McLeod NSDF
+  + YIN refine) in the UI task; TEMPO, YES, NO or the chord close it.
+  `remixes/octatrick-tuner.py` = `octatrick-usb` + TUNER. Emulator-verified,
+  not yet on hardware.
 - **`remixes/octatrick.py`** -- the three modules plus the fourteen stock
   effects (fallback NONE), so the DSP payloads and the effect chooser stay
   stock. **`remixes/octatrick-usb.py`** adds markandrus's USB MIDI and USB
@@ -74,8 +88,8 @@ git clone --recurse-submodules https://github.com/timhastie/octatrick
 ```
 
 (or, in an existing clone, `git submodule update --init`; without it the
-three `modules/*/upstream` directories are empty and the registry finds no
-SYNTH MACHINE, SCALE QUANTIZER or DIRECT JUMP) -- then follow octabam's
+four `modules/*/upstream` directories are empty and the registry finds no
+SYNTH MACHINE, SCALE QUANTIZER, DIRECT JUMP or TUNER) -- then follow octabam's
 quick start below (`make setup`, `make os` with your own OS 1.40C file,
 `make recon`), then
 

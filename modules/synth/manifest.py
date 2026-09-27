@@ -1,11 +1,11 @@
 """SYNTH MACHINE -- a two-operator FM synth machine: a FLEX track whose
 sample is named SYNTH*.wav plays an FM voice instead of the sample, with its
-own PLAYBACK page (PTCH RATO INDX RATE FDBK DEC) and, on the LFO page, VOIC
+own PLAYBACK page (PTCH RATO INDX FINE FDBK DEC: PTCH in semitones, FINE in cents) and, on the LFO page, VOIC
 (1 = mono, 2..4 = paraphonic) and CHRD (32 chord shapes, lockable per step,
 snapped onto SCALE QUANTIZER's scale).
 
 Source: `upstream/` is Tim Hastie's repository (timhastie/octatrick-modules,
-submodule, pinned to v9.1 = OCTATRICK9 + the runtime page clone, hardware-confirmed as OCTATRIK10 on an MKI). The declaration is
+submodule, pinned to the tuning branch, 27 Sep 2026). The declaration is
 `upstream/synth/manifest.py`: the voice engine as a DRAM unit (`poly.s`,
 `Linked(dram=True)`, in the platform reserve with the other DRAM modules),
 the page as a pinned ROM cave (`page.s` at 0x400d24d0, the start of the

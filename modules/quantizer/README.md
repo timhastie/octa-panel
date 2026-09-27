@@ -2,8 +2,8 @@
 
 A SCALE row and a GLIDE row in PROJECT > CONTROL > SEQUENCER, built from
 [timhastie/octatrick-modules](https://github.com/timhastie/octatrick-modules)
-(submodule `upstream/`, pinned to `v9.1`). `Kind.CF_PATCH`: four ROM units
-(`glide.s`, `keys.s`, `quantizer.s`, `scale.s`), detours, pokes and a
+(submodule `upstream/`, pinned to `v10`). `Kind.CF_PATCH`: three ROM units
+(`keys.s`, `quantizer.s`, `scale.s`), detours, pokes and a
 `TableGrow` for the menu rows. No DSP code, no FX2 row.
 
 ## What it does
@@ -20,15 +20,19 @@ description, with what was measured and what was inferred.
 
 ## How it is built
 
-Source: `upstream/` is Tim's repository (submodule, pinned to `v9.1`).
+Source: `upstream/` is Tim's repository (submodule, pinned to `v10`).
 Nothing inside `upstream/` is edited here. The manifest here
 (`manifest.py`) executes `upstream/quantizer/manifest.py` from the source on
 disk and re-exports its `MODULE`; that manifest derives its source paths
 from its own directory, so the same file builds at `modules/quantizer/` in
-Tim's tree and at `modules/quantizer/upstream/quantizer/` here. The glide
-byte, the key trampoline and the scale trampoline are at pinned addresses
-(`GLIDE_AT`, `KEYS_AT`, `SCALE_AT`) that SYNTH MACHINE's engine reads; the
-main unit floats.
+Tim's tree and at `modules/quantizer/upstream/quantizer/` here. The key
+trampoline and the scale trampoline are at pinned addresses (`KEYS_AT`,
+`SCALE_AT`) that SYNTH MACHINE's engine reads; the main unit floats. The
+SCALE and GLIDE bytes themselves are battery-backed RAM (`0x100b14ec` /
+`0x100b14ed`, `GLIDE_AT`), so they survive a power cycle like CHAIN AFTER
+does -- until 26 Sep 2026 they lived in the OS image and came back OFF at
+every boot although SAVE had written them to the project files (the boot
+restores the unit from battery RAM and reads no project file).
 
 ## Measured
 
@@ -40,8 +44,12 @@ main unit floats.
   remixes do not carry).
 - **On hardware 26 Sep 2026** as `OCTATRICK9` (remix `octatrick-usb`) on
   Tim's Octatrack MKI.
+- At `v10` the image differs from OCTATRICK9 (SCALE and GLIDE moved into
+  battery RAM, `glide.s` gone; two jsr detours keep the bytes sane);
+  emulator-verified 26 Sep 2026 (SAVE, then a warm boot with the battery
+  RAM carried over, keeps SCALE and GLIDE), not yet flashed.
 
 ## Updating
 
-Bump the submodule pin and rebuild; SYNTH MACHINE reads the three pinned
+Bump the submodule pin and rebuild; SYNTH MACHINE reads the pinned
 addresses, so a pin that moves them needs both modules bumped together.
