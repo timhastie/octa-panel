@@ -6,7 +6,7 @@ YES, NO or the chord close it; TEMPO alone, FUNC + TEMPO and UP alone stay
 stock.
 
 Source: `upstream/` is Tim Hastie's repository (timhastie/octatrick-modules,
-submodule, pinned to v10). The declaration is `upstream/tuner/manifest.py`:
+submodule, pinned to v2.9). The declaration is `upstream/tuner/manifest.py`:
 one DRAM unit (`tuner.s`, `Linked(dram=True)`, in the platform reserve with
 the other DRAM modules) and three detours (the TEMPO opener's first
 instruction, frame_isr's tail, the UI task's loop head); no ROM cave, no
