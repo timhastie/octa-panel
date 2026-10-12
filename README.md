@@ -32,8 +32,7 @@ was forked; this fork adds, on top of it:
 > fixes, the metronome and the machine-change init, are emulator-verified);
 > the sources live in
 > [timhastie/octatrick-modules](https://github.com/timhastie/octatrick-modules).
-> This repository's `upstream-port` branch mirrors it; `panel-ui` is the
-> emulator and panel work on the older base.
+> `panel-ui` here is the emulator and panel work on the older base.
 
 - **A virtual front panel** for the emulator (`tools/panel/`): the whole
   Octatrack panel in a browser page or a macOS app, with the LCD, every key,
@@ -47,7 +46,7 @@ was forked; this fork adds, on top of it:
   per-track outputs available through CoreAudio, persistent card images with
   write-back, and the effects rendering correctly (milestones O15-O24 in
   `CONTEXT.md`).
-- **Three firmware modules** built with octabam's module system, ColdFire
+- **Three firmware modules** (their first versions; the current six live in timhastie/octatrick-modules) built with octabam's module system, ColdFire
   only, DSP payloads stock (`REMIX=tim make cf`, `make image-cf`):
   `modules/synth` (a two-operator FM synth machine on any FLEX track whose
   sample is named SYNTH*.wav, with its own PLAYBACK page, paraphonic chords,
