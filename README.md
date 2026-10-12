@@ -27,9 +27,10 @@ was forked; this fork adds, on top of it:
 > **Looking for the firmware modules?** Their current home is
 > [timhastie/octatrick](https://github.com/timhastie/octatrick): six
 > modules (FM synth, SY DRUM, scale quantizer, direct jump, tuner, processor
-> load; octatrick-modules 2.12) on current octabam main, with a remix that
+> load; octatrick-modules 2.13) on current octabam main, with a remix that
 > adds USB MIDI and USB audio (running on an Octatrack MKI; 2.12's two
-> fixes, the metronome and the machine-change init, are emulator-verified);
+> fixes, the metronome and the machine-change init, and 2.13's scale
+> quantizer on MIDI tracks are emulator-verified);
 > the sources live in
 > [timhastie/octatrick-modules](https://github.com/timhastie/octatrick-modules).
 > `panel-ui` here is the emulator and panel work on the older base.
